@@ -5,6 +5,7 @@
 
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
+from .actor_critic_mm_transformer import ActorCriticMMTransformer
 from .normalizer import EmpiricalNormalization
 
-__all__ = ["ActorCritic", "ActorCriticRecurrent"]
+__all__ = ["ActorCritic", "ActorCriticRecurrent", "ActorCriticMMTransformer"]
