@@ -83,3 +83,44 @@ class VecEnv(ABC):
                 A tuple containing the observations, rewards, dones and extra information (metrics).
         """
         raise NotImplementedError
+
+class MMVecEnv(VecEnv):
+    num_ref_obs: int
+    """Number of reference observations."""
+    num_privileged_ref_obs: int
+    """Number of privileged reference observations."""
+    ref_obs_buf: torch.Tensor
+    """Buffer for reference observations."""
+    privileged_ref_obs_buf: torch.Tensor
+    """Buffer for privileged reference observations."""
+
+    @abstractmethod
+    def get_reference_observations(self) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, dict]:
+        """Return the current reference observations.
+
+        Returns:
+            Tuple[Tuple[torch.Tensor, torch.Tensor], dict]: Tuple containing the reference observations (ref_obs, ref_obs_mask) and extras.
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def reset(self) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, dict]:
+        """Reset all environment instances.
+
+        Returns:
+            Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], dict]: Tuple containing the observations, reference observations and extras.
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor, torch.Tensor, dict]:
+        """Apply input action on the environment.
+
+        Args:
+            actions (torch.Tensor): Input actions to apply. Shape: (num_envs, num_actions)
+
+        Returns:
+            Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor, dict]:
+                A tuple containing the observations, reference observations, rewards, dones and extra information (metrics).
+        """
+        raise NotImplementedError

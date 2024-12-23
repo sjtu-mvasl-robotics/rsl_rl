@@ -7,12 +7,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from rsl_rl.modules import ActorCritic, ActorCriticMMTransformer
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.modules import ActorCriticMMTransformer
+from rsl_rl.storage import RolloutStorageMM
 
 
-class PPO:
-    actor_critic: ActorCritic
+class MMPPO:
+    actor_critic: ActorCriticMMTransformer
 
     def __init__(
         self,
@@ -42,7 +42,7 @@ class PPO:
         self.actor_critic.to(self.device)
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
-        self.transition = RolloutStorage.Transition()
+        self.transition = RolloutStorageMM.Transition()
 
         # PPO parameters
         self.clip_param = clip_param
@@ -55,10 +55,18 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
-        self.storage = RolloutStorage(
-            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device
+    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, actor_ref_obs_shape, critic_obs_shape, critic_ref_obs_shape, action_shape):
+        self.storage = RolloutStorageMM(
+            num_envs,
+            num_transitions_per_env,
+            obs_shape=actor_obs_shape,
+            ref_obs_shape=actor_ref_obs_shape,
+            privileged_obs_shape=critic_obs_shape,
+            privileged_ref_obs_shape=critic_ref_obs_shape,
+            actions_shape=action_shape,
+            device=self.device,
         )
+
 
     def test_mode(self):
         self.actor_critic.test()
@@ -66,12 +74,12 @@ class PPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, ref_obs, critic_obs, ref_critic_obs):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values
-        self.transition.actions = self.actor_critic.act(obs).detach()
-        self.transition.values = self.actor_critic.evaluate(critic_obs).detach()
+        self.transition.actions = self.actor_critic.act(obs, ref_observations=ref_obs).detach()
+        self.transition.values = self.actor_critic.evaluate(critic_obs, ref_critic_observations=ref_critic_obs).detach()
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
@@ -89,25 +97,31 @@ class PPO:
                 self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
             )
 
+        assert self.storage is not None, "Storage is not initialized. Please call init_storage before process_env_step."
         # Record the transition
         self.storage.add_transitions(self.transition)
         self.transition.clear()
         self.actor_critic.reset(dones)
 
     def compute_returns(self, last_critic_obs):
+        assert self.storage is not None, "Storage is not initialized. Please call init_storage before compute_returns."
         last_values = self.actor_critic.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(self):
         mean_value_loss = 0
         mean_surrogate_loss = 0
-        if self.actor_critic.is_recurrent:
-            generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        # if self.actor_critic.is_recurrent:
+        #     generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs) #
+        # else:
+        assert self.actor_critic.is_recurrent == False, "MM-PPO does not support recurrent actor-critic networks."
+        assert self.storage is not None, "Storage is not initialized. Please call init_storage before update."
+        generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for (
             obs_batch,
+            ref_obs_batch,
             critic_obs_batch,
+            critic_ref_obs_batch,
             actions_batch,
             target_values_batch,
             advantages_batch,
@@ -118,10 +132,10 @@ class PPO:
             hid_states_batch,
             masks_batch,
         ) in generator:
-            self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
             value_batch = self.actor_critic.evaluate(
-                critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]
+                critic_obs_batch, ref_critic_observations=critic_ref_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]
             )
             mu_batch = self.actor_critic.action_mean
             sigma_batch = self.actor_critic.action_std

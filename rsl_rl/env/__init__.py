@@ -3,6 +3,6 @@
 
 """Submodule defining the environment definitions."""
 
-from .vec_env import VecEnv
+from .vec_env import VecEnv, MMVecEnv
 
-__all__ = ["VecEnv"]
+__all__ = ["VecEnv", "MMVecEnv"]
