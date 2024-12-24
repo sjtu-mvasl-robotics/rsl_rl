@@ -23,52 +23,51 @@ class mycustomenv(MMVecEnv):
         self.obs_buf = torch.zeros((num_envs, num_obs), device=device)
         self.ref_obs_buf = torch.zeros((num_envs, num_ref_obs), device=device)
         self.privileged_obs_buf = torch.zeros((num_envs, self.num_privileged_obs), device=device)
-        self.privileged_ref_obs_buf = torch.zeros((num_envs, self.num_privileged_ref_obs), device=device)
+        self.privileged_ref_obs_buf = torch.zeros((num_envs,), device=device)
         self.ref_obs_mask_buf = torch.zeros((num_envs, num_ref_obs), device=device)
-        self.privileged_ref_obs_mask_buf = torch.zeros((num_envs, self.num_privileged_ref_obs), device=device)
+        self.privileged_ref_obs_mask_buf = torch.zeros((num_envs,), device=device)
         self.extras = {}
         self.reset()
 
     def get_observations(self):
-        return self.obs_buf, {}
+        return self.obs_buf
     
     def reset(self):
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device)
         self.ref_obs_buf = torch.zeros((self.num_envs, self.num_ref_obs), device=self.device)
         self.privileged_obs_buf = torch.zeros((self.num_envs, self.num_privileged_obs), device=self.device)
         self.privileged_ref_obs_buf = torch.zeros((self.num_envs, self.num_privileged_ref_obs), device=self.device)
-        self.ref_obs_mask_buf = torch.zeros((self.num_envs, self.num_ref_obs), device=self.device)
-        self.privileged_ref_obs_mask_buf = torch.zeros((self.num_envs, self.num_privileged_ref_obs), device=self.device)
-        obs_buf, obs_dict = self.get_observations()
-        ref_obs, ref_obs_dict = self.get_reference_observations()
-        joined_dict = {**obs_dict, **ref_obs_dict}
-        return obs_buf, ref_obs, joined_dict
+        self.ref_obs_mask_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+        self.privileged_ref_obs_mask_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+        obs_buf = self.get_observations()
+        ref_obs = self.get_reference_observations()
+        return obs_buf, ref_obs
     
     def get_reference_observations(self):
-        return (self.ref_obs_buf, self.ref_obs_mask_buf), {}
+        return (self.ref_obs_buf, self.ref_obs_mask_buf) if self.num_ref_obs > 0 else None
     
     def step(self, actions):
         # test, so just add random values to the observations
         self.obs_buf += torch.rand_like(self.obs_buf)
         self.ref_obs_buf += torch.rand_like(self.ref_obs_buf)
-        self.privileged_obs_buf += torch.rand_like(self.privileged_obs_buf)
-        self.privileged_ref_obs_buf += torch.rand_like(self.privileged_ref_obs_buf)
-        self.ref_obs_mask_buf = torch.rand_like(self.ref_obs_mask_buf)
-        self.privileged_ref_obs_mask_buf = torch.rand_like(self.privileged_ref_obs_mask_buf)
+        self.privileged_obs_buf += torch.rand_like(self.privileged_obs_buf, device=self.device)
+        self.privileged_ref_obs_buf += torch.rand_like(self.privileged_ref_obs_buf, device=self.device)
+        # self.ref_obs_mask_buf = torch.rand_like(self.ref_obs_mask_buf)
+        # self.privileged_ref_obs_mask_buf = torch.rand_like(self.privileged_ref_obs_mask_buf)
         rewards = torch.rand(self.num_envs, device=self.device)
         dones = torch.zeros(self.num_envs, device=self.device)
         infos = {}
-        return self.obs_buf, (self.ref_obs_buf, self.ref_obs_mask_buf), rewards, dones, infos
+        return self.obs_buf, (self.ref_obs_buf, self.ref_obs_mask_buf), self.get_privileged_observations(), self.get_privileged_reference_observations(), rewards, dones, infos
     
     def get_privileged_observations(self):
-        return self.privileged_obs_buf, {}
+        return self.privileged_obs_buf if self.num_privileged_obs > 0 else self.get_observations()
     
     def get_privileged_reference_observations(self):
-        return (self.privileged_ref_obs_buf, self.privileged_ref_obs_mask_buf), {}
+        return (self.privileged_ref_obs_buf, self.privileged_ref_obs_mask_buf) if self.num_privileged_ref_obs > 0 else self.get_reference_observations()
     
 train_cfg={
     "algorithm":{
-        "class_name":"MMPPO",
+        # "class_name":"MMPPO",
         "value_loss_coef":1.0,
         "clip_param":0.2,
         "use_clipped_value_loss":True,
@@ -82,7 +81,7 @@ train_cfg={
         "schedule":"adaptive",
     },
     "policy":{
-        "class_name":"ActorCriticPolicyMM",
+        "class_name":"ActorCriticMMTransformer",
         "max_len":4,
         "dim_model":128,
         "num_layers":4,
@@ -92,6 +91,8 @@ train_cfg={
     "runner":{
         "num_steps_per_env":24,
         "max_iterations":100,
+        "policy_class_name":"ActorCriticMMTransformer",
+        "algorithm_class_name":"MMPPO",
         "empirical_normalization":False,
         "save_interval":50,
         "experiment_name":"test_mmppo",
@@ -106,7 +107,7 @@ train_cfg={
     "seed":0,
 }
 
-num_envs = 2048
+num_envs = 1024
 num_obs = 64
 num_ref_obs = 40
 num_actions = 29
@@ -117,6 +118,9 @@ env = mycustomenv(num_envs, num_obs, num_ref_obs, num_actions, max_episode_lengt
 runner = OnPolicyRunnerMM(
     env=env,
     train_cfg=train_cfg,
+    log_dir="logs",
     device=device,
 
 )
+
+runner.learn(num_learning_iterations=10)

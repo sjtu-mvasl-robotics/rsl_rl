@@ -91,15 +91,18 @@ class Transformer(nn.Module):
             num_layers = 4,
             ffn_ratio = 4,
             dropout = 0.1,
+            name = "",
             **kwargs
     ):
         super().__init__()
+        self.name = name
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
 
         self.obs_deque = ObsDeque(max_len, obs_size)
         self.obs_embedding = ObservationEmbedding(obs_size, dim_model, max_len)
-        if ref_obs_size == 0:
+        self.ref_obs_size = ref_obs_size
+        if self.ref_obs_size == 0:
             self.ref_obs_deque = None
             self.ref_obs_embedding = None
         else:
@@ -241,8 +244,8 @@ class ActorCriticMMTransformer(nn.Module):
             **kwargs
     ):
         super().__init__()
-        self.actor = Transformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, **kwargs)
-        self.critic = Transformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, **kwargs) # 1 for value function
+        self.actor = Transformer(obs_size=num_actor_obs, ref_obs_size=num_actor_ref_obs, dim_out=num_actions, dim_model=dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", **kwargs)
+        self.critic = Transformer(obs_size=num_critic_obs, ref_obs_size=num_critic_ref_obs, dim_out=1, dim_model=dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
 
@@ -252,6 +255,12 @@ class ActorCriticMMTransformer(nn.Module):
         # disable args validation for speedup
         Normal.set_default_validate_args = False
 
+    def reset(self, dones=None):
+        pass
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
+    
     @property
     def action_mean(self):
         return self.distribution.mean

@@ -54,12 +54,12 @@ class OnPolicyRunnerMM:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
-        if self.env.num_privileged_obs is not None:
+        if self.env.num_privileged_obs:
             num_critic_obs = self.env.num_privileged_obs 
         else:
             num_critic_obs = self.env.num_obs
 
-        if self.env.num_privileged_ref_obs is not None:
+        if self.env.num_privileged_ref_obs:
             num_critic_ref_obs = self.env.num_privileged_ref_obs
         else:
             num_critic_ref_obs = self.env.num_ref_obs
@@ -88,9 +88,9 @@ class OnPolicyRunnerMM:
             num_envs=self.env.num_envs,
             num_transitions_per_env=self.num_steps_per_env,
             actor_obs_shape=[self.env.num_obs],
-            actor_ref_obs_shape=[self.env.num_ref_obs] if self.env.num_ref_obs > 0 else None,
+            actor_ref_obs_shape=[self.env.num_ref_obs] if self.env.num_ref_obs > 0 else [None],
             critic_obs_shape=[num_critic_obs],
-            critic_ref_obs_shape=[num_critic_ref_obs] if num_critic_ref_obs > 0 else None,
+            critic_ref_obs_shape=[num_critic_ref_obs] if num_critic_ref_obs > 0 else [None],
             action_shape=[self.env.num_actions]
         )
 

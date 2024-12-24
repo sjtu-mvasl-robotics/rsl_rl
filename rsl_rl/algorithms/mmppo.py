@@ -85,7 +85,11 @@ class MMPPO:
         self.transition.action_sigma = self.actor_critic.action_std.detach()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
+        self.transition.reference_observations = ref_obs[0]
+        self.transition.reference_observations_mask = ref_obs[1]
         self.transition.critic_observations = critic_obs
+        self.transition.critic_reference_observations = ref_critic_obs[0]
+        self.transition.critic_reference_observations_mask = ref_critic_obs[1]
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
