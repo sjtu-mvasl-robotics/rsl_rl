@@ -1,6 +1,31 @@
 # RSL RL
 
-> Re-implemented some components for better imitation learning.
+Re-implemented some components for better imitation learning.
+
+## RSL RL MM Series Interface (2024-12-24)
+
+The RSL RL MM Series Interface is a new interface for the RSL RL framework. It is built upon `envs.MMVecEnv` and called only by  `rsl_rl.runners.on_policy_runner_mm`. The changes to the interface are as follows:
+
+* get_observations
+    * former: `get_observations(self) -> tuple[torch.Tensor, dict]:`
+    * new: `get_observations(self) -> tuple[torch.Tensor, dict]:`
+    * Description: This function requires to return **direct observations** only. Former `rsl_rl` just require to set this function up for observations, but now we require users to also implement `get_reference_observations` even if no reference observations are used (just return `None`).
+* get_reference_observations
+    * former: `None`
+    * new: `tuple[tuple[torch.Tensor, torch.Tensor] | None, dict]`
+    * Description: This function requires to return **reference observations** only. The first element (tuple) contains `reference_observations` of shape (num_envs, *ref_obs_shape) (use zeros to fill up environments where no references are provided) and `reference_masks` of shape (num_envs,) indicating which environments have reference observations. The second element is a dictionary containing additional information. If no reference observations are used, return `None`, {}.
+* reset
+    * former: `reset(self) -> tuple[torch.Tensor, dict]:`
+    * new: `reset(self) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, dict]`
+    * Description: New reset also requires to reset reference observation buffers.
+* step
+    * former: `step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:`
+    * new: `step(self, actions: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor, torch.Tensor, dict]:`
+    * Description: New step also requires to return reference observations and masks.
+
+For update in `rsl_rl.runners.on_policy_runner_mm`, please check the `rsl_rl.runners.on_policy_runner_mm` module. You can simply refer to our project [GBC](https://github.com/sjtu-mvasl-robotics/GBC) for recommended usage.
+
+## Introduction
 
 
 Fast and simple implementation of RL algorithms, designed to run fully on GPU.
