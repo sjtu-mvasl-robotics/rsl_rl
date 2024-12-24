@@ -2,6 +2,9 @@
 
 Re-implemented some components for better imitation learning.
 
+**!!! Important !!!**:
+This version (`2.0.x-devx`) is not compatible with `legged_gym` since the interface (original interface) has been severely modified by ETHZ. To install the version for `legged_gym`, please use the `1.0.2` branch. 
+
 ## RSL RL MM Series Interface (2024-12-24)
 
 The RSL RL MM Series Interface is a new interface for the RSL RL framework. It is built upon `envs.MMVecEnv` and called only by  `rsl_rl.runners.on_policy_runner_mm`. The changes to the interface are as follows:

@@ -91,8 +91,12 @@ class MMVecEnv(VecEnv):
     """Number of privileged reference observations."""
     ref_obs_buf: torch.Tensor
     """Buffer for reference observations."""
+    ref_obs_mask_buf: torch.Tensor
+    """Buffer for reference observations masks."""
     privileged_ref_obs_buf: torch.Tensor
     """Buffer for privileged reference observations."""
+    privileged_ref_obs_mask_buf: torch.Tensor
+    """Buffer for privileged reference observations masks."""
 
     @abstractmethod
     def get_reference_observations(self) -> tuple[tuple[torch.Tensor, torch.Tensor] | None, dict]:
