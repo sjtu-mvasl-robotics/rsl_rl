@@ -57,7 +57,7 @@ class mycustomenv(MMVecEnv):
         rewards = torch.rand(self.num_envs, device=self.device)
         dones = torch.zeros(self.num_envs, device=self.device)
         infos = {}
-        return self.obs_buf, (self.ref_obs_buf, self.ref_obs_mask_buf), self.get_privileged_observations(), self.get_privileged_reference_observations(), rewards, dones, infos
+        return self.get_observations(), self.get_reference_observations(), self.get_privileged_observations(), self.get_privileged_reference_observations(), rewards, dones, infos
     
     def get_privileged_observations(self):
         return self.privileged_obs_buf if self.num_privileged_obs > 0 else self.get_observations()
@@ -109,7 +109,7 @@ train_cfg={
 
 num_envs = 1024
 num_obs = 64
-num_ref_obs = 40
+num_ref_obs = 0
 num_actions = 29
 max_episode_length = 100
 device = "cuda" if torch.cuda.is_available() else "cpu"

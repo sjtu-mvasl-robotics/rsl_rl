@@ -119,9 +119,11 @@ class OnPolicyRunnerMM:
         if ref_obs_tuple is not None:
             ref_obs, ref_obs_mask = ref_obs_tuple
             ref_obs, ref_obs_mask = ref_obs.to(self.device), ref_obs_mask.to(self.device)
+            ref_obs_tuple = (ref_obs, ref_obs_mask)
         if critic_ref_obs_tuple is not None:
             critic_ref_obs, critic_ref_obs_mask = critic_ref_obs_tuple
             critic_ref_obs, critic_ref_obs_mask = critic_ref_obs.to(self.device), critic_ref_obs_mask.to(self.device)
+            critic_ref_obs_tuple = (critic_ref_obs, critic_ref_obs_mask)
 
         self.alg.actor_critic.train() # switch to train mode (for dropout for example)
 
@@ -137,7 +139,7 @@ class OnPolicyRunnerMM:
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, (ref_obs, ref_obs_mask), critic_obs, (critic_ref_obs, critic_ref_obs_mask))
+                    actions = self.alg.act(obs, ref_obs_tuple, critic_obs, critic_ref_obs_tuple)
                     obs, ref_obs_tuple, privileged_obs, privileged_ref_obs_tuple, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     critic_ref_obs_tuple = privileged_ref_obs_tuple if privileged_ref_obs_tuple is not None else ref_obs_tuple
@@ -145,9 +147,11 @@ class OnPolicyRunnerMM:
                     if ref_obs_tuple is not None:
                         ref_obs, ref_obs_mask = ref_obs_tuple
                         ref_obs, ref_obs_mask = ref_obs.to(self.device), ref_obs_mask.to(self.device)
+                        ref_obs_tuple = (ref_obs, ref_obs_mask)
                     if critic_ref_obs_tuple is not None:
                         critic_ref_obs, critic_ref_obs_mask = critic_ref_obs_tuple
                         critic_ref_obs, critic_ref_obs_mask = critic_ref_obs.to(self.device), critic_ref_obs_mask.to(self.device)
+                        ref_obs_tuple = (critic_ref_obs, critic_ref_obs_mask)
                     self.alg.process_env_step(rewards, dones, infos)
                     
                     if self.log_dir is not None:
