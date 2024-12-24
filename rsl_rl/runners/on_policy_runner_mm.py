@@ -78,9 +78,9 @@ class OnPolicyRunnerMM:
             num_envs=self.env.num_envs,
             num_transitions_per_env=self.num_steps_per_env,
             actor_obs_shape=[num_obs],
-            actor_ref_obs_shape=[num_ref_obs] if num_ref_obs > 0 else None,
+            actor_ref_obs_shape=[num_ref_obs] if num_ref_obs > 0 else [None],
             critic_obs_shape=[num_critic_obs],
-            critic_ref_obs_shape=[num_critic_ref_obs] if num_critic_ref_obs > 0 else None,
+            critic_ref_obs_shape=[num_critic_ref_obs] if num_critic_ref_obs > 0 else [None],
             action_shape=[self.env.num_actions],
         )
 

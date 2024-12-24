@@ -91,9 +91,11 @@ class Transformer(nn.Module):
             num_layers = 4,
             ffn_ratio = 4,
             dropout = 0.1,
+            name = "",
             **kwargs
     ):
         super().__init__()
+        self.name = name
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
 
@@ -241,8 +243,8 @@ class ActorCriticMMTransformer(nn.Module):
             **kwargs
     ):
         super().__init__()
-        self.actor = Transformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, **kwargs)
-        self.critic = Transformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, **kwargs) # 1 for value function
+        self.actor = Transformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", **kwargs)
+        self.critic = Transformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
 
@@ -251,6 +253,20 @@ class ActorCriticMMTransformer(nn.Module):
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args = False
+
+    @staticmethod
+    # not used at the moment
+    def init_weights(sequential, scales):
+        [
+            torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
+            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
+        ]
+
+    def reset(self, dones=None):
+        pass
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
 
     @property
     def action_mean(self):
@@ -284,53 +300,53 @@ class ActorCriticMMTransformer(nn.Module):
         return value
     
 
-if __name__ == "__main__":
-    # Test ActorCriticMMTransformer
-    num_actor_obs = 64
-    num_actor_ref_obs = 40
-    num_critic_obs = 64
-    num_critic_ref_obs = 40
-    num_actions = 29
-    max_len = 4
-    dim_model = 128
-    num_layers = 4
-    num_heads = 4
-    init_noise_std = 1.0
-    batch_size = 4096
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# if __name__ == "__main__":
+#     # Test ActorCriticMMTransformer
+#     num_actor_obs = 64
+#     num_actor_ref_obs = 40
+#     num_critic_obs = 64
+#     num_critic_ref_obs = 40
+#     num_actions = 29
+#     max_len = 4
+#     dim_model = 128
+#     num_layers = 4
+#     num_heads = 4
+#     init_noise_std = 1.0
+#     batch_size = 4096
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    actor_critic = ActorCriticMMTransformer(
-        num_actor_obs=num_actor_obs,
-        num_actor_ref_obs=num_actor_ref_obs,
-        num_critic_obs=num_critic_obs,
-        num_critic_ref_obs=num_critic_ref_obs,
-        num_actions=num_actions,
-        max_len=max_len,
-        dim_model=dim_model,
-        num_layers=num_layers,
-        num_heads=num_heads,
-        init_noise_std=init_noise_std
-    ).to(device)
+#     actor_critic = ActorCriticMMTransformer(
+#         num_actor_obs=num_actor_obs,
+#         num_actor_ref_obs=num_actor_ref_obs,
+#         num_critic_obs=num_critic_obs,
+#         num_critic_ref_obs=num_critic_ref_obs,
+#         num_actions=num_actions,
+#         max_len=max_len,
+#         dim_model=dim_model,
+#         num_layers=num_layers,
+#         num_heads=num_heads,
+#         init_noise_std=init_noise_std
+#     ).to(device)
 
-    # Test forward pass
-    actor_obs = torch.randn(batch_size, num_actor_obs, device=device)
-    actor_ref_obs = torch.randn(batch_size, num_actor_ref_obs, device=device)
-    actor_ref_obs_mask = torch.randint(0, 2, (batch_size,), device=device).bool()
-    critic_obs = torch.randn(batch_size, num_critic_obs, device=device)
-    critic_ref_obs = torch.randn(batch_size,num_critic_ref_obs, device=device)
-    critic_ref_obs_mask = torch.randint(0, 2, (batch_size,), device=device).bool()
+#     # Test forward pass
+#     actor_obs = torch.randn(batch_size, num_actor_obs, device=device)
+#     actor_ref_obs = torch.randn(batch_size, num_actor_ref_obs, device=device)
+#     actor_ref_obs_mask = torch.randint(0, 2, (batch_size,), device=device).bool()
+#     critic_obs = torch.randn(batch_size, num_critic_obs, device=device)
+#     critic_ref_obs = torch.randn(batch_size,num_critic_ref_obs, device=device)
+#     critic_ref_obs_mask = torch.randint(0, 2, (batch_size,), device=device).bool()
 
-    import time
-    start = time.time()
-    for _ in range(100):
-        actions = actor_critic.act(actor_obs, (actor_ref_obs, actor_ref_obs_mask))
-        values = actor_critic.evaluate(critic_obs, (critic_ref_obs, critic_ref_obs_mask))
-    total_time = time.time() - start
-    print(f"Single inference time: {total_time / 100:.6f} s")
-    print(f"Actions: {actions}")
-    print(f"Values: {values}")
-    print(f"Action mean: {actor_critic.action_mean}")
-    print(f"Action std: {actor_critic.action_std}")
-    print(f"Entropy: {actor_critic.entropy}")
-    print(f"Actions log prob: {actor_critic.get_actions_log_prob(actions)}")
-    print(f"Actions inference: {actor_critic.act_inference(actor_obs, actor_ref_obs)}")
+#     import time
+#     start = time.time()
+#     for _ in range(100):
+#         actions = actor_critic.act(actor_obs, (actor_ref_obs, actor_ref_obs_mask))
+#         values = actor_critic.evaluate(critic_obs, (critic_ref_obs, critic_ref_obs_mask))
+#     total_time = time.time() - start
+#     print(f"Single inference time: {total_time / 100:.6f} s")
+#     print(f"Actions: {actions}")
+#     print(f"Values: {values}")
+#     print(f"Action mean: {actor_critic.action_mean}")
+#     print(f"Action std: {actor_critic.action_std}")
+#     print(f"Entropy: {actor_critic.entropy}")
+#     print(f"Actions log prob: {actor_critic.get_actions_log_prob(actions)}")
+#     print(f"Actions inference: {actor_critic.act_inference(actor_obs, actor_ref_obs)}")
