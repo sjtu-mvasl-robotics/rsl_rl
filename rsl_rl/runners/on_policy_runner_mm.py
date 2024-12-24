@@ -116,10 +116,12 @@ class OnPolicyRunnerMM:
         critic_obs = privileged_obs if privileged_obs is not None else obs
         critic_ref_obs_tuple = privileged_ref_obs_tuple if privileged_ref_obs_tuple is not None else ref_obs_tuple
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
-        ref_obs, ref_obs_mask = ref_obs_tuple
-        ref_obs, ref_obs_mask = ref_obs.to(self.device), ref_obs_mask.to(self.device)
-        critic_ref_obs, critic_ref_obs_mask = critic_ref_obs_tuple
-        critic_ref_obs, critic_ref_obs_mask = critic_ref_obs.to(self.device), critic_ref_obs_mask.to(self.device)
+        if ref_obs_tuple is not None:
+            ref_obs, ref_obs_mask = ref_obs_tuple
+            ref_obs, ref_obs_mask = ref_obs.to(self.device), ref_obs_mask.to(self.device)
+        if critic_ref_obs_tuple is not None:
+            critic_ref_obs, critic_ref_obs_mask = critic_ref_obs_tuple
+            critic_ref_obs, critic_ref_obs_mask = critic_ref_obs.to(self.device), critic_ref_obs_mask.to(self.device)
 
         self.alg.actor_critic.train() # switch to train mode (for dropout for example)
 
@@ -140,11 +142,12 @@ class OnPolicyRunnerMM:
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     critic_ref_obs_tuple = privileged_ref_obs_tuple if privileged_ref_obs_tuple is not None else ref_obs_tuple
                     obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
-                    ref_obs, ref_obs_mask = ref_obs_tuple
-                    ref_obs, ref_obs_mask = ref_obs.to(self.device), ref_obs_mask.to(self.device)
-
-                    critic_ref_obs, critic_ref_obs_mask = critic_ref_obs_tuple
-                    critic_ref_obs, critic_ref_obs_mask = critic_ref_obs.to(self.device), critic_ref_obs_mask.to(self.device)
+                    if ref_obs_tuple is not None:
+                        ref_obs, ref_obs_mask = ref_obs_tuple
+                        ref_obs, ref_obs_mask = ref_obs.to(self.device), ref_obs_mask.to(self.device)
+                    if critic_ref_obs_tuple is not None:
+                        critic_ref_obs, critic_ref_obs_mask = critic_ref_obs_tuple
+                        critic_ref_obs, critic_ref_obs_mask = critic_ref_obs.to(self.device), critic_ref_obs_mask.to(self.device)
                     self.alg.process_env_step(rewards, dones, infos)
                     
                     if self.log_dir is not None:
