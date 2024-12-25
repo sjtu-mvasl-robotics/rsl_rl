@@ -19,8 +19,17 @@ class ObsDeque(nn.Module):
         # Initialize buffer with zeros
         self.register_buffer('buffer', torch.zeros(1, max_len, obs_size))
         # Initialize current position
-        self.register_buffer('current_pos', torch.tensor(0, dtype=torch.long))
-        self.padded_len = None
+        self.current_pos = -1
+        self.padded_len = -1
+
+    def load_state_dict(self, state_dict, strict = True, assign = False):
+        batch_size = state_dict['buffer'].size(0)
+        if self.buffer.size(0) != batch_size:
+            self.buffer = torch.zeros(batch_size, self.max_len, self.obs_size, device=state_dict['buffer'].device, dtype=state_dict['buffer'].dtype)
+        return super().load_state_dict(state_dict, strict, assign)
+
+    def set_buffer_batch_size(self, batch_size):
+        self.buffer = torch.zeros(batch_size, self.max_len, self.obs_size, device=self.buffer.device, dtype=self.buffer.dtype)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -40,13 +49,13 @@ class ObsDeque(nn.Module):
         if self.buffer.size(0) != batch_size:
             # Reinitialize buffer for new batch size
             self.buffer = torch.zeros(batch_size, self.max_len, self.obs_size, device=x.device, dtype=x.dtype)
-            self.current_pos = torch.zeros(1, dtype=torch.long, device=x.device)
+            self.current_pos = 0
             self.padded_len = self.max_len
 
-        if self.padded_len and self.padded_len > 0:
+        if self.padded_len > 0:
             self.padded_len -= 1
 
-        pos = self.current_pos.item()
+        pos = self.current_pos
         # Insert new observation at the current position
         self.buffer[:, pos, :] = x.squeeze(1)
         # Update position
@@ -164,7 +173,7 @@ class Transformer(nn.Module):
         # obs_seq_pad_mask shape: (seq_len_obs,) -> (B, seq_len_obs)
         # obs_seq_pad_mask is False for positions which should not be considered for calculating attention
         obs_padding_mask = obs_padding_mask & obs_seq_pad_mask.unsqueeze(0)
-        obs_padding_mask = F.pad(obs_padding_mask, (1, 1), value=1)  # Account for CLS and SEP tokens
+        obs_padding_mask = F.pad(obs_padding_mask, (1, 1), value=1.0)  # Account for CLS and SEP tokens
         padding_masks.append(obs_padding_mask)  # Shape: (B, seq_len_obs + 2)
 
         # -------------------
@@ -192,7 +201,7 @@ class Transformer(nn.Module):
             # ref_obs_seq_pad_mask shape: (seq_len_ref_obs,) -> (B, seq_len_ref_obs)
             # ref_obs_seq_pad_mask is False for positions which should not be considered for calculating attention
             ref_obs_padding_mask = ref_obs_padding_mask & ref_obs_seq_pad_mask.unsqueeze(0)
-            ref_obs_padding_mask = F.pad(ref_obs_padding_mask, (1, 1), value=1)  # Account for CLS and SEP tokens
+            ref_obs_padding_mask = F.pad(ref_obs_padding_mask, (1, 1), value=1.0)  # Account for CLS and SEP tokens
 
             # Update padding mask: set to 0 where ref_obs_mask is False
             # ref_obs_mask shape: (B, 1, 1) -> (B, 1)
@@ -261,6 +270,16 @@ class ActorCriticMMTransformer(nn.Module):
             torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
             for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
         ]
+
+    def load_state_dict(self, state_dict, strict = True, assign = False):
+        self.actor.obs_deque.set_buffer_batch_size(state_dict['actor.obs_deque.buffer'].size(0))
+        if self.actor.ref_obs_deque is not None:
+            self.actor.ref_obs_deque.set_buffer_batch_size(state_dict['actor.ref_obs_deque.buffer'].size(0))
+        self.critic.obs_deque.set_buffer_batch_size(state_dict['critic.obs_deque.buffer'].size(0))
+        if self.critic.ref_obs_deque is not None:
+            self.critic.ref_obs_deque.set_buffer_batch_size(state_dict['critic.ref_obs_deque.buffer'].size(0))
+
+        return super().load_state_dict(state_dict, strict, assign)
 
     def reset(self, dones=None):
         pass

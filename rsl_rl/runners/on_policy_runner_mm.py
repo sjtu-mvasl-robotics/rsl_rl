@@ -37,8 +37,8 @@ class OnPolicyRunnerMM:
             num_critic_obs = extras["observations"]["critic"].shape[1]
         else:
             num_critic_obs = num_obs
-        if "critic" in ref_extras["observations"]:
-            num_critic_ref_obs = ref_extras["observations"]["critic"].shape[1]
+        if "critic" in ref_extras["ref_observations"]:
+            num_critic_ref_obs = ref_extras["ref_observations"]["critic"].shape[1]
         else:
             num_critic_ref_obs = num_ref_obs
             
@@ -121,7 +121,7 @@ class OnPolicyRunnerMM:
         obs, extras = self.env.get_observations()
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
         critic_obs = extras["observations"].get("critic", obs)
-        critic_ref_obs_tuple = ref_extras["observations"].get("critic", ref_obs_tuple) if ref_obs_tuple is not None else None
+        critic_ref_obs_tuple = ref_extras["ref_observations"].get("critic", ref_obs_tuple) if ref_obs_tuple is not None else None
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         if ref_obs_tuple is not None:
             ref_obs_tuple = tuple(ref_obs.to(self.device) for ref_obs in ref_obs_tuple)
@@ -165,8 +165,8 @@ class OnPolicyRunnerMM:
                         critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
                     else:
                         critic_obs = obs
-                    if "critic" in infos["reference_observations"]:
-                        critic_ref_obs_tuple = infos["reference_observations"]["critic"]
+                    if "critic" in infos["ref_observations"]:
+                        critic_ref_obs_tuple = infos["ref_observations"]["critic"]
                         if self.critic_ref_obs_normalizer is not None:
                             critic_ref_obs_tuple = (self.critic_ref_obs_normalizer(critic_ref_obs_tuple[0]), critic_ref_obs_tuple[1])
                     else:
