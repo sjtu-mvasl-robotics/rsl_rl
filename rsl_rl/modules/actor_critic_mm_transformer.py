@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 from typing import Optional, Tuple
-from collections import deque
+from timm.models.vision_transformer import LayerScale
 
 
 class ObsDeque(nn.Module):
@@ -49,7 +49,7 @@ class ObsDeque(nn.Module):
         if self.buffer.size(0) != batch_size:
             # Reinitialize buffer for new batch size
             self.buffer = torch.zeros(batch_size, self.max_len, self.obs_size, device=x.device, dtype=x.dtype)
-            self.current_pos = 0
+            self.current_pos = self.max_len - 1
             self.padded_len = self.max_len
 
         if self.padded_len > 0:
@@ -58,15 +58,16 @@ class ObsDeque(nn.Module):
         pos = self.current_pos
         # Insert new observation at the current position
         self.buffer[:, pos, :] = x.squeeze(1)
+        self.buffer = self.buffer.detach()
         # Update position
-        self.current_pos = (self.current_pos + 1) % self.max_len
+        self.current_pos = (self.current_pos - 1) % self.max_len
         # create mask, 0 to padded_len - 1 is False, others are True. If padded_len is None or 0, all are True
-        if not self.padded_len:
-            seq_mask = torch.ones(self.max_len, dtype=torch.bool, device=x.device)
-        else:
-            seq_mask = torch.arange(self.max_len, device=x.device) >= self.padded_len
+        # if not self.padded_len:
+        #     seq_mask = torch.ones(self.max_len, dtype=torch.bool, device=x.device)
+        # else:
+        #     seq_mask = torch.arange(self.max_len, device=x.device) >= self.padded_len
 
-        return self.buffer, seq_mask
+        return self.buffer #, seq_mask
 
     
 
@@ -99,7 +100,7 @@ class Transformer(nn.Module):
             num_heads = 8,
             num_layers = 4,
             ffn_ratio = 4,
-            dropout = 0.1,
+            dropout = 0.0,
             name = "",
             **kwargs
     ):
@@ -132,6 +133,7 @@ class Transformer(nn.Module):
             nn.LayerNorm(dim_model),
             nn.Linear(dim_model, dim_out)
         )
+        self.out_ls = LayerScale(dim_out, init_values=1e-3)
 
     def forward(
         self, 
@@ -157,7 +159,8 @@ class Transformer(nn.Module):
         assert (self.ref_obs_deque is not None) or (ref_obs is None), "Cannot run multi-modality mode with ref_obs_size=0"
 
         # Preprocess observations
-        obs, obs_seq_pad_mask = self.obs_deque(obs)
+        # obs, obs_seq_pad_mask = self.obs_deque(obs)
+        obs = self.obs_deque(obs)
 
         # -------------------
         # Process obs embeddings
@@ -172,7 +175,7 @@ class Transformer(nn.Module):
         obs_padding_mask = torch.ones(obs.size(0), obs.size(1), dtype=torch.bool, device=obs.device) # Shape: (B, seq_len_obs)
         # obs_seq_pad_mask shape: (seq_len_obs,) -> (B, seq_len_obs)
         # obs_seq_pad_mask is False for positions which should not be considered for calculating attention
-        obs_padding_mask = obs_padding_mask & obs_seq_pad_mask.unsqueeze(0)
+        # obs_padding_mask = obs_padding_mask & obs_seq_pad_mask.unsqueeze(0)
         obs_padding_mask = F.pad(obs_padding_mask, (1, 1), value=1.0)  # Account for CLS and SEP tokens
         padding_masks.append(obs_padding_mask)  # Shape: (B, seq_len_obs + 2)
 
@@ -183,11 +186,11 @@ class Transformer(nn.Module):
             ref_obs_tensor, ref_obs_mask = ref_obs  # Unpack the tuple
 
             # Preprocess reference observations
-            ref_obs_tensor, ref_obs_seq_pad_mask = self.ref_obs_deque(ref_obs_tensor)
+            ref_obs_tensor = self.ref_obs_deque(ref_obs_tensor)
             ref_obs_emb = self.ref_obs_embedding(ref_obs_tensor)  # Shape: (B, seq_len_ref_obs, dim_model)
-            cls_ref_emb = self.cls_token.expand(ref_obs_emb.size(0), -1, -1)  # Shape: (B, 1, dim_model)
+            # cls_ref_emb = self.cls_token.expand(ref_obs_emb.size(0), -1, -1)  # Shape: (B, 1, dim_model)
             sep_ref_emb = self.sep_token.expand(ref_obs_emb.size(0), -1, -1)  # Shape: (B, 1, dim_model)
-            ref_obs_emb = torch.cat([cls_ref_emb, ref_obs_emb, sep_ref_emb], dim=1)  # Shape: (B, seq_len_ref_obs + 2, dim_model)
+            ref_obs_emb = torch.cat([ref_obs_emb, sep_ref_emb], dim=1)  # Shape: (B, seq_len_ref_obs + 2, dim_model)
 
             # Apply the ref_obs_mask to zero out embeddings where ref_obs is not present
             # ref_obs_mask shape: (B,) -> (B, 1, 1) for broadcasting
@@ -200,8 +203,8 @@ class Transformer(nn.Module):
             ref_obs_padding_mask = torch.ones(ref_obs_tensor.size(0), ref_obs_tensor.size(1), dtype=torch.bool, device=ref_obs_tensor.device) # Shape: (B, seq_len_ref_obs)
             # ref_obs_seq_pad_mask shape: (seq_len_ref_obs,) -> (B, seq_len_ref_obs)
             # ref_obs_seq_pad_mask is False for positions which should not be considered for calculating attention
-            ref_obs_padding_mask = ref_obs_padding_mask & ref_obs_seq_pad_mask.unsqueeze(0)
-            ref_obs_padding_mask = F.pad(ref_obs_padding_mask, (1, 1), value=1.0)  # Account for CLS and SEP tokens
+            # ref_obs_padding_mask = ref_obs_padding_mask & ref_obs_seq_pad_mask.unsqueeze(0)
+            ref_obs_padding_mask = F.pad(ref_obs_padding_mask, (0, 1), value=1.0)  # Account for CLS and SEP tokens
 
             # Update padding mask: set to 0 where ref_obs_mask is False
             # ref_obs_mask shape: (B, 1, 1) -> (B, 1)
@@ -225,12 +228,13 @@ class Transformer(nn.Module):
         # -------------------
         # x = x.transpose(0, 1)  # Shape: (total_seq_len, B, dim_model)
         x = self.transformer(x, src_key_padding_mask=padding_mask)  # Transformer expects shape (S, B, E)
-        x = x[:,-1, :]  # Take the last token's output: Shape (B, dim_model)
+        x = x[:, 0, :]  # Take the last token's output: Shape (B, dim_model)
 
         # -------------------
         # Final fully connected layer
         # -------------------
         x = self.fc(x)  # Shape: (B, output_dim)
+        x = self.out_ls(x)
         return x
     
 
