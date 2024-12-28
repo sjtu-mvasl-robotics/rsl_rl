@@ -56,9 +56,10 @@ class ObsDeque(nn.Module):
             self.padded_len -= 1
 
         pos = self.current_pos
-        # Insert new observation at the current position
-        self.buffer[:, pos, :] = x.squeeze(1)
-        self.buffer = self.buffer.detach()
+        # Insert new observation at the current position (first detach then assign)
+        self.buffer[:, pos, :] = x.squeeze(1).detach()
+
+        # self.buffer = self.buffer.detach()
         # Update position
         self.current_pos = (self.current_pos - 1) % self.max_len
         # create mask, 0 to padded_len - 1 is False, others are True. If padded_len is None or 0, all are True
@@ -76,7 +77,10 @@ class ObservationEmbedding(nn.Module):
     def __init__(self, num_obs, d_model, max_len=16):
         super().__init__()
         self.d_model = d_model
-        self.embedding = nn.Linear(num_obs, d_model)
+        self.embedding = nn.Sequential(
+            nn.Linear(num_obs, d_model),
+            nn.GELU()
+        )
         self.pos_embedding = nn.Embedding(max_len, d_model)
 
     def forward(self, x):
@@ -102,6 +106,7 @@ class Transformer(nn.Module):
             ffn_ratio = 4,
             dropout = 0.0,
             name = "",
+            ls_init_values = 1e-3,
             **kwargs
     ):
         super().__init__()
@@ -117,8 +122,8 @@ class Transformer(nn.Module):
         else:
             self.ref_obs_deque = ObsDeque(max_len, ref_obs_size)
             self.ref_obs_embedding = ObservationEmbedding(ref_obs_size, dim_model, max_len)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim_model))
-        self.sep_token = nn.Parameter(torch.randn(1, 1, dim_model))
+        self.cls_token = nn.Parameter(torch.ones(1, 1, dim_model))
+        self.sep_token = nn.Parameter(torch.zeros(1, 1, dim_model))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim_model,
             nhead=num_heads,
@@ -127,13 +132,14 @@ class Transformer(nn.Module):
             activation='gelu',
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers, norm=nn.LayerNorm(dim_model))
         # Like BERT, we use the last token to represent the whole sequence
         self.fc = nn.Sequential(
             nn.LayerNorm(dim_model),
-            nn.Linear(dim_model, dim_out)
+            nn.Linear(dim_model, dim_out),
+            nn.ELU()
         )
-        self.out_ls = LayerScale(dim_out, init_values=1e-3)
+        # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
 
     def forward(
         self, 
@@ -161,6 +167,7 @@ class Transformer(nn.Module):
         # Preprocess observations
         # obs, obs_seq_pad_mask = self.obs_deque(obs)
         obs = self.obs_deque(obs)
+        # obs = obs.unsqueeze(1)  # Add a singleton dimension for sequence length
 
         # -------------------
         # Process obs embeddings
@@ -168,7 +175,7 @@ class Transformer(nn.Module):
         obs_emb = self.obs_embedding(obs)  # Shape: (B, seq_len_obs, dim_model)
         cls_emb = self.cls_token.expand(obs.size(0), -1, -1)  # Shape: (B, 1, dim_model)
         sep_emb = self.sep_token.expand(obs.size(0), -1, -1)  # Shape: (B, 1, dim_model)
-        obs_emb = torch.cat([cls_emb, obs_emb, sep_emb], dim=1)  # Shape: (B, seq_len_obs + 2, dim_model)
+        # obs_emb = torch.cat([cls_emb, obs_emb, sep_emb], dim=1)  # Shape: (B, seq_len_obs + 2, dim_model)
         embeddings.append(obs_emb)
 
         # Create padding mask for obs: 1 for non-padding, 0 for padding
@@ -227,14 +234,14 @@ class Transformer(nn.Module):
         # Transformer processing
         # -------------------
         # x = x.transpose(0, 1)  # Shape: (total_seq_len, B, dim_model)
-        x = self.transformer(x, src_key_padding_mask=padding_mask)  # Transformer expects shape (S, B, E)
-        x = x[:, 0, :]  # Take the last token's output: Shape (B, dim_model)
+        x = self.transformer(x)#, src_key_padding_mask=padding_mask)  # Transformer expects shape (S, B, E)
+        x = x[:, -1, :]  # Take the first token's output: Shape (B, dim_model)
 
         # -------------------
         # Final fully connected layer
         # -------------------
         x = self.fc(x)  # Shape: (B, output_dim)
-        x = self.out_ls(x)
+        # x = self.out_ls(x)
         return x
     
 
@@ -256,10 +263,44 @@ class ActorCriticMMTransformer(nn.Module):
             **kwargs
     ):
         super().__init__()
-        self.actor = Transformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", **kwargs)
-        self.critic = Transformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", **kwargs) # 1 for value function
+        self.actor = Transformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", ls_init_values=1e-2, **kwargs)
+        self.critic = Transformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", ls_init_values=1, **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
+        # self.actor.fc[0].weight.data *= 1e-2
+        # actor_hidden_dims=[512, 256, 128]
+        # critic_hidden_dims=[512, 256, 128]
+        # activation="elu"
+        # activation = nn.ELU() if activation == "elu" else nn.ReLU()
+        # mlp_input_dim_a = num_actor_obs
+        # mlp_input_dim_c = num_critic_obs
+        # # Policy
+        # actor_layers = []
+        # actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
+        # actor_layers.append(activation)
+        # for layer_index in range(len(actor_hidden_dims)):
+        #     if layer_index == len(actor_hidden_dims) - 1:
+        #         actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
+        #     else:
+        #         actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
+        #         actor_layers.append(activation)
+        # self.actor = nn.Sequential(*actor_layers)
+
+        # # Value function
+        # critic_layers = []
+        # critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
+        # critic_layers.append(activation)
+        # for layer_index in range(len(critic_hidden_dims)):
+        #     if layer_index == len(critic_hidden_dims) - 1:
+        #         critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
+        #     else:
+        #         critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
+        #         critic_layers.append(activation)
+        # self.critic = nn.Sequential(*critic_layers)
+
+        # print(f"Actor MLP: {self.actor}")
+        # print(f"Critic MLP: {self.critic}")
+
 
         # Action noise
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
@@ -305,7 +346,7 @@ class ActorCriticMMTransformer(nn.Module):
 
     def update_distribution(self, observations, ref_observations=None):
         mean = self.actor(observations, ref_observations)
-        self.distribution = Normal(mean, mean * 0.0 + self.std)
+        self.distribution = Normal(mean, 0.0 * mean + self.std)
 
     def act(self, observations, ref_observations=None, **kwargs):
         self.update_distribution(observations, ref_observations)
@@ -323,33 +364,35 @@ class ActorCriticMMTransformer(nn.Module):
         return value
     
 
-# if __name__ == "__main__":
-#     # Test ActorCriticMMTransformer
-#     num_actor_obs = 64
-#     num_actor_ref_obs = 40
-#     num_critic_obs = 64
-#     num_critic_ref_obs = 40
-#     num_actions = 29
-#     max_len = 4
-#     dim_model = 128
-#     num_layers = 4
-#     num_heads = 4
-#     init_noise_std = 1.0
-#     batch_size = 4096
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if __name__ == "__main__":
+    # Test ActorCriticMMTransformer
+    num_actor_obs = 64
+    num_actor_ref_obs = 40
+    num_critic_obs = 64
+    num_critic_ref_obs = 40
+    num_actions = 29
+    max_len = 4
+    dim_model = 128
+    num_layers = 4
+    num_heads = 4
+    init_noise_std = 1.0
+    batch_size = 256
+    device = "cpu"
 
-#     actor_critic = ActorCriticMMTransformer(
-#         num_actor_obs=num_actor_obs,
-#         num_actor_ref_obs=num_actor_ref_obs,
-#         num_critic_obs=num_critic_obs,
-#         num_critic_ref_obs=num_critic_ref_obs,
-#         num_actions=num_actions,
-#         max_len=max_len,
-#         dim_model=dim_model,
-#         num_layers=num_layers,
-#         num_heads=num_heads,
-#         init_noise_std=init_noise_std
-#     ).to(device)
+    actor_critic = ActorCriticMMTransformer(
+        num_actor_obs=num_actor_obs,
+        num_actor_ref_obs=num_actor_ref_obs,
+        num_critic_obs=num_critic_obs,
+        num_critic_ref_obs=num_critic_ref_obs,
+        num_actions=num_actions,
+        max_len=max_len,
+        dim_model=dim_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        init_noise_std=init_noise_std
+    ).to(device)
+
+    print(actor_critic)
 
 #     # Test forward pass
 #     actor_obs = torch.randn(batch_size, num_actor_obs, device=device)

@@ -184,6 +184,9 @@ class OnPolicyRunnerMM:
                             ep_infos.append(infos["episode"])
                         elif "log" in infos:
                             ep_infos.append(infos["log"])
+
+                        # clip rewards < 0 to 0
+                        # rewards = torch.clamp(rewards, min=0.0)
                         cur_reward_sum += rewards
                         cur_episode_length += 1
                         new_ids = (dones > 0).nonzero(as_tuple=False)
@@ -342,7 +345,19 @@ class OnPolicyRunnerMM:
         if self.cfg["empirical_normalization"]:
             if device is not None:
                 self.obs_normalizer.to(device)
-            policy = lambda x: self.alg.actor_critic.act_inference(self.obs_normalizer(x))  # noqa: E731
+                if self.ref_obs_normalizer is not None:
+                    self.ref_obs_normalizer.to(device)
+                    # policy = lambda x, ref_x: self.alg.actor_critic.act_inference(self.obs_normalizer(x), ref_x)  # noqa: E731
+                    def pol(x, ref_x):
+                        if ref_x is not None:
+                            assert self.ref_obs_normalizer is not None
+                            return self.alg.actor_critic.act_inference(self.obs_normalizer(x), (self.ref_obs_normalizer(ref_x[0]), ref_x[1]))
+                        else:
+                            return self.alg.actor_critic.act_inference(self.obs_normalizer(x), ref_x)
+                    policy = pol
+                
+                else:
+                    policy = lambda x, ref_x: self.alg.actor_critic.act_inference(self.obs_normalizer(x), ref_x)
         return policy
 
     def train_mode(self):
