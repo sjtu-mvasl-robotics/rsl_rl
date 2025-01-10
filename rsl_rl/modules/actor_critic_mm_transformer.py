@@ -125,7 +125,7 @@ class Transformer(nn.Module):
             sep_ref_emb = self.sep_token.expand(ref_obs_emb.size(0), -1, -1)  # Shape: (B, 1, dim_model)
             
             # Create padding mask for ref_obs: 1 for non-padding, 0 for padding
-            ref_obs_padding_mask = torch.ones(ref_obs_tensor.size(0), ref_obs_tensor.size(1), dtype=torch.bool, device=ref_obs_tensor.device) # Shape: (B, seq_len_ref_obs)
+            ref_obs_padding_mask = torch.ones(ref_obs_emb.size(0), ref_obs_emb.size(1), dtype=torch.bool, device=ref_obs_emb.device) # Shape: (B, seq_len_ref_obs)
             ref_obs_emb = torch.cat([ref_obs_emb, sep_ref_emb], dim=1)  # Shape: (B, seq_len_ref_obs + 2, dim_model)
 
             # Apply the ref_obs_mask to zero out embeddings where ref_obs is not present
