@@ -48,14 +48,10 @@ class Transformer(nn.Module):
         self.name = name
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
-
-        # self.obs_deque = ObsDeque(max_len, obs_size)
         self.obs_embedding = ObservationEmbedding(obs_size, dim_model, max_len)
         if ref_obs_size == 0:
-            self.ref_obs_deque = None
             self.ref_obs_embedding = None
         else:
-            # self.ref_obs_deque = ObsDeque(max_len, ref_obs_size)
             self.ref_obs_embedding = ObservationEmbedding(ref_obs_size, dim_model, max_len)
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim_model))
         self.sep_token = nn.Parameter(torch.randn(1, 1, dim_model))
@@ -96,12 +92,7 @@ class Transformer(nn.Module):
         embeddings = []
         padding_masks = []
 
-        assert (self.ref_obs_deque is not None) or (ref_obs is None), "Cannot run multi-modality mode with ref_obs_size=0"
-
-        # Preprocess observations
-        # obs, obs_seq_pad_mask = self.obs_deque(obs)
-        # obs = self.obs_deque(obs)
-        # obs = obs.unsqueeze(1)  # Add a singleton dimension for sequence length
+        assert (self.ref_obs_embedding is not None) or (ref_obs is None), "Cannot run multi-modality mode with ref_obs_size=0"
 
         # -------------------
         # Process obs embeddings
@@ -200,8 +191,8 @@ class ActorCriticMMTransformer(nn.Module):
             **kwargs
     ):
         super().__init__()
-        self.actor = Transformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", ls_init_values=1e-2, **kwargs)
-        self.critic = Transformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", ls_init_values=1, **kwargs) # 1 for value function
+        self.actor = Transformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", **kwargs)
+        self.critic = Transformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
         # Action noise
