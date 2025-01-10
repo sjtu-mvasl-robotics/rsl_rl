@@ -115,7 +115,7 @@ class Transformer(nn.Module):
         # -------------------
         # Process ref_obs embeddings (if provided)
         # -------------------
-        if ref_obs is not None and self.ref_obs_deque is not None:
+        if ref_obs is not None and self.ref_obs_embedding is not None:
             ref_obs_tensor, ref_obs_mask = ref_obs  # Unpack the tuple
 
             # Preprocess reference observations
