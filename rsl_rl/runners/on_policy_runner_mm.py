@@ -38,7 +38,7 @@ class OnPolicyRunnerMM:
         else:
             num_critic_obs = num_obs
         if "critic" in ref_extras["ref_observations"]:
-            num_critic_ref_obs = ref_extras["ref_observations"]["critic"].shape[1]
+            num_critic_ref_obs = ref_extras["ref_observations"]["critic"][0].shape[1]
         else:
             num_critic_ref_obs = num_ref_obs
             
