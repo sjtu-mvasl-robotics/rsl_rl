@@ -7,7 +7,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-
+import time
 
 class ActorCritic(nn.Module):
     is_recurrent = False
@@ -101,8 +101,11 @@ class ActorCritic(nn.Module):
         self.distribution = Normal(mean, mean * 0.0 + self.std)
 
     def act(self, observations, **kwargs):
+        # time_start = time.time()
         self.update_distribution(observations)
-        return self.distribution.sample()
+        sample = self.distribution.sample()
+        # print(f"ActorCritic.act took {time.time() - time_start} seconds, sample shape: {sample.shape}")
+        return sample
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)

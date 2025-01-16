@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from typing import Optional, Tuple
 # from timm.models.vision_transformer import LayerScale
+import time
 
 class ObservationEmbedding(nn.Module):
     def __init__(self, num_obs, d_model, max_len=16):
@@ -64,7 +65,6 @@ class Transformer(nn.Module):
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers, norm=nn.LayerNorm(dim_model))
-        # Like BERT, we use the last token to represent the whole sequence
         self.fc = nn.Sequential(
             nn.LayerNorm(dim_model),
             nn.Linear(dim_model, dim_out),
@@ -233,7 +233,8 @@ class ActorCriticMMTransformer(nn.Module):
 
     def act(self, observations, ref_observations=None, **kwargs):
         self.update_distribution(observations, ref_observations)
-        return self.distribution.sample()
+        sample = self.distribution.sample()
+        return sample
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)

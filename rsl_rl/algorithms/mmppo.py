@@ -9,6 +9,7 @@ import torch.optim as optim
 
 from rsl_rl.modules import ActorCriticMMTransformer
 from rsl_rl.storage import RolloutStorageMM
+import time
 
 
 class MMPPO:
@@ -113,8 +114,8 @@ class MMPPO:
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(self):
-        mean_value_loss = 0
-        mean_surrogate_loss = 0
+        mean_value_loss = torch.tensor(0.0).to(self.device)
+        mean_surrogate_loss = torch.tensor(0.0).to(self.device)
         # if self.actor_critic.is_recurrent:
         #     generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs) #
         # else:
@@ -185,19 +186,17 @@ class MMPPO:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
-
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
-
-            mean_value_loss += value_loss.item()
-            mean_surrogate_loss += surrogate_loss.item()
+            mean_value_loss += value_loss
+            mean_surrogate_loss += surrogate_loss
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss
+        return mean_value_loss.item(), mean_surrogate_loss.item()
