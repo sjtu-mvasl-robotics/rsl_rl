@@ -31,12 +31,16 @@ class MMPPO:
         schedule="fixed",
         desired_kl=0.01,
         device="cpu",
+        ref_action_idx=0,
+        teacher_coef=None,
     ):
         self.device = device
 
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.ref_action_idx = ref_action_idx
+        self.teacher_coef = teacher_coef
 
         # PPO components
         self.actor_critic = actor_critic
@@ -116,6 +120,7 @@ class MMPPO:
     def update(self):
         mean_value_loss = torch.tensor(0.0).to(self.device)
         mean_surrogate_loss = torch.tensor(0.0).to(self.device)
+        mean_imitation_loss = torch.tensor(0.0).to(self.device)
         # if self.actor_critic.is_recurrent:
         #     generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs) #
         # else:
@@ -185,7 +190,18 @@ class MMPPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # Imitation Entropy loss (optional, arxiv: 2409.08904)
+            # This loss is calculated only when critic_ref_obs_batch is not None, otherwise 0.0
+            # By default, we assume that ref_action_batch = critic_ref_obs_batch[0][:, ref_action_idx: num_actions + ref_action_idx] where ref_action_idx = 0
+            if self.teacher_coef is not None and critic_ref_obs_batch is not None:
+                ref_action_batch = critic_ref_obs_batch[0][:, self.ref_action_idx: self.ref_action_idx + actions_batch.shape[-1]]
+                ref_action_mask = critic_ref_obs_batch[1].float()
+                imitation_loss = torch.sum((torch.square(mu_batch - ref_action_batch) / (2.0 * torch.square(sigma_batch) + 1e-5) * ref_action_mask), axis=-1).mean() 
+                imitation_loss = self.teacher_coef * imitation_loss
+            else:
+                imitation_loss = 0.0     
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + imitation_loss
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
@@ -193,10 +209,12 @@ class MMPPO:
             self.optimizer.step()
             mean_value_loss += value_loss
             mean_surrogate_loss += surrogate_loss
+            mean_imitation_loss += imitation_loss
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        mean_imitation_loss /= num_updates
         self.storage.clear()
 
-        return mean_value_loss.item(), mean_surrogate_loss.item()
+        return mean_value_loss.item(), mean_surrogate_loss.item(), mean_imitation_loss.item()
