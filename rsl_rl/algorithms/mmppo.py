@@ -196,7 +196,7 @@ class MMPPO:
             if self.teacher_coef is not None and critic_ref_obs_batch is not None:
                 ref_action_batch = critic_ref_obs_batch[0][:, self.ref_action_idx: self.ref_action_idx + actions_batch.shape[-1]]
                 ref_action_mask = critic_ref_obs_batch[1].float()
-                imitation_loss = torch.sum((torch.square(mu_batch - ref_action_batch) / (2.0 * torch.square(sigma_batch) + 1e-5) * ref_action_mask), axis=-1).mean() 
+                imitation_loss = torch.sum(torch.sum((torch.square(mu_batch - ref_action_batch) / (2.0 * torch.square(sigma_batch) + 1e-5)), axis=-1) * ref_action_mask) / (ref_action_mask.sum() + 1e-5)
                 imitation_loss = self.teacher_coef * imitation_loss
             else:
                 imitation_loss = 0.0     
