@@ -141,6 +141,7 @@ class OnPolicyRunnerMM:
             start = time.time()
             # Rollout
             with torch.inference_mode():
+                # ref_obss = []
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(#obs, critic_obs)
                         obs=obs,
@@ -157,6 +158,7 @@ class OnPolicyRunnerMM:
                         dones.to(self.device),
                     )
                     ref_obs_tuple = tuple(ref_obs.to(self.device) for ref_obs in ref_obs_tuple) if ref_obs_tuple is not None else None
+                    # ref_obss.append(ref_obs_tuple[0])
                     # perform normalization
                     obs = self.obs_normalizer(obs)
                     if ref_obs_tuple is not None and self.ref_obs_normalizer is not None:
@@ -197,6 +199,9 @@ class OnPolicyRunnerMM:
 
                 stop = time.time()
                 collection_time = stop - start
+                # ref_obss = torch.stack(ref_obss, dim=1) if ref_obss else None
+                # if ref_obss is not None:
+                #     torch.save(ref_obss, os.path.join(self.log_dir, f"ref_obs_{it}.pkl"))
 
                 # Learning step
                 start = stop
