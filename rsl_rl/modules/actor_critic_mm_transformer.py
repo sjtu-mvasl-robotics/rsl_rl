@@ -70,7 +70,7 @@ class MMTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers, norm=nn.LayerNorm(dim_model))
         self.fc = nn.Sequential(
-            nn.LayerNorm(dim_model),
+            # nn.LayerNorm(dim_model),
             nn.Linear(dim_model, dim_out),
         )
         # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
@@ -263,6 +263,70 @@ class Transformer(nn.Module):
         # -------------------
         x = self.fc(x)  # Shape: (B, output_dim)
         # x = self.out_ls(x)
+        return x
+    
+class DebugMLP(nn.Module):
+    '''
+        This class is for debugging only.
+        Do not use it for real PPO training.
+    '''
+    def __init__(
+            self,
+            obs_size,
+            ref_obs_size,
+            dim_out,
+            dim_model,
+            max_len = 128,
+            num_heads = 8,
+            num_layers = 4,
+            ffn_ratio = 4,
+            dropout = 0.0,
+            name = "",
+            ls_init_values = 1e-3,
+            **kwargs
+    ):
+        super().__init__()
+        self.name = name
+        self.obs_size = obs_size
+        self.ref_obs_size = ref_obs_size
+        if kwargs:
+            print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
+        self.layers = nn.Sequential(
+            nn.Linear(obs_size + ref_obs_size, 768),
+            nn.ReLU(),
+            nn.Linear(768, 384),
+            nn.ReLU(),
+            nn.Linear(384, 128),
+            nn.ReLU(),
+            nn.Linear(128, dim_out),
+        )
+
+    def forward(
+        self, 
+        obs: torch.Tensor, 
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        """
+        Forward pass for the multi-modality transformer.
+
+        Args:
+            obs (torch.Tensor): Observation tensor of shape (B, seq_len_obs, dim_in).
+            ref_obs (Optional[Tuple[torch.Tensor, torch.Tensor]]): 
+                A tuple containing:
+                - ref_obs_tensor (torch.Tensor): Reference observations of shape (B, seq_len_ref_obs, dim_in).
+                - ref_obs_mask (torch.Tensor): Mask tensor of shape (B,) indicating the presence of ref_obs.
+
+        Returns:
+            torch.Tensor: Output tensor after transformer and fully connected layer.
+        """
+        embeddings = []
+
+        if ref_obs is not None:
+            ref_obs_tensor, _ = ref_obs  # Unpack the tuple
+        else:
+            ref_obs_tensor = torch.zeros(self.ref_obs_size, device=obs.device).unsqueeze(0).expand(obs.size(0), -1)  # Shape: (B, seq_len_ref_obs)
+        obs = torch.cat([obs, ref_obs_tensor], dim=1)  # Concatenate obs and ref_obs along the last dimension
+        x = self.layers(obs)  # Shape: (B, dim_out)
         return x
 
 
