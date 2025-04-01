@@ -168,6 +168,11 @@ class MMTransformer(nn.Module):
         # -------------------
         x = self.transformer(x, src_key_padding_mask=padding_mask)  # Transformer expects shape (S, B, E)
         x = x[:, 0, :]  # Take the first token's output: Shape (B, dim_model)
+        # padding_mask = ~padding_mask # Inverted mask: True for non-padding tokens
+        # # Apply average pooling over non-padding tokens
+        # x = x.masked_fill(padding_mask.unsqueeze(-1), 0)  # Set padding tokens to zero
+        # x = x.sum(dim=1)  # Sum over the sequence length dimension, x shape: (B, dim_model)
+        # x = x / padding_mask.sum(dim=1, keepdim=True)  # Normalize by the number of non-padding tokens
 
         # -------------------
         # Final fully connected layer
@@ -344,10 +349,16 @@ class ActorCriticMMTransformer(nn.Module):
             num_layers=4,
             num_heads=8,
             init_noise_std=1.0,
+            load_dagger=False,
+            load_dagger_path=None,
             **kwargs
     ):
         super().__init__()
+        assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
         self.actor = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", **kwargs)
+        self.actor_dagger = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", **kwargs) if load_dagger else None
+        if load_dagger:
+            self.load_dagger_weights(load_dagger_path)
         self.critic = MMTransformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
@@ -356,6 +367,14 @@ class ActorCriticMMTransformer(nn.Module):
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args = False
+        
+    def load_dagger_weights(self, path):
+        state_dict = torch.load(path)
+        # check for 'actor' in the state_dict keys
+        assert 'actor' in state_dict.keys(), f"Key 'actor' not found in state_dict keys: {state_dict.keys()}, failed to load dagger weights"
+        # load the actor weights to actor_dagger
+        self.actor_dagger.load_state_dict(state_dict['actor'])
+        print(f"Loaded dagger weights from {path} to actor_dagger")
 
     @staticmethod
     # not used at the moment
@@ -391,6 +410,19 @@ class ActorCriticMMTransformer(nn.Module):
         self.update_distribution(observations, ref_observations)
         sample = self.distribution.sample()
         return sample
+    
+    def act_dagger(self, observations, ref_observations=None, **kwargs):
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        return self.actor_dagger(observations, ref_observations)
+    
+    @torch.no_grad()
+    def act_dagger_inference(self, observations, ref_observations=None, **kwargs):
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        actions_mean = self.actor_dagger(observations, ref_observations)
+        return actions_mean
+    
+    def act_inference(self, observations, ref_observations=None):
+        return self.actor(observations, ref_observations)
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)

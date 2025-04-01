@@ -19,6 +19,7 @@ class RolloutStorageMM:
             self.critic_reference_observations = None
             self.critic_reference_observations_mask = None
             self.actions = None
+            self.dagger_actions = None
             self.rewards = None
             self.dones = None
             self.values = None
@@ -26,11 +27,10 @@ class RolloutStorageMM:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
-
         def clear(self):
             self.__init__()
 
-    def __init__(self, num_envs, num_transitions_per_env, obs_shape, ref_obs_shape, privileged_obs_shape, privileged_ref_obs_shape, actions_shape, device="cpu"):
+    def __init__(self, num_envs, num_transitions_per_env, obs_shape, ref_obs_shape, privileged_obs_shape, privileged_ref_obs_shape, actions_shape, apply_dagger_actions = False, device="cpu"):
         self.device = device
 
         self.obs_shape = obs_shape
@@ -66,6 +66,7 @@ class RolloutStorageMM:
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.dagger_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device) if apply_dagger_actions else None
 
         # For PPO
         self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
@@ -97,6 +98,9 @@ class RolloutStorageMM:
             if self.privileged_reference_observations is not None:
                 self.privileged_reference_observations[self.step].copy_(transition.critic_reference_observations)
                 self.privileged_reference_observations_mask[self.step].copy_(transition.critic_reference_observations_mask)
+                
+        if self.dagger_actions is not None:
+            self.dagger_actions[self.step].copy_(transition.dagger_actions)           
         
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
@@ -184,6 +188,7 @@ class RolloutStorageMM:
             critic_reference_observations_mask = None
 
         actions = self.actions.flatten(0, 1)
+        dagger_actions = self.dagger_actions.flatten(0, 1) if self.dagger_actions is not None else None
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
@@ -206,13 +211,14 @@ class RolloutStorageMM:
                 critic_ref_obs_mask_batch = critic_reference_observations_mask[batch_idx] if critic_reference_observations_mask is not None else None
                 critic_ref_obs_batch_rtn = (critic_ref_obs_batch, critic_ref_obs_mask_batch) if critic_ref_obs_batch is not None else None
                 actions_batch = actions[batch_idx]
+                dagger_actions_batch = dagger_actions[batch_idx] if dagger_actions is not None else None
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
                 old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
-                yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     None,
                     None,
                 ), None
@@ -244,6 +250,7 @@ class RolloutStorageMM:
                 critic_obs_batch = padded_critic_obs_trajectories[:, first_traj:last_traj]
 
                 actions_batch = self.actions[:, start:stop]
+                dagger_actions_batch = self.dagger_actions[:, start:stop] if self.dagger_actions is not None else None
                 old_mu_batch = self.mu[:, start:stop]
                 old_sigma_batch = self.sigma[:, start:stop]
                 returns_batch = self.returns[:, start:stop]
@@ -271,7 +278,7 @@ class RolloutStorageMM:
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
-                yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     hid_a_batch,
                     hid_c_batch,
                 ), masks_batch
