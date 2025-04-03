@@ -259,7 +259,7 @@ class OnPolicyRunnerMM:
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/imitation", locs["mean_imitation_loss"], locs["it"])
         if locs["mean_dagger_loss"] > 0:
-            self.writer.add_scalar("Loss/dagger", locs["dagger_loss"], locs["it"])
+            self.writer.add_scalar("Loss/dagger", locs["mean_dagger_loss"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])

@@ -47,6 +47,7 @@ class MMTransformer(nn.Module):
             dropout = 0.0,
             name = "",
             ls_init_values = 1e-3,
+            apply_pooling = False,
             **kwargs
     ):
         super().__init__()
@@ -73,6 +74,7 @@ class MMTransformer(nn.Module):
             # nn.LayerNorm(dim_model),
             nn.Linear(dim_model, dim_out),
         )
+        self.apply_pooling = apply_pooling
         # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
 
     def forward(
@@ -167,12 +169,14 @@ class MMTransformer(nn.Module):
         # Transformer processing
         # -------------------
         x = self.transformer(x, src_key_padding_mask=padding_mask)  # Transformer expects shape (S, B, E)
-        x = x[:, 0, :]  # Take the first token's output: Shape (B, dim_model)
-        # padding_mask = ~padding_mask # Inverted mask: True for non-padding tokens
-        # # Apply average pooling over non-padding tokens
-        # x = x.masked_fill(padding_mask.unsqueeze(-1), 0)  # Set padding tokens to zero
-        # x = x.sum(dim=1)  # Sum over the sequence length dimension, x shape: (B, dim_model)
-        # x = x / padding_mask.sum(dim=1, keepdim=True)  # Normalize by the number of non-padding tokens
+        if not self.apply_pooling:
+            x = x[:, 0, :]  # Take the first token's output: Shape (B, dim_model)
+        else:
+            padding_mask = ~padding_mask # Inverted mask: True for non-padding tokens
+            # Apply average pooling over non-padding tokens
+            x = x.masked_fill(padding_mask.unsqueeze(-1), 0)  # Set padding tokens to zero
+            x = x.sum(dim=1)  # Sum over the sequence length dimension, x shape: (B, dim_model)
+            x = x / padding_mask.sum(dim=1, keepdim=True)  # Normalize by the number of non-padding tokens
 
         # -------------------
         # Final fully connected layer
@@ -200,6 +204,7 @@ class Transformer(nn.Module):
             dropout = 0.0,
             name = "",
             ls_init_values = 1e-3,
+            apply_pooling = True,
             **kwargs
     ):
         super().__init__()
@@ -224,6 +229,7 @@ class Transformer(nn.Module):
             nn.LayerNorm(dim_model),
             nn.Linear(dim_model, dim_out),
         )
+        self.apply_pooling = apply_pooling
 
     def forward(
         self, 
@@ -362,6 +368,7 @@ class ActorCriticMMTransformer(nn.Module):
         self.critic = MMTransformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
+        print(f"Dagger Model: {self.actor_dagger}")
         # Action noise
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         self.distribution = None
@@ -371,11 +378,22 @@ class ActorCriticMMTransformer(nn.Module):
     def load_dagger_weights(self, path):
         state_dict = torch.load(path)
         # check for 'actor' in the state_dict keys
-        assert 'actor' in state_dict.keys(), f"Key 'actor' not found in state_dict keys: {state_dict.keys()}, failed to load dagger weights"
-        # load the actor weights to actor_dagger
-        self.actor_dagger.load_state_dict(state_dict['actor'])
-        print(f"Loaded dagger weights from {path} to actor_dagger")
-
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the actor_dagger weights through layer name matching (starting with 'actor')
+        dagger_weights = {k[len('actor.'):]: v for k, v in model_state_dict.items() if k.startswith('actor')}
+        dagger_state_dict = self.actor_dagger.state_dict()
+        # perform weights checking
+        for k, v in dagger_weights.items():
+            if k not in dagger_state_dict:
+                raise KeyError(f"Key {k} not found in actor_dagger state_dict")
+            if dagger_state_dict[k].shape != v.shape:
+                raise ValueError(f"Shape mismatch for key {k}: {dagger_state_dict[k].shape} vs {v.shape}")
+        # load the weights
+        self.actor_dagger.load_state_dict(dagger_weights)
+        print(f"Loaded dagger weights from {path}")
+        
     @staticmethod
     # not used at the moment
     def init_weights(sequential, scales):
@@ -415,7 +433,6 @@ class ActorCriticMMTransformer(nn.Module):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
         return self.actor_dagger(observations, ref_observations)
     
-    @torch.no_grad()
     def act_dagger_inference(self, observations, ref_observations=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
         actions_mean = self.actor_dagger(observations, ref_observations)

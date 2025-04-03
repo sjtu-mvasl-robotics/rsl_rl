@@ -1,5 +1,5 @@
-#  Copyright 2021 ETH Zurich, NVIDIA CORPORATION
-#  SPDX-License-Identifier: BSD-3-Clause
+#  Optimized from RSL_RL/PPO
+#  Created by Yifei Yao, 10/12/2024
 
 from __future__ import annotations
 
@@ -14,19 +14,26 @@ import time
 
 class SmoothL2Loss(nn.Module):
     """
-    Smooth L2 loss function
+    Smooth L2 loss (Huber loss), where:
+    loss(x) = 0.5 * x^2               if |x| < delta
+              delta * (|x| - 0.5*delta)  otherwise
     """
 
-    def __init__(self, delta=1.0):
+    def __init__(self, delta: float = 1.0):
         super(SmoothL2Loss, self).__init__()
         self.delta = delta
 
-    def forward(self, input, target):
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = input - target
         abs_diff = torch.abs(diff)
-        quadratic = torch.min(abs_diff, self.delta)
-        linear = abs_diff - quadratic
-        loss = 0.5 * torch.square(quadratic) + self.delta * linear
+
+        mask = abs_diff < self.delta
+        loss = torch.where(
+            mask,
+            0.5 * diff**2,
+            self.delta * (abs_diff - 0.5 * self.delta)
+        )
+
         return loss.mean()
     
 class L2Loss(nn.Module):
@@ -56,6 +63,8 @@ class MMPPO:
         value_loss_coef=1.0,
         entropy_coef=0.0,
         learning_rate=1e-3,
+        max_lr=1e-2,
+        min_lr=1e-4,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
         schedule="fixed",
@@ -87,6 +96,9 @@ class MMPPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         self.learning_rate = learning_rate
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        assert min_lr <= learning_rate <= max_lr, "learning_rate should be in range [min_lr, max_lr], and min_lr <= max_lr"
         self.ref_action_idx = ref_action_idx
         self.teacher_coef = teacher_coef
         self.teacher_coef_range = teacher_coef_range
@@ -182,6 +194,8 @@ class MMPPO:
         self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
+        if self.teacher_coef is not None:
+            self.transition.dagger_actions = self.actor_critic.act_dagger(obs, ref_observations=ref_obs).detach()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.reference_observations = ref_obs[0] if ref_obs is not None else None
@@ -265,9 +279,9 @@ class MMPPO:
                     kl_mean = torch.mean(kl) #- imitation_loss # advanced kl
 
                     if kl_mean > self.desired_kl * 2.0:
-                        self.learning_rate = max(5e-5, self.learning_rate / 1.5)
+                        self.learning_rate = max(self.min_lr, self.learning_rate / 1.5)
                     elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                        self.learning_rate = min(self.max_lr, self.learning_rate * 1.5)
 
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
