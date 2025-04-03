@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import itertools
 
 from rsl_rl.modules import ActorCriticMMTransformer
 from rsl_rl.storage import RolloutStorageMM
@@ -119,7 +120,12 @@ class MMPPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         self.storage = None  # initialized later
-        self.optimizer = optim.AdamW(self.actor_critic.parameters(), lr=learning_rate) # Avoid optimizing dagger parameters if self.teacher_coef is None
+        self.optimizer = optim.AdamW(
+            itertools.chain(
+                self.actor_critic.actor.parameters(),
+                self.actor_critic.critic.parameters()
+            ),
+            lr=learning_rate) # Avoid optimizing dagger parameters if self.teacher_coef is None
         self.teacher_update_interval = teacher_update_interval
         self.transition = RolloutStorageMM.Transition()
 
@@ -195,7 +201,7 @@ class MMPPO:
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
         if self.teacher_coef is not None:
-            self.transition.dagger_actions = self.actor_critic.act_dagger(obs, ref_observations=ref_obs).detach()
+            self.transition.dagger_actions = self.actor_critic.act_dagger(obs, ref_obs).detach()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.reference_observations = ref_obs[0] if ref_obs is not None else None
@@ -315,12 +321,11 @@ class MMPPO:
             self.optimizer.zero_grad()
             
             if self.teacher_loss_coef is not None:
-                if epoch % self.teacher_coef_decay_interval == 0:
+                if epoch % self.teacher_loss_coef_decay_interval == 0:
                     self.teacher_loss_coef = max(
                         self.teacher_loss_coef_range[0],
-                        self.teacher_loss_coef - self.teacher_loss_coef_decay * (self.teacher_loss_coef_range[1] - self.teacher_loss_coef_range[0]),)
+                        self.teacher_loss_coef - (1 - self.teacher_loss_coef_decay) * (self.teacher_loss_coef_range[1] - self.teacher_loss_coef_range[0]),)
                 
-                loss *= 1.0 - self.teacher_loss_coef
                 loss += imitation_loss * self.teacher_loss_coef
                 if self.teacher_only_interval != 0 and epoch % self.teacher_only_interval == 0:
                     loss = imitation_loss * self.teacher_loss_coef
@@ -371,11 +376,11 @@ class MMPPO:
     
     def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, epoch):
         assert self.teacher_coef is not None, "Teacher coef is None. Please set teacher_coef to a value greater than 0.0 to enable Dagger."
-        dagger_actions = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+        dagger_actions = self.actor_critic.act_dagger(obs_batch, ref_observations=ref_obs_batch)
         add_actions = actions_batch * (1.0 - self.teacher_coef) + dagger_actions * self.teacher_coef
         add_actions = add_actions.detach()
-        loss = SmoothL2Loss()(add_actions, dagger_actions)
-        # loss = F.mse_loss(add_actions, dagger_actions, reduction="mean")
+        # loss = SmoothL2Loss()(add_actions, dagger_actions)
+        loss = F.mse_loss(add_actions, dagger_actions, reduction="mean")
         self.dagger_optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.actor_critic.actor_dagger.parameters(), self.max_grad_norm)
@@ -384,6 +389,6 @@ class MMPPO:
         if epoch % self.teacher_coef_decay_interval == 0:
             self.teacher_coef = max(
                 self.teacher_coef_range[0],
-                self.teacher_coef - self.teacher_coef_decay * (self.teacher_coef_range[1] - self.teacher_coef_range[0]),)
+                self.teacher_coef - (1 - self.teacher_coef_decay) * (self.teacher_coef_range[1] - self.teacher_coef_range[0]),)
         
         return loss.item()
