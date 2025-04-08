@@ -20,5 +20,7 @@ setup(
         "numpy>=1.16.4",
         "GitPython",
         "onnx",
+        "peft",
+        "transformers",
     ],
 )

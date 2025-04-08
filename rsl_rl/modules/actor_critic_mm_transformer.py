@@ -10,24 +10,22 @@ from torch.distributions import Normal
 from typing import Optional, Tuple
 # from timm.models.vision_transformer import LayerScale
 import time
+from peft import get_peft_model, LoraConfig, TaskType
+from peft.tuners.lora import Linear as LoRALinear
 
 class ObservationEmbedding(nn.Module):
     def __init__(self, num_obs, d_model, max_len=16, apply_norm = False):
         super().__init__()
         self.d_model = d_model
         self.max_len = max_len
-        if apply_norm:
-            self.embedding = nn.Sequential(
-                nn.Linear(num_obs, d_model * max_len),
-                nn.LayerNorm(d_model * max_len),
-            )
-        else:
-            self.embedding = nn.Linear(num_obs, d_model * max_len)
+        self.embedding = nn.Linear(num_obs, d_model * max_len)
+        self.norm = nn.LayerNorm(d_model) if apply_norm else nn.Identity()
         self.pos_embedding = nn.Embedding(max_len, d_model)
 
     def forward(self, x):
         x = self.embedding(x)
-        x = x.reshape(x.size(0), -1, self.d_model)  # (B, seq_len, dim_model)        
+        x = x.reshape(x.size(0), -1, self.d_model)  # (B, seq_len, dim_model) 
+        x = self.norm(x)  # Apply normalization       
         pos = torch.arange(self.max_len, device=x.device).unsqueeze(0)  # (1, seq_len)
         return x + self.pos_embedding(pos)
     
@@ -54,11 +52,11 @@ class MMTransformer(nn.Module):
         self.name = name
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
-        self.obs_embedding = ObservationEmbedding(obs_size, dim_model, max_len)
+        self.obs_embedding = ObservationEmbedding(obs_size, dim_model, max_len, apply_norm=True)
         if ref_obs_size == 0:
             self.ref_obs_embedding = None
         else:
-            self.ref_obs_embedding = ObservationEmbedding(ref_obs_size, dim_model, max_len)
+            self.ref_obs_embedding = ObservationEmbedding(ref_obs_size, dim_model, max_len, apply_norm=True)
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim_model))
         self.sep_token = nn.Parameter(torch.randn(1, 1, dim_model))
         encoder_layer = nn.TransformerEncoderLayer(
@@ -71,7 +69,9 @@ class MMTransformer(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers, norm=nn.LayerNorm(dim_model))
         self.fc = nn.Sequential(
-            # nn.LayerNorm(dim_model),
+            # nn.Linear(dim_model, dim_model * 2),
+            # nn.GELU(),
+            # nn.Linear(dim_model * 2, dim_out),
             nn.Linear(dim_model, dim_out),
         )
         self.apply_pooling = apply_pooling
@@ -357,6 +357,7 @@ class ActorCriticMMTransformer(nn.Module):
             init_noise_std=1.0,
             load_dagger=False,
             load_dagger_path=None,
+            enable_lora=False,
             **kwargs
     ):
         super().__init__()
@@ -365,6 +366,12 @@ class ActorCriticMMTransformer(nn.Module):
         self.actor_dagger = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", **kwargs) if load_dagger else None
         if load_dagger:
             self.load_dagger_weights(load_dagger_path)
+            lora_r = kwargs.get('lora_r', 8)
+            lora_alpha = kwargs.get('lora_alpha', 16)
+            lora_dropout = kwargs.get('lora_dropout', 0.05)
+            if enable_lora:
+                self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+            
         self.critic = MMTransformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
@@ -374,6 +381,19 @@ class ActorCriticMMTransformer(nn.Module):
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args = False
+        
+    # def load_state_dict(self, state_dict, strict = True, assign = False):
+    #     actor_weights = {k[len('actor.'):]: v for k, v in state_dict.items() if k.startswith('actor.')}
+    #     critic_weights = {k[len('critic.'):]: v for k, v in state_dict.items() if k.startswith('critic.')}
+    #     # load the actor weights through layer name matching (starting with 'actor')
+    #     self.actor.load_state_dict(actor_weights, strict = strict)
+    #     self.critic.load_state_dict(critic_weights, strict = strict)
+    #     print(f"Loaded actor weights from {state_dict} to actor")
+    #     if self.actor_dagger is not None:
+    #         dagger_weights = {k[len('actor_dagger.'):]: v for k, v in state_dict.items() if k.startswith('actor_dagger')}
+    #         self.actor_dagger.load_state_dict(dagger_weights, strict = strict)
+    #         print(f"Loaded dagger weights from {state_dict} to actor_dagger")
+
         
     def load_dagger_weights(self, path):
         state_dict = torch.load(path)
@@ -391,8 +411,37 @@ class ActorCriticMMTransformer(nn.Module):
             if dagger_state_dict[k].shape != v.shape:
                 raise ValueError(f"Shape mismatch for key {k}: {dagger_state_dict[k].shape} vs {v.shape}")
         # load the weights
+        # self.actor.load_state_dict(dagger_weights)
         self.actor_dagger.load_state_dict(dagger_weights)
-        print(f"Loaded dagger weights from {path}")
+        print(f"Loaded dagger weights from {path} to actor_dagger")
+        
+    def apply_dagger_lora(self, r=8, alpha=16, dropout=0.05):
+        for param in self.actor_dagger.transformer.parameters():
+            param.requires_grad = False
+        
+        for name, module in self.actor_dagger.transformer.named_modules():
+            if isinstance(module, nn.MultiheadAttention):
+                # Replace the linear projections with LoRA layers
+                d_model = module.embed_dim
+                module.out_proj = LoRALinear(
+                    in_features=d_model,
+                    out_features=d_model,
+                    base_layer=module.out_proj,
+                    adapter_name="default",
+                    r=r,
+                    lora_alpha=alpha,
+                    lora_dropout=dropout,
+                    bias=False
+                )
+
+        # Unfreeze LoRA parameters explicitly
+        for module in self.actor_dagger.transformer.modules():
+            if isinstance(module, LoRALinear):
+                for param in module.parameters():
+                    param.requires_grad = True
+
+        print("LoRA manually applied, other parameters frozen.")
+
         
     @staticmethod
     # not used at the moment
@@ -429,6 +478,7 @@ class ActorCriticMMTransformer(nn.Module):
         sample = self.distribution.sample()
         return sample
     
+    @torch.no_grad()
     def act_dagger(self, observations, ref_observations=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
         return self.actor_dagger(observations, ref_observations)

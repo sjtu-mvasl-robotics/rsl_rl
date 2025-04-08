@@ -65,7 +65,9 @@ class MMPPO:
         entropy_coef=0.0,
         learning_rate=1e-3,
         max_lr=1e-2,
-        min_lr=1e-4,
+        min_lr=1e-5,
+        max_lr_after_certain_epoch=5e-4,
+        max_lr_restriction_epoch=2500,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
         schedule="fixed",
@@ -84,7 +86,7 @@ class MMPPO:
         teacher_loss_coef_decay=None,
         teacher_loss_coef_decay_interval=100,
         # dagger update parameters        
-        teacher_supervising_intervals=0, # when epoch < teacher_supervising_intervals, PPO will not be used to update dagger actor
+        teacher_supervising_intervals=0, # when epoch < teacher_supervising_intervals, PPO won't imitate dagger actions and dagger will not be updated
         teacher_coef_mode="kl", # "kl" or "norm"
         teacher_update_interval=1,
         teacher_lr=5e-4,
@@ -99,6 +101,8 @@ class MMPPO:
         self.learning_rate = learning_rate
         self.max_lr = max_lr
         self.min_lr = min_lr
+        self.max_lr_after_certain_epoch = max_lr_after_certain_epoch
+        self.max_lr_restriction_epoch = max_lr_restriction_epoch
         assert min_lr <= learning_rate <= max_lr, "learning_rate should be in range [min_lr, max_lr], and min_lr <= max_lr"
         self.ref_action_idx = ref_action_idx
         self.teacher_coef = teacher_coef
@@ -126,6 +130,10 @@ class MMPPO:
                 self.actor_critic.critic.parameters()
             ),
             lr=learning_rate) # Avoid optimizing dagger parameters if self.teacher_coef is None
+        # self.optimizer = optim.AdamW(
+        #     self.actor_critic.parameters(),
+        #     lr=learning_rate
+        # )
         self.teacher_update_interval = teacher_update_interval
         self.transition = RolloutStorageMM.Transition()
 
@@ -271,7 +279,8 @@ class MMPPO:
             # This loss is calculated only when critic_ref_obs_batch is not None, otherwise 0.0
             # By default, we assume that ref_action_batch = critic_ref_obs_batch[0][:, ref_action_idx: num_actions + ref_action_idx] where ref_action_idx = 0
             # Loss: \sum_i [\sqrt(2 * \pi * \sigma_i^2) + (mu_i - ref_action_i)^2 / (2 * \sigma_i^2)]
-            
+            if self.max_lr_restriction_epoch != 0 and epoch > self.max_lr_restriction_epoch:
+                self.max_lr = self.max_lr_after_certain_epoch
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
@@ -316,31 +325,25 @@ class MMPPO:
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
             # if self.teacher_coef is not None:
             #     loss += imitation_loss * self.teacher_coef
-            imitation_loss = self._imitation_loss(actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch)
+            imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch)
             # Gradient step
             self.optimizer.zero_grad()
             
-            if self.teacher_loss_coef is not None:
-                if epoch % self.teacher_loss_coef_decay_interval == 0:
-                    self.teacher_loss_coef = max(
-                        self.teacher_loss_coef_range[0],
-                        self.teacher_loss_coef - (1 - self.teacher_loss_coef_decay) * (self.teacher_loss_coef_range[1] - self.teacher_loss_coef_range[0]),)
-                
+            if self.teacher_loss_coef is not None and epoch > self.teacher_supervising_intervals:
                 loss += imitation_loss * self.teacher_loss_coef
-                if self.teacher_only_interval != 0 and epoch % self.teacher_only_interval == 0:
-                    loss = imitation_loss * self.teacher_loss_coef
             loss.backward()
                 
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
             
             
-            mean_value_loss += value_loss
-            mean_surrogate_loss += surrogate_loss
-            mean_imitation_loss += imitation_loss
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_imitation_loss += imitation_loss.item()
             
-            if epoch % self.teacher_update_interval == 0 and self.dagger_optimizer is not None:
-                dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, epoch)
+            if (epoch+1) % self.teacher_update_interval == 0 and self.dagger_optimizer is not None and epoch > self.teacher_supervising_intervals:
+                # dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, epoch)
+                dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch)
             else:
                 dagger_loss = 0.0
             mean_dagger_loss += dagger_loss
@@ -350,6 +353,17 @@ class MMPPO:
         mean_surrogate_loss /= num_updates
         mean_imitation_loss /= num_updates
         mean_dagger_loss /= num_updates
+        
+        # udpate teacher coef and teacher loss coef
+        if self.teacher_coef is not None and (epoch+1) % self.teacher_coef_decay_interval == 0:
+            self.teacher_coef = max(
+                self.teacher_coef_range[0],
+                self.teacher_coef - (1 - self.teacher_coef_decay) * (self.teacher_coef_range[1] - self.teacher_coef_range[0]),)
+        if self.teacher_loss_coef is not None and (epoch+1) % self.teacher_loss_coef_decay_interval == 0:
+            self.teacher_loss_coef = min(
+                self.teacher_loss_coef_range[1],
+                self.teacher_loss_coef + (1 - self.teacher_loss_coef_decay) * (self.teacher_loss_coef_range[1] - self.teacher_loss_coef_range[0]),)
+        
         self.storage.clear()
 
         return mean_value_loss.item(), mean_surrogate_loss.item(), mean_imitation_loss.item(), mean_dagger_loss.item()
@@ -371,24 +385,25 @@ class MMPPO:
                 ).mean()
                     
         else:
-            imitation_loss = 0.0     
+            imitation_loss = torch.tensor(0.0).to(self.device)   
         return imitation_loss
     
-    def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, epoch):
-        assert self.teacher_coef is not None, "Teacher coef is None. Please set teacher_coef to a value greater than 0.0 to enable Dagger."
-        dagger_actions = self.actor_critic.act_dagger(obs_batch, ref_observations=ref_obs_batch)
-        add_actions = actions_batch * (1.0 - self.teacher_coef) + dagger_actions * self.teacher_coef
-        add_actions = add_actions.detach()
-        # loss = SmoothL2Loss()(add_actions, dagger_actions)
-        loss = F.mse_loss(add_actions, dagger_actions, reduction="mean")
+    def _imitation_loss_original(self, actions_batch, critic_ref_obs_batch, mu_batch, sigma_batch, action_scale = 0.5):
+        ref_action_batch = critic_ref_obs_batch[0][:, self.ref_action_idx: self.ref_action_idx + actions_batch.shape[-1]]
+        ref_action_mask = critic_ref_obs_batch[1].long()
+        action_processed = ref_action_batch / action_scale
+        imitation_loss = torch.sum((
+            (1 / actions_batch.shape[-1]) * (torch.sum((torch.square(mu_batch - action_processed) / (2.0 * torch.square(sigma_batch) + 1e-5)), axis=-1) +  0.92 * torch.sum(torch.clamp_min(torch.log(sigma_batch), 0.0), axis=-1))
+        ) * ref_action_mask) / (ref_action_mask.sum() + 1e-5)
+        return imitation_loss
+    
+    def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch):
+        output = self.actor_critic.act_dagger_inference(obs_batch, ref_observations=ref_obs_batch)
+        gt = self.teacher_coef * dagger_actions_batch + (1 - self.teacher_coef) * actions_batch
+        loss = SmoothL2Loss()(output, gt)
         self.dagger_optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.actor_critic.actor_dagger.parameters(), self.max_grad_norm)
         self.dagger_optimizer.step()
-        
-        if epoch % self.teacher_coef_decay_interval == 0:
-            self.teacher_coef = max(
-                self.teacher_coef_range[0],
-                self.teacher_coef - (1 - self.teacher_coef_decay) * (self.teacher_coef_range[1] - self.teacher_coef_range[0]),)
-        
         return loss.item()
+        
