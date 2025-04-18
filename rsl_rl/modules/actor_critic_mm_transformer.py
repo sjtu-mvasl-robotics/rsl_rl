@@ -396,7 +396,7 @@ class ActorCriticMMTransformer(nn.Module):
 
         
     def load_dagger_weights(self, path):
-        state_dict = torch.load(path)
+        state_dict = torch.load(path, map_location="cpu")
         # check for 'actor' in the state_dict keys
         assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
         
