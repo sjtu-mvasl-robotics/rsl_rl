@@ -13,6 +13,34 @@ import time
 from peft import get_peft_model, LoraConfig, TaskType
 from peft.tuners.lora import Linear as LoRALinear
 
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization.
+    y = x / sqrt(mean(x**2) + eps) * weight + bias
+    No mean subtraction.
+    """
+    def __init__(self, normalized_shape, eps: float = 1e-8, bias: bool = True):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+
+        # Scale (gamma)
+        self.weight = nn.Parameter(torch.ones(self.normalized_shape))
+        # Shift (beta)
+        self.bias = nn.Parameter(torch.zeros(self.normalized_shape)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        x_norm = x / rms
+        x_norm = x_norm * self.weight
+        if self.bias is not None:
+            x_norm = x_norm + self.bias
+        return x_norm
+
 ############################################################################################################
 #
 # Observation Embedding
@@ -29,7 +57,7 @@ class ObservationEmbedding(nn.Module):
         self.d_model = d_model
         self.max_len = max_len
         self.embedding = nn.Linear(num_obs, d_model * max_len)
-        self.norm = nn.LayerNorm(d_model) if apply_norm else nn.Identity()
+        self.norm = RMSNorm(d_model) if apply_norm else nn.Identity()
         self.pos_embedding = nn.Embedding(max_len, d_model)
 
     def forward(self, x):
@@ -56,7 +84,7 @@ class ObservationEmbeddingWithObsLen(nn.Module):
         self.d_model = d_model
         self.embedding = nn.Linear(1, d_model)
         self.pos_embedding = nn.Embedding(num_obs, d_model)
-        self.norm = nn.LayerNorm(d_model) if apply_norm else nn.Identity()
+        self.norm = RMSNorm(d_model) if apply_norm else nn.Identity()
         
     def forward(self, x):
         x = x.unsqueeze(-1) # (B, seq_len, 1)
@@ -77,34 +105,35 @@ class ObservationEmbeddingWithObsLen(nn.Module):
 ############################################################################################################
 
 class ObservationEmbeddingV2(nn.Module):
-    def __init__(self, d_model, term_dict: dict, apply_norm = False):
+    def __init__(self, d_model: int, term_dict: dict[str, int], apply_norm: bool = False):
         super().__init__()
-        self.d_model = d_model
-        self.term_dict = term_dict
+        self.term_names = list(term_dict.keys())
+        self.term_dims  = list(term_dict.values())
+        self.seq_len    = len(self.term_names)
+        self.d_model    = d_model
         self.embeddings = nn.ModuleList([
-            nn.Linear(term_dict[term], d_model) for term in term_dict.keys()
+            nn.Linear(dim, d_model) for dim in self.term_dims
         ])
+        self.term_embed = nn.Embedding(self.seq_len, d_model)
+        self.norm = RMSNorm(d_model) if apply_norm else nn.Identity()
+        start = 0
         self.term_slices = []
-        for term in term_dict.keys():
-            start = sum([term_dict[t] for t in term_dict.keys() if t < term])
-            end = start + term_dict[term]
-            self.term_slices.append((start, end))
-        self.seq_len = len(term_dict)
-        self.norm = nn.LayerNorm(d_model) if apply_norm else nn.Identity()
-        self.pos_embedding = nn.Embedding(self.seq_len, d_model)
-        
-    def forward(self, x):
-        tokens = []
-        for i, term in enumerate(self.term_dict.keys()):
-            start, end = self.term_slices[i]
-            term_x = x[:, start:end]
-            term_x = self.embeddings[i](term_x)
-            tokens.append(term_x)
-        x = torch.stack(tokens, dim=1)  # (B, seq_len, dim_model)
-        x = self.norm(x)  # Apply normalization
-        pos = torch.arange(self.seq_len, device=x.device).unsqueeze(0)  # (1, seq_len)
-        x = x + self.pos_embedding(pos)  # (B, seq_len, dim_model)
+        for dim in self.term_dims:
+            self.term_slices.append(slice(start, start + dim))
+            start += dim
+
+    def forward(self, obs: torch.Tensor):
+        # obs shape: (B, num_obs)
+        token_list = []
+        for i, sl in enumerate(self.term_slices):
+            token_i = self.embeddings[i](obs[:, sl])          # (B, d_model)
+            token_list.append(token_i)
+        x = torch.stack(token_list, dim=1)                    # (B, seq_len, d_model)
+        x = self.norm(x)
+        idx = torch.arange(self.seq_len, device=obs.device).unsqueeze(0)  # (1, seq_len)
+        x = x + self.term_embed(idx)                          # (B, seq_len, d_model)
         return x
+
 
     
 class MMTransformer(nn.Module):
