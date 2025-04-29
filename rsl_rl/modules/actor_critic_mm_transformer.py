@@ -13,6 +13,16 @@ import time
 from peft import get_peft_model, LoraConfig, TaskType
 from peft.tuners.lora import Linear as LoRALinear
 
+############################################################################################################
+#
+# Observation Embedding
+#
+# ObservationEmbedding is the simplest approach for embedding observations.
+# It projects observations to sequence length * dim_model, and then reshapes it to (B, seq_len, dim_model).
+# This implementation is simple but may amplify the disturbance caused by the observation noise.
+#
+############################################################################################################
+
 class ObservationEmbedding(nn.Module):
     def __init__(self, num_obs, d_model, max_len=16, apply_norm = False):
         super().__init__()
@@ -29,6 +39,72 @@ class ObservationEmbedding(nn.Module):
         pos = torch.arange(self.max_len, device=x.device).unsqueeze(0)  # (1, seq_len)
         return x + self.pos_embedding(pos)
     
+    
+############################################################################################################
+#
+# Observation Embedding With Observation Length
+#
+# ObservationEmbeddingWithObsLen is another simple approach for embedding observations.
+# It treats num_obs as seq_len, given each observation a unique id for representation.
+# This implementation is simple but requires a lot of memory.
+#
+############################################################################################################
+
+class ObservationEmbeddingWithObsLen(nn.Module):
+    def __init__(self, num_obs, d_model, apply_norm = False): # max len won't be used
+        super().__init__()
+        self.d_model = d_model
+        self.embedding = nn.Linear(1, d_model)
+        self.pos_embedding = nn.Embedding(num_obs, d_model)
+        self.norm = nn.LayerNorm(d_model) if apply_norm else nn.Identity()
+        
+    def forward(self, x):
+        x = x.unsqueeze(-1) # (B, seq_len, 1)
+        x = self.embedding(x)  # (B, seq_len, dim_model)
+        x = self.norm(x)  # Apply normalization
+        idx = torch.arange(x.size(1), device=x.device).unsqueeze(0)  # (1, seq_len)
+        x = x + self.pos_embedding(idx)  # (B, seq_len, dim_model)
+        return x
+    
+############################################################################################################
+#
+# Observation Embedding V2
+#
+# ObservationEmbeddingV2 treats different observation terms as different tokens
+# It projects observation terms to dim_model, and then concatenates them to form a sequence.
+# This implementation is better than the previous two, but still not perfect.
+#
+############################################################################################################
+
+class ObservationEmbeddingV2(nn.Module):
+    def __init__(self, d_model, term_dict: dict, apply_norm = False):
+        super().__init__()
+        self.d_model = d_model
+        self.term_dict = term_dict
+        self.embeddings = nn.ModuleList([
+            nn.Linear(term_dict[term], d_model) for term in term_dict.keys()
+        ])
+        self.term_slices = []
+        for term in term_dict.keys():
+            start = sum([term_dict[t] for t in term_dict.keys() if t < term])
+            end = start + term_dict[term]
+            self.term_slices.append((start, end))
+        self.seq_len = len(term_dict)
+        self.norm = nn.LayerNorm(d_model) if apply_norm else nn.Identity()
+        self.pos_embedding = nn.Embedding(self.seq_len, d_model)
+        
+    def forward(self, x):
+        tokens = []
+        for i, term in enumerate(self.term_dict.keys()):
+            start, end = self.term_slices[i]
+            term_x = x[:, start:end]
+            term_x = self.embeddings[i](term_x)
+            tokens.append(term_x)
+        x = torch.stack(tokens, dim=1)  # (B, seq_len, dim_model)
+        x = self.norm(x)  # Apply normalization
+        pos = torch.arange(self.seq_len, device=x.device).unsqueeze(0)  # (1, seq_len)
+        x = x + self.pos_embedding(pos)  # (B, seq_len, dim_model)
+        return x
 
     
 class MMTransformer(nn.Module):
@@ -46,17 +122,271 @@ class MMTransformer(nn.Module):
             name = "",
             ls_init_values = 1e-3,
             apply_pooling = False,
+            apply_mlp_residual = True,
             **kwargs
     ):
         super().__init__()
         self.name = name
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
-        self.obs_embedding = ObservationEmbedding(obs_size, dim_model, max_len, apply_norm=True)
+        self.obs_embedding = ObservationEmbedding(obs_size, dim_model, max_len, apply_norm=False)
         if ref_obs_size == 0:
             self.ref_obs_embedding = None
         else:
-            self.ref_obs_embedding = ObservationEmbedding(ref_obs_size, dim_model, max_len, apply_norm=True)
+            self.ref_obs_embedding = ObservationEmbedding(ref_obs_size, dim_model, max_len, apply_norm=False)
+        
+        self.in_size = obs_size + ref_obs_size
+            
+        self.mlp_residual = nn.Sequential(
+            nn.Linear(obs_size + ref_obs_size, 512),
+            nn.GELU(),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, dim_out),
+        ) if apply_mlp_residual else None
+        
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim_model))
+        self.sep_token = nn.Parameter(torch.randn(1, 1, dim_model))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim_model,
+            nhead=num_heads,
+            dim_feedforward=dim_model * ffn_ratio,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers, norm=nn.LayerNorm(dim_model))
+        self.fc = nn.Sequential(
+            # nn.Linear(dim_model, dim_model * 2),
+            # nn.GELU(),
+            # nn.Linear(dim_model * 2, dim_out),
+            nn.Linear(dim_model, dim_out),
+        )
+        self.apply_pooling = apply_pooling
+        # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
+
+    def forward(
+        self, 
+        obs: torch.Tensor, 
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        """
+        Forward pass for the multi-modality transformer.
+
+        Args:
+            obs (torch.Tensor): Observation tensor of shape (B, seq_len_obs, dim_in).
+            ref_obs (Optional[Tuple[torch.Tensor, torch.Tensor]]): 
+                A tuple containing:
+                - ref_obs_tensor (torch.Tensor): Reference observations of shape (B, seq_len_ref_obs, dim_in).
+                - ref_obs_mask (torch.Tensor): Mask tensor of shape (B,) indicating the presence of ref_obs.
+
+        Returns:
+            torch.Tensor: Output tensor after transformer and fully connected layer.
+        """
+        embeddings = []
+        padding_masks = []
+
+        assert (self.ref_obs_embedding is not None) or (ref_obs is None), "Cannot run multi-modality mode with ref_obs_size=0"
+
+        # -------------------
+        # Process obs embeddings
+        # -------------------
+        obs_emb = self.obs_embedding(obs)  # Shape: (B, seq_len_obs, dim_model)
+        cls_emb = self.cls_token.expand(obs.size(0), -1, -1)  # Shape: (B, 1, dim_model)
+        sep_emb = self.sep_token.expand(obs.size(0), -1, -1)  # Shape: (B, 1, dim_model)
+        
+
+        # Create padding mask for obs: 1 for non-padding, 0 for padding
+        obs_padding_mask = torch.ones(obs_emb.size(0), obs_emb.size(1), dtype=torch.bool, device=obs.device) # Shape: (B, seq_len_obs)
+        # obs_seq_pad_mask shape: (seq_len_obs,) -> (B, seq_len_obs)
+        # obs_seq_pad_mask is False for positions which should not be considered for calculating attention
+        # obs_padding_mask = obs_padding_mask & obs_seq_pad_mask.unsqueeze(0)
+        obs_padding_mask = F.pad(obs_padding_mask, (1, 1), value=1.0)  # Account for CLS and SEP tokens
+        obs_emb = torch.cat([cls_emb, obs_emb, sep_emb], dim=1)  # Shape: (B, seq_len_obs + 2, dim_model)
+        embeddings.append(obs_emb)
+        padding_masks.append(obs_padding_mask)  # Shape: (B, seq_len_obs + 2)
+
+        # -------------------
+        # Process ref_obs embeddings (if provided)
+        # -------------------
+        if ref_obs is not None and self.ref_obs_embedding is not None:
+            ref_obs_tensor, ref_obs_mask = ref_obs  # Unpack the tuple
+
+            # Preprocess reference observations
+            # ref_obs_tensor = self.ref_obs_deque(ref_obs_tensor)
+            ref_obs_emb = self.ref_obs_embedding(ref_obs_tensor)  # Shape: (B, seq_len_ref_obs, dim_model)
+            # cls_ref_emb = self.cls_token.expand(ref_obs_emb.size(0), -1, -1)  # Shape: (B, 1, dim_model)
+            sep_ref_emb = self.sep_token.expand(ref_obs_emb.size(0), -1, -1)  # Shape: (B, 1, dim_model)
+            
+            # Create padding mask for ref_obs: 1 for non-padding, 0 for padding
+            ref_obs_padding_mask = torch.ones(ref_obs_emb.size(0), ref_obs_emb.size(1), dtype=torch.bool, device=ref_obs_emb.device) # Shape: (B, seq_len_ref_obs)
+            ref_obs_emb = torch.cat([ref_obs_emb, sep_ref_emb], dim=1)  # Shape: (B, seq_len_ref_obs + 2, dim_model)
+
+            # Apply the ref_obs_mask to zero out embeddings where ref_obs is not present
+            # ref_obs_mask shape: (B,) -> (B, 1, 1) for broadcasting
+            ref_obs_mask = ref_obs_mask.view(-1, 1, 1)
+            ref_obs_emb = ref_obs_emb * ref_obs_mask  # Zero out embeddings where ref_obs_mask is False
+
+            embeddings.append(ref_obs_emb)  # Append to embeddings list
+
+            # ref_obs_seq_pad_mask shape: (seq_len_ref_obs,) -> (B, seq_len_ref_obs)
+            # ref_obs_seq_pad_mask is False for positions which should not be considered for calculating attention
+            # ref_obs_padding_mask = ref_obs_padding_mask & ref_obs_seq_pad_mask.unsqueeze(0)
+            ref_obs_padding_mask = F.pad(ref_obs_padding_mask, (0, 1), value=1.0)  # Account for CLS and SEP tokens
+
+            # Update padding mask: set to 0 where ref_obs_mask is False
+            # ref_obs_mask shape: (B, 1, 1) -> (B, 1)
+            ref_obs_padding_mask = ref_obs_padding_mask & ref_obs_mask.squeeze(-1).squeeze(-1).unsqueeze(1)
+            padding_masks.append(ref_obs_padding_mask)  # Shape: (B, seq_len_ref_obs + 2)
+
+            
+
+        # -------------------
+        # Concatenate embeddings and padding masks
+        # -------------------
+        x = torch.cat(embeddings, dim=1)  # Shape: (B, total_seq_len, dim_model)
+
+        if len(padding_masks) > 1:
+            padding_mask = torch.cat(padding_masks, dim=1)  # Shape: (B, total_seq_len)
+        else:
+            padding_mask = padding_masks[0]  # Shape: (B, total_seq_len)
+
+        padding_mask = ~padding_mask  # Invert mask: True for padding tokens
+
+        # -------------------
+        # Transformer processing
+        # -------------------
+        x = self.transformer(x, src_key_padding_mask=padding_mask)  # Transformer expects shape (S, B, E)
+        if not self.apply_pooling:
+            x = x[:, 0, :]  # Take the first token's output: Shape (B, dim_model)
+        else:
+            padding_mask = ~padding_mask # Inverted mask: True for non-padding tokens
+            # Apply average pooling over non-padding tokens
+            x = x.masked_fill(padding_mask.unsqueeze(-1), 0)  # Set padding tokens to zero
+            x = x.sum(dim=1)  # Sum over the sequence length dimension, x shape: (B, dim_model)
+            x = x / padding_mask.sum(dim=1, keepdim=True)  # Normalize by the number of non-padding tokens
+
+        # -------------------
+        # Final fully connected layer
+        # -------------------
+        x = self.fc(x)  # Shape: (B, output_dim)
+        if self.mlp_residual is not None:
+            obs_in = obs
+            if ref_obs is not None:
+                obs_in = torch.cat([obs, ref_obs_tensor], dim=1)
+            
+            if obs_in.size(1) != self.in_size: # use zero padding
+                obs_in = F.pad(obs_in, (0, self.in_size - obs_in.size(1)), value=0.0)
+                
+            x = x + self.mlp_residual(obs_in)
+        # x = self.out_ls(x)
+        return x
+    
+class MMTransformerWithSeqLen(nn.Module):
+    def __init__(
+            self,
+            obs_size,
+            ref_obs_size,
+            dim_out,
+            dim_model,
+            num_heads = 4,
+            num_layers = 4,
+            ffn_ratio = 4,
+            dropout = 0.0,
+            name = "",
+            ls_init_values = 1e-3,
+            **kwargs
+    ):
+        super().__init__()
+        self.name = name
+        if kwargs:
+            print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
+        self.obs_embedding = ObservationEmbeddingWithObsLen(obs_size, dim_model)
+        if ref_obs_size == 0:
+            self.ref_obs_embedding = None
+        else:
+            self.ref_obs_embedding = ObservationEmbedding(ref_obs_size, dim_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim_model,
+            nhead=num_heads,
+            dim_feedforward=dim_model * ffn_ratio,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers, norm=nn.LayerNorm(dim_model))
+        self.fc = nn.Sequential(
+            nn.Linear(dim_model, dim_out),
+        )
+
+    def forward(
+        self, 
+        obs: torch.Tensor, 
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+
+        embeddings = []
+        padding_masks = []
+
+        assert (self.ref_obs_embedding is not None) or (ref_obs is None), "Cannot run multi-modality mode with ref_obs_size=0"
+        obs_emb = self.obs_embedding(obs)  # Shape: (B, seq_len_obs, dim_model)
+
+        # Create padding mask for obs: 1 for non-padding, 0 for padding
+        obs_padding_mask = torch.ones(obs_emb.size(0), obs_emb.size(1), dtype=torch.bool, device=obs.device) # Shape: (B, seq_len_obs)
+        embeddings.append(obs_emb)
+        padding_masks.append(obs_padding_mask)  # Shape: (B, seq_len_obs + 2)
+        if ref_obs is not None and self.ref_obs_embedding is not None:
+            ref_obs_tensor, ref_obs_mask = ref_obs  # Unpack the tuple
+            ref_obs_emb = self.ref_obs_embedding(ref_obs_tensor)  # Shape: (B, seq_len_ref_obs, dim_model)
+            ref_obs_padding_mask = torch.ones(ref_obs_emb.size(0), ref_obs_emb.size(1), dtype=torch.bool, device=ref_obs_emb.device) # Shape: (B, seq_len_ref_obs)
+            ref_obs_mask = ref_obs_mask.view(-1, 1, 1)
+            ref_obs_emb = ref_obs_emb * ref_obs_mask  # Zero out embeddings where ref_obs_mask is False
+            embeddings.append(ref_obs_emb)  # Append to embeddings list
+            ref_obs_padding_mask = ref_obs_padding_mask & ref_obs_mask.squeeze(-1).squeeze(-1).unsqueeze(1)
+            padding_masks.append(ref_obs_padding_mask)  # Shape: (B, seq_len_ref_obs + 2)
+
+        x = torch.cat(embeddings, dim=1)  # Shape: (B, total_seq_len, dim_model)
+
+        if len(padding_masks) > 1:
+            padding_mask = torch.cat(padding_masks, dim=1)  # Shape: (B, total_seq_len)
+        else:
+            padding_mask = padding_masks[0]  # Shape: (B, total_seq_len)
+
+        padding_mask = ~padding_mask  # Invert mask: True for padding tokens
+        x = self.transformer(x, src_key_padding_mask=padding_mask)  # Transformer expects shape (S, B, E)
+        padding_mask = ~padding_mask # Inverted mask: True for non-padding tokens
+        # Apply average pooling over non-padding tokens
+        x = x.masked_fill(padding_mask.unsqueeze(-1), 0)  # Set padding tokens to zero
+        x = x.sum(dim=1)  # Sum over the sequence length dimension, x shape: (B, dim_model)
+        x = x / padding_mask.sum(dim=1, keepdim=True)  # Normalize by the number of non-padding tokens
+        x = self.fc(x)  # Shape: (B, output_dim)
+        return x
+
+class MMTransformerV2(nn.Module):
+    def __init__(
+            self,
+            dim_out,
+            dim_model,
+            term_dict: dict,
+            ref_term_dict: dict | None = None,
+            num_heads = 8,
+            num_layers = 4,
+            ffn_ratio = 4,
+            dropout = 0.0,
+            name = "",
+            ls_init_values = 1e-3,
+            apply_pooling = False,
+            **kwargs
+    ):
+        super().__init__()
+        self.name = name
+        if kwargs:
+            print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
+        self.obs_embedding = ObservationEmbeddingV2(dim_model, term_dict)
+        if ref_term_dict:
+            self.ref_obs_embedding = ObservationEmbeddingV2(dim_model, ref_term_dict)
+        else:
+            self.ref_obs_embedding = None
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim_model))
         self.sep_token = nn.Parameter(torch.randn(1, 1, dim_model))
         encoder_layer = nn.TransformerEncoderLayer(
@@ -184,7 +514,6 @@ class MMTransformer(nn.Module):
         x = self.fc(x)  # Shape: (B, output_dim)
         # x = self.out_ls(x)
         return x
-    
 
 class Transformer(nn.Module):
     '''
@@ -286,7 +615,7 @@ class DebugMLP(nn.Module):
             obs_size,
             ref_obs_size,
             dim_out,
-            dim_model,
+            dim_model = 0,
             max_len = 128,
             num_heads = 8,
             num_layers = 4,
@@ -302,14 +631,15 @@ class DebugMLP(nn.Module):
         self.ref_obs_size = ref_obs_size
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
+        self.layers_dim = [128, 128, 128]
         self.layers = nn.Sequential(
-            nn.Linear(obs_size + ref_obs_size, 768),
+            nn.Linear(obs_size + ref_obs_size, self.layers_dim[0]),
             nn.ReLU(),
-            nn.Linear(768, 384),
+            nn.Linear(self.layers_dim[0], self.layers_dim[1]),
             nn.ReLU(),
-            nn.Linear(384, 128),
+            nn.Linear(self.layers_dim[1], self.layers_dim[2]),
             nn.ReLU(),
-            nn.Linear(128, dim_out),
+            nn.Linear(self.layers_dim[2], dim_out),
         )
 
     def forward(
@@ -357,13 +687,17 @@ class ActorCriticMMTransformer(nn.Module):
             init_noise_std=1.0,
             load_dagger=False,
             load_dagger_path=None,
+            load_actor_path=None,
             enable_lora=False,
+            dropout=0.05,
             **kwargs
     ):
         super().__init__()
         assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
-        self.actor = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", **kwargs)
-        self.actor_dagger = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", **kwargs) if load_dagger else None
+        self.actor = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", dropout=dropout, **kwargs)
+        self.actor_dagger = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, **kwargs) if load_dagger else None
+        if load_actor_path:
+            self.load_actor_weights(load_actor_path)
         if load_dagger:
             self.load_dagger_weights(load_dagger_path)
             lora_r = kwargs.get('lora_r', 8)
@@ -372,7 +706,7 @@ class ActorCriticMMTransformer(nn.Module):
             if enable_lora:
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             
-        self.critic = MMTransformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", **kwargs) # 1 for value function
+        self.critic = MMTransformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", dropout=dropout, **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")
@@ -394,6 +728,25 @@ class ActorCriticMMTransformer(nn.Module):
     #         self.actor_dagger.load_state_dict(dagger_weights, strict = strict)
     #         print(f"Loaded dagger weights from {state_dict} to actor_dagger")
 
+    def load_actor_weights(self, path):
+        state_dict = torch.load(path, map_location="cpu")
+        # check for 'actor' in the state_dict keys
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the actor_dagger weights through layer name matching (starting with 'actor')
+        actor_weights = {k[len('actor.'):]: v for k, v in model_state_dict.items() if k.startswith('actor')}
+        actor_state_dict = self.actor.state_dict()
+        # perform weights checking
+        for k, v in actor_weights.items():
+            if k not in actor_state_dict:
+                raise KeyError(f"Key {k} not found in actor_dagger state_dict")
+            if actor_state_dict[k].shape != v.shape:
+                raise ValueError(f"Shape mismatch for key {k}: {actor_state_dict[k].shape} vs {v.shape}")
+        # load the weights
+        # self.actor.load_state_dict(dagger_weights)
+        self.actor.load_state_dict(actor_weights)
+        print(f"Loaded dagger weights from {path} to actor_dagger")
         
     def load_dagger_weights(self, path):
         state_dict = torch.load(path, map_location="cpu")
@@ -501,4 +854,199 @@ class ActorCriticMMTransformer(nn.Module):
     def evaluate(self, critic_observations, ref_critic_observations =None, **kwargs):
         value = self.critic(critic_observations, ref_critic_observations)
         return value
+
+class ActorCriticDebugMLP(nn.Module):
+    is_recurrent = False
+    def __init__(
+            self,
+            num_actor_obs,
+            num_actor_ref_obs,
+            num_critic_obs,
+            num_critic_ref_obs,
+            num_actions,
+            max_len=16,
+            dim_model=128,
+            num_layers=4,
+            num_heads=8,
+            init_noise_std=1.0,
+            **kwargs
+    ):
+        super().__init__()
+        self.actor = DebugMLP(num_actor_obs, num_actor_ref_obs, num_actions)
+        self.critic = DebugMLP(num_critic_obs, num_critic_ref_obs, 1)
+        print(f"Actor Transformer: {self.actor}")
+        print(f"Critic Transformer: {self.critic}")
+        # Action noise
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.distribution = None
+        # disable args validation for speedup
+        Normal.set_default_validate_args = False
+        
+    @staticmethod
+    # not used at the moment
+    def init_weights(sequential, scales):
+        [
+            torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
+            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
+        ]
+
+    def reset(self, dones=None):
+        pass
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    @property
+    def action_mean(self):
+        return self.distribution.mean
+
+    @property
+    def action_std(self):
+        return self.distribution.stddev
+
+    @property
+    def entropy(self):
+        return self.distribution.entropy().sum(dim=-1)
+
+    def update_distribution(self, observations, ref_observations=None):
+        mean = self.actor(observations, ref_observations)
+        self.distribution = Normal(mean, 0.0 * mean + self.std)
+
+    def act(self, observations, ref_observations=None, **kwargs):
+        self.update_distribution(observations, ref_observations)
+        sample = self.distribution.sample()
+        return sample
+        
+    def act_inference(self, observations, ref_observations=None):
+        return self.actor(observations, ref_observations)
+
+    def get_actions_log_prob(self, actions):
+        return self.distribution.log_prob(actions).sum(dim=-1)
+
+    def act_inference(self, observations, ref_observations=None):
+        actions_mean = self.actor(observations, ref_observations)
+        return actions_mean
+
+    def evaluate(self, critic_observations, ref_critic_observations =None, **kwargs):
+        value = self.critic(critic_observations, ref_critic_observations)
+        return value
     
+
+class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
+    def __init__(
+            self,
+            term_dict,
+            ref_term_dict,
+            num_actions,
+            max_len=16,
+            dim_model=128,
+            num_layers=4,
+            num_heads=8,
+            init_noise_std=1.0,
+            load_dagger=False,
+            load_dagger_path=None,
+            load_actor_path=None,
+            enable_lora=False,
+            dropout=0.05,
+            **kwargs
+    ):
+        nn.Module.__init__(self)
+        assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
+        self.actor = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", dropout=dropout, **kwargs)
+        self.actor_dagger = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, **kwargs) if load_dagger else None
+        if load_actor_path:
+            self.load_actor_weights(load_actor_path)
+        if load_dagger:
+            self.load_dagger_weights(load_dagger_path)
+            lora_r = kwargs.get('lora_r', 8)
+            lora_alpha = kwargs.get('lora_alpha', 16)
+            lora_dropout = kwargs.get('lora_dropout', 0.05)
+            if enable_lora:
+                self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+            
+        self.critic = MMTransformerV2(1, dim_model, term_dict["critic"], ref_term_dict["critic"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", dropout=dropout, **kwargs) # 1 for value function
+        print(f"Actor Transformer: {self.actor}")
+        print(f"Critic Transformer: {self.critic}")
+        print(f"Dagger Model: {self.actor_dagger}")
+        # Action noise
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.distribution = None
+        # disable args validation for speedup
+        Normal.set_default_validate_args = False
+        
+
+class ActorCriticDebugMLP(nn.Module):
+    is_recurrent = False
+    def __init__(
+            self,
+            num_actor_obs,
+            num_actor_ref_obs,
+            num_critic_obs,
+            num_critic_ref_obs,
+            num_actions,
+            max_len=16,
+            dim_model=128,
+            num_layers=4,
+            num_heads=8,
+            init_noise_std=1.0,
+            **kwargs
+    ):
+        super().__init__()
+        self.actor = DebugMLP(num_actor_obs, num_actor_ref_obs, num_actions)
+        self.critic = DebugMLP(num_critic_obs, num_critic_ref_obs, 1)
+        print(f"Actor Transformer: {self.actor}")
+        print(f"Critic Transformer: {self.critic}")
+        # Action noise
+        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.distribution = None
+        # disable args validation for speedup
+        Normal.set_default_validate_args = False
+        
+    @staticmethod
+    # not used at the moment
+    def init_weights(sequential, scales):
+        [
+            torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
+            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
+        ]
+
+    def reset(self, dones=None):
+        pass
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    @property
+    def action_mean(self):
+        return self.distribution.mean
+
+    @property
+    def action_std(self):
+        return self.distribution.stddev
+
+    @property
+    def entropy(self):
+        return self.distribution.entropy().sum(dim=-1)
+
+    def update_distribution(self, observations, ref_observations=None):
+        mean = self.actor(observations, ref_observations)
+        self.distribution = Normal(mean, 0.0 * mean + self.std)
+
+    def act(self, observations, ref_observations=None, **kwargs):
+        self.update_distribution(observations, ref_observations)
+        sample = self.distribution.sample()
+        return sample
+        
+    def act_inference(self, observations, ref_observations=None):
+        return self.actor(observations, ref_observations)
+
+    def get_actions_log_prob(self, actions):
+        return self.distribution.log_prob(actions).sum(dim=-1)
+
+    def act_inference(self, observations, ref_observations=None):
+        actions_mean = self.actor(observations, ref_observations)
+        return actions_mean
+
+    def evaluate(self, critic_observations, ref_critic_observations =None, **kwargs):
+        value = self.critic(critic_observations, ref_critic_observations)
+        return value

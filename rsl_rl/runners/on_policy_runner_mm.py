@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 import rsl_rl
 from rsl_rl.algorithms import MMPPO
 from rsl_rl.env import MMVecEnv
-from rsl_rl.modules import ActorCriticMMTransformer, EmpiricalNormalization
+from rsl_rl.modules import *
 from rsl_rl.utils import store_code_state
 
 
@@ -28,6 +28,7 @@ class OnPolicyRunnerMM:
         self.env = env
         obs, extras = self.env.get_observations()
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
+            
         num_obs = obs.shape[1]
         if ref_obs_tuple is not None:
             num_ref_obs = ref_obs_tuple[0].shape[1]
@@ -41,15 +42,38 @@ class OnPolicyRunnerMM:
             num_critic_ref_obs = ref_extras["ref_observations"]["critic"][0].shape[1]
         else:
             num_critic_ref_obs = num_ref_obs
-            
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
-        actor_critic: ActorCriticMMTransformer = actor_critic_class(
-            num_actor_obs=num_obs,
-            num_actor_ref_obs=num_ref_obs,
-            num_critic_obs=num_critic_obs,
-            num_critic_ref_obs=num_critic_ref_obs,
+        actor_critic_dim = {
+            "num_actor_obs": num_obs,
+            "num_actor_ref_obs": num_ref_obs,
+            "num_critic_obs": num_critic_obs,
+            "num_critic_ref_obs": num_critic_ref_obs,
+        }
+
+        actor_critic_name = self.policy_cfg.pop("class_name")
+        actor_critic_class = eval(actor_critic_name)  # ActorCritic
+        if actor_critic_name == "ActorCriticMMTransformerV2":
+            def get_term_dict(dict_names, dict_dims):
+                ret = dict(
+                    (key, dict((name, dim[0]) for name, dim in zip(dict_names[key], dict_dims[key]) if dim[0] > 0))
+                    for key in dict_names.keys()
+                )
+                if "critic" not in ret:
+                    ret["critic"] = ret["policy"]
+                return ret
+            actor_critic_dim = {
+                "term_dict": get_term_dict(
+                    self.env.unwrapped.observation_manager.active_terms,
+                    self.env.unwrapped.observation_manager.group_obs_term_dim,
+                ),
+                "ref_term_dict": get_term_dict(
+                    self.env.unwrapped.ref_observation_manager.active_terms,
+                    self.env.unwrapped.ref_observation_manager.group_ref_obs_term_dim,
+                ),
+            }
+        actor_critic = actor_critic_class(
+            **actor_critic_dim,
             num_actions=self.env.num_actions,
-             **self.policy_cfg
+            **self.policy_cfg
         ).to(self.device)
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
         self.alg: MMPPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
