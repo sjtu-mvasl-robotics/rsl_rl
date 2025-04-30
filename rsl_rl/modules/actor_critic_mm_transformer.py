@@ -660,7 +660,7 @@ class DebugMLP(nn.Module):
         self.ref_obs_size = ref_obs_size
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
-        self.layers_dim = [128, 128, 128]
+        self.layers_dim = [512, 256, 128]
         self.layers = nn.Sequential(
             nn.Linear(obs_size + ref_obs_size, self.layers_dim[0]),
             nn.ReLU(),
