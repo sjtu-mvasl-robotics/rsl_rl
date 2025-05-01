@@ -324,6 +324,7 @@ class MMTransformerWithSeqLen(nn.Module):
             dropout = 0.0,
             name = "",
             ls_init_values = 1e-3,
+            apply_mlp_residual = True,
             **kwargs
     ):
         super().__init__()
@@ -347,6 +348,8 @@ class MMTransformerWithSeqLen(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(dim_model, dim_out),
         )
+        
+        
 
     def forward(
         self, 
@@ -405,6 +408,7 @@ class MMTransformerV2(nn.Module):
             name = "",
             ls_init_values = 1e-3,
             apply_pooling = False,
+            apply_mlp_residual = True,
             **kwargs
     ):
         super().__init__()
@@ -434,6 +438,17 @@ class MMTransformerV2(nn.Module):
             nn.Linear(dim_model, dim_out),
         )
         self.apply_pooling = apply_pooling
+        obs_size = sum(term_dict.values())
+        ref_obs_size = sum(ref_term_dict.values()) if ref_term_dict else 0
+        self.in_size = obs_size + ref_obs_size
+        self.mlp_residual = nn.Sequential(
+            nn.Linear(obs_size + ref_obs_size, 512),
+            nn.GELU(),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, dim_out),
+        ) if apply_mlp_residual else None
+        self.mlp_weight = nn.Parameter(torch.ones(1)) if apply_mlp_residual else None
         # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
 
     def forward(
@@ -541,6 +556,16 @@ class MMTransformerV2(nn.Module):
         # Final fully connected layer
         # -------------------
         x = self.fc(x)  # Shape: (B, output_dim)
+        
+        if self.mlp_residual is not None:
+            obs_in = obs
+            if ref_obs is not None:
+                obs_in = torch.cat([obs, ref_obs_tensor], dim=1)
+            
+            if obs_in.size(1) != self.in_size: # use zero padding
+                obs_in = F.pad(obs_in, (0, self.in_size - obs_in.size(1)), value=0.0)
+                
+            x = x + self.mlp_residual(obs_in) * self.mlp_weight
         # x = self.out_ls(x)
         return x
 
