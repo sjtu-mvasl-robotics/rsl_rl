@@ -118,8 +118,12 @@ class OnPolicyRunnerMM:
 
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             rnd_state = extras["observations"].get("rnd_state")
+            # for debug use only
+
             if rnd_state is None:
-                raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
+                rnd_state = extras["observations"].get("policy")
+                if rnd_state is None:
+                    raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
             num_rnd_state = rnd_state.shape[1]
             self.alg_cfg["rnd_cfg"]["num_states"] = num_rnd_state
             self.alg_cfg["rnd_cfg"]["weight"] *= self.env.unwrapped.step_dt

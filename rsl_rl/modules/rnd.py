@@ -31,6 +31,7 @@ class RandomNetworkDistillation(nn.Module):
         reward_normalization: bool = False,
         device: str = "cpu",
         weight_schedule: dict | None = None,
+        **kwargs
     ):
         """Initialize the RND module.
 
@@ -73,6 +74,8 @@ class RandomNetworkDistillation(nn.Module):
         """
         # initialize parent class
         super().__init__()
+
+        
 
         # Store parameters
         self.num_states = num_states

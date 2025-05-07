@@ -286,7 +286,10 @@ class MMPPO:
         
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
-            rnd_state = infos["observations"]["rnd_state"]
+            try:
+                rnd_state = infos["observations"]["rnd_state"]
+            except KeyError:
+                rnd_state = infos["observations"]["policy"]
             self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
             self.transition.rewards += self.intrinsic_rewards
             self.transition.rnd_state = rnd_state.clone()
@@ -467,11 +470,11 @@ class MMPPO:
                     else:
                         symmetry_loss = symmetry_loss.detach()
 
-                if self.rnd:
-                    predicted_embedding = self.rnd.predictor(rnd_state_batch)
-                    target_embedding = self.rnd.target(rnd_state_batch).detach()
-                    mse_loss = torch.nn.MSELoss()
-                    rnd_loss = mse_loss(predicted_embedding, target_embedding)    
+            if self.rnd:
+                predicted_embedding = self.rnd.predictor(rnd_state_batch)
+                target_embedding = self.rnd.target(rnd_state_batch).detach()
+                mse_loss = torch.nn.MSELoss()
+                rnd_loss = mse_loss(predicted_embedding, target_embedding)    
 
             imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch)      
                     
