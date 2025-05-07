@@ -26,6 +26,16 @@ class OnPolicyRunnerMM:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+
+        self._configure_multi_gpu()
+
+        if self.alg_cfg["class_name"] == "MMPPO":
+            self.training_type = "rl"
+        elif self.alg_cfg["class_name"] == "Distillation":
+            self.training_type = "distillation"
+        else:
+            raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
+
         obs, extras = self.env.get_observations()
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
             
@@ -34,14 +44,37 @@ class OnPolicyRunnerMM:
             num_ref_obs = ref_obs_tuple[0].shape[1]
         else:
             num_ref_obs = 0
-        if "critic" in extras["observations"]:
-            num_critic_obs = extras["observations"]["critic"].shape[1]
+
+        if self.training_type == "rl":
+            self.privileged_obs_type = "critic"
+        elif self.training_type == "distillation":
+            self.privileged_obs_type = "teacher"
+        else:
+            self.privileged_obs_type = None
+
+        if self.training_type == "rl":
+            if "critic" in extras["observations"]:
+                num_critic_obs = extras["observations"]["critic"].shape[1]
+            else:
+                num_critic_obs = num_obs
+            if "critic" in ref_extras["ref_observations"]:
+                num_critic_ref_obs = ref_extras["ref_observations"]["critic"][0].shape[1]
+            else:
+                num_critic_ref_obs = num_ref_obs
+        elif self.training_type == "distillation":
+            if "teacher" in extras["observations"]:
+                num_critic_obs = extras["observations"]["teacher"].shape[1]
+            else:
+                num_critic_obs = num_obs
+            if "teacher" in ref_extras["ref_observations"]:
+                num_critic_ref_obs = ref_extras["ref_observations"]["teacher"][0].shape[1]
+            else:
+                num_critic_ref_obs = num_ref_obs
+
         else:
             num_critic_obs = num_obs
-        if "critic" in ref_extras["ref_observations"]:
-            num_critic_ref_obs = ref_extras["ref_observations"]["critic"][0].shape[1]
-        else:
             num_critic_ref_obs = num_ref_obs
+
         actor_critic_dim = {
             "num_actor_obs": num_obs,
             "num_actor_ref_obs": num_ref_obs,
@@ -70,13 +103,32 @@ class OnPolicyRunnerMM:
                     self.env.unwrapped.ref_observation_manager.group_ref_obs_term_dim,
                 ),
             }
+        elif actor_critic_name == "StudentTeacherMMTransformer":
+            actor_critic_dim = {
+                "num_teacher_obs": num_critic_obs,
+                "num_teacher_ref_obs": num_critic_ref_obs,
+                "num_student_obs": num_obs,
+                "num_student_ref_obs": num_ref_obs,
+            }
         actor_critic = actor_critic_class(
             **actor_critic_dim,
             num_actions=self.env.num_actions,
             **self.policy_cfg
         ).to(self.device)
+
+        if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
+            rnd_state = extras["observations"].get("rnd_state")
+            if rnd_state is None:
+                raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
+            num_rnd_state = rnd_state.shape[1]
+            self.alg_cfg["rnd_cfg"]["num_states"] = num_rnd_state
+            self.alg_cfg["rnd_cfg"]["weight"] *= self.env.unwrapped.step_dt
+
+        if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
+            self.alg_cfg["symmetry_cfg"]["_env"] = self.env
+
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
-        self.alg: MMPPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+        self.alg: MMPPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
@@ -99,6 +151,7 @@ class OnPolicyRunnerMM:
         #     [self.env.num_actions],
         # )
         self.alg.init_storage(
+            training_type=self.training_type,
             num_envs=self.env.num_envs,
             num_transitions_per_env=self.num_steps_per_env,
             actor_obs_shape=[num_obs],
@@ -108,7 +161,9 @@ class OnPolicyRunnerMM:
             action_shape=[self.env.num_actions],
         )
 
-        # Log
+        self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
+
+        # Logging
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
@@ -118,7 +173,7 @@ class OnPolicyRunnerMM:
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
-        if self.log_dir is not None and self.writer is None:
+        if self.log_dir is not None and self.writer is None and not self.disable_logs:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
             self.logger_type = self.cfg.get("logger", "tensorboard")
             self.logger_type = self.logger_type.lower()
@@ -137,6 +192,9 @@ class OnPolicyRunnerMM:
                 self.writer = TensorboardSummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise AssertionError("logger type not found")
+
+        if self.training_type == "distillation" and not self.alg.actor_critic.loaded_teacher:
+            raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
 
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
@@ -158,6 +216,20 @@ class OnPolicyRunnerMM:
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        if self.alg.rnd:
+            erewbuffer = deque(maxlen=100)
+            irewbuffer = deque(maxlen=100)
+            cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        if self.is_distributed:
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            self.alg.broadcast_parameters()
+            try:
+                self.alg.broadcast_parameters_dagger()
+            except:
+                pass
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -202,6 +274,8 @@ class OnPolicyRunnerMM:
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
 
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
+
                     if self.log_dir is not None:
                         # Book keeping
                         # note: we changed logging to use "log" instead of "episode" to avoid confusion with
@@ -213,13 +287,24 @@ class OnPolicyRunnerMM:
 
                         # clip rewards < 0 to 0
                         # rewards = torch.clamp(rewards, min=0.0)
-                        cur_reward_sum += rewards
+
+                        if self.alg.rnd:
+                            cur_ereward_sum += rewards
+                            cur_ireward_sum += intrinsic_rewards  # type: ignore
+                            cur_reward_sum += rewards + intrinsic_rewards
+                        else:
+                            cur_reward_sum += rewards
                         cur_episode_length += 1
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
+                        if self.alg.rnd:
+                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_ereward_sum[new_ids] = 0
+                            cur_ireward_sum[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -229,18 +314,20 @@ class OnPolicyRunnerMM:
 
                 # Learning step
                 start = stop
-                self.alg.compute_returns(critic_obs)
+                if self.training_type == "rl":
+                    self.alg.compute_returns(critic_obs)
 
-            mean_value_loss, mean_surrogate_loss, mean_imitation_loss, mean_dagger_loss = self.alg.update(epoch=it)
+            loss_dict = self.alg.update()
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
-            if self.log_dir is not None:
+            if self.log_dir is not None and not self.disable_logs:
                 self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                if it % self.save_interval == 0:
+                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
             ep_infos.clear()
-            if it == start_iter:
+            if it == start_iter and not self.disable_logs:
                 # obtain all the diff files
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
                 # if possible store them to wandb
@@ -248,7 +335,8 @@ class OnPolicyRunnerMM:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
-        self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+        if self.log_dir is not None and not self.disable_logs:
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -279,17 +367,29 @@ class OnPolicyRunnerMM:
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
-        self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
-        self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
-        self.writer.add_scalar("Loss/imitation", locs["mean_imitation_loss"], locs["it"])
-        if locs["mean_dagger_loss"] > 0:
-            self.writer.add_scalar("Loss/dagger", locs["mean_dagger_loss"], locs["it"])
+        self.writer.add_scalar("Loss/value_function", locs["loss_dict"]["mean_value_loss"], locs["it"])
+        self.writer.add_scalar("Loss/surrogate", locs["loss_dict"]["mean_surrogate_loss"], locs["it"])
+        self.writer.add_scalar("Loss/imitation", locs["loss_dict"]["mean_imitation_loss"], locs["it"])
+        if locs["loss_dict"]["mean_dagger_loss"] > 0:
+            self.writer.add_scalar("Loss/dagger", locs["loss_dict"]["mean_dagger_loss"], locs["it"])
+        if self.alg.rnd:
+            self.writer.add_scalar("Loss/rnd", locs["loss_dict"]["mean_rnd_loss"], locs["it"])
+        if self.alg.symmetry:
+            self.writer.add_scalar("Loss/symmetry", locs["loss_dict"]["symmetry"], locs["it"])
+        
+
+        
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
         if len(locs["rewbuffer"]) > 0:
+            if self.alg.rnd:
+                self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
+                self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
+                self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
+          
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
@@ -306,10 +406,27 @@ class OnPolicyRunnerMM:
                 f"""{str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Imitation loss:':>{pad}} {locs['mean_imitation_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                f"""{'Value function loss:':>{pad}} {locs['loss_dict']['mean_value_loss']:.4f}\n"""
+                f"""{'Surrogate loss:':>{pad}} {locs['loss_dict']['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Imitation loss:':>{pad}} {locs['loss_dict']['mean_imitation_loss']:.4f}\n""")
+            
+                # f"""{'Dagger loss:':>{pad}} {locs['loss_dict']['mean_dagger_loss']:.4f}\n""" if locs['loss_dict']['mean_dagger_loss'] > 0 else ""
+                # f"""{'Rnd loss:':>{pad}} {locs['loss_dict']['mean_rnd_loss']:.4f}\n""" if self.alg.rnd else ""
+                # f"""{'Entropy:':>{pad}} {locs['loss_dict']['mean_entropy']:.4f}\n"""
+                # f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n""" if self.alg.rnd else ""
+                # f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n""" if self.alg.rnd else ""
+                # f"""{'Symmetry loss:':>{pad}} {locs['loss_dict']['symmetry']:.4f}\n""" if self.alg.symmetry else ""
+
+            if locs['loss_dict']['mean_dagger_loss'] > 0:
+                log_string += (f"""{'Dagger loss:':>{pad}} {locs['loss_dict']['mean_dagger_loss']:.4f}\n""")
+            if self.alg.rnd:
+                log_string += (f"""{'Rnd loss:':>{pad}} {locs['loss_dict']['mean_rnd_loss']:.4f}\n"""
+                               f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
+                               f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n""")
+            if self.alg.symmetry:
+                log_string += (f"""{'Symmetry loss:':>{pad}} {locs['loss_dict']['symmetry']:.4f}\n""")
+            
+            log_string += (f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
             )
@@ -349,6 +466,10 @@ class OnPolicyRunnerMM:
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
+        if self.alg.rnd:
+            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
+            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+            
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -358,6 +479,9 @@ class OnPolicyRunnerMM:
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path, map_location=self.device)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
+        if self.alg.rnd:
+            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+            self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
         if self.empirical_normalization:
             self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
             self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
@@ -395,15 +519,59 @@ class OnPolicyRunnerMM:
 
     def train_mode(self):
         self.alg.actor_critic.train()
+
+        if self.alg.rnd:
+            self.alg.rnd.train()
         if self.empirical_normalization:
             self.obs_normalizer.train()
             self.critic_obs_normalizer.train()
 
     def eval_mode(self):
         self.alg.actor_critic.eval()
+        if self.alg.rnd:
+            self.alg.rnd.eval()
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.critic_obs_normalizer.eval()
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
+
+    def _configure_multi_gpu(self):
+        """Configure multi-gpu training."""
+        # check if distributed training is enabled
+        self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
+        self.is_distributed = self.gpu_world_size > 1
+
+        # if not distributed training, set local and global rank to 0 and return
+        if not self.is_distributed:
+            self.gpu_local_rank = 0
+            self.gpu_global_rank = 0
+            self.multi_gpu_cfg = None
+            return
+
+        self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        self.gpu_global_rank = int(os.getenv("RANK", "0"))
+
+        self.multi_gpu_cfg = {
+            "global_rank": self.gpu_global_rank,
+            "local_rank": self.gpu_local_rank,
+            "world_size": self.gpu_world_size,
+        }
+
+        # check if user has device specified for local rank
+        if self.device != f"cuda:{self.gpu_local_rank}":
+            raise ValueError(f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'.")
+        # validate multi-gpu configuration
+        if self.gpu_local_rank >= self.gpu_world_size:
+            raise ValueError(f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
+        if self.gpu_global_rank >= self.gpu_world_size:
+            raise ValueError(f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
+
+        # initialize torch distributed
+        torch.distributed.init_process_group(
+            backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size
+        )
+        # set device to the local rank
+        torch.cuda.set_device(self.gpu_local_rank)
+            

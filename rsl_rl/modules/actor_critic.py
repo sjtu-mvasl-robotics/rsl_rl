@@ -1,13 +1,16 @@
-#  Copyright 2021 ETH Zurich, NVIDIA CORPORATION
-#  SPDX-License-Identifier: BSD-3-Clause
-
+# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-import time
+
+from rsl_rl.utils import resolve_nn_activation
+
 
 class ActorCritic(nn.Module):
     is_recurrent = False
@@ -21,6 +24,7 @@ class ActorCritic(nn.Module):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         init_noise_std=1.0,
+        noise_std_type: str = "scalar",
         **kwargs,
     ):
         if kwargs:
@@ -29,7 +33,7 @@ class ActorCritic(nn.Module):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
-        activation = get_activation(activation)
+        activation = resolve_nn_activation(activation)
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
@@ -61,14 +65,18 @@ class ActorCritic(nn.Module):
         print(f"Critic MLP: {self.critic}")
 
         # Action noise
-        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.noise_std_type = noise_std_type
+        if self.noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif self.noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+
+        # Action distribution (populated in update_distribution)
         self.distribution = None
         # disable args validation for speedup
-        Normal.set_default_validate_args = False
-
-        # seems that we get better performance without init
-        # self.init_memory_weights(self.memory_a, 0.001, 0.)
-        # self.init_memory_weights(self.memory_c, 0.001, 0.)
+        Normal.set_default_validate_args(False)
 
     @staticmethod
     # not used at the moment
@@ -97,15 +105,21 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, observations):
+        # compute mean
         mean = self.actor(observations)
-        self.distribution = Normal(mean, mean * 0.0 + self.std)
+        # compute standard deviation
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        # create distribution
+        self.distribution = Normal(mean, std)
 
     def act(self, observations, **kwargs):
-        # time_start = time.time()
         self.update_distribution(observations)
-        sample = self.distribution.sample()
-        # print(f"ActorCritic.act took {time.time() - time_start} seconds, sample shape: {sample.shape}")
-        return sample
+        return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
@@ -118,22 +132,18 @@ class ActorCritic(nn.Module):
         value = self.critic(critic_observations)
         return value
 
+    def load_state_dict(self, state_dict, strict=True):
+        """Load the parameters of the actor-critic model.
 
-def get_activation(act_name):
-    if act_name == "elu":
-        return nn.ELU()
-    elif act_name == "selu":
-        return nn.SELU()
-    elif act_name == "relu":
-        return nn.ReLU()
-    elif act_name == "crelu":
-        return nn.CReLU()
-    elif act_name == "lrelu":
-        return nn.LeakyReLU()
-    elif act_name == "tanh":
-        return nn.Tanh()
-    elif act_name == "sigmoid":
-        return nn.Sigmoid()
-    else:
-        print("invalid activation function!")
-        return None
+        Args:
+            state_dict (dict): State dictionary of the model.
+            strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
+                           module's state_dict() function.
+
+        Returns:
+            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
+                  `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
+        """
+
+        super().load_state_dict(state_dict, strict=strict)
+        return True

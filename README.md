@@ -3,9 +3,14 @@
 Re-implemented some components for better imitation learning.
 
 **!!! Important !!!**:
-This version (`2.0.x-devx`) is not compatible with `legged_gym` since the interface (original interface) has been severely modified by ETHZ. To install the version for `legged_gym`, please use the `1.0.2` branch. 
 
-## RSL RL MM Series Interface (2024-12-24)
+~~This version (`2.x.x-devx`) is not compatible with `legged_gym` since the interface (original interface) has been severely modified by ETHZ. To install the version for `legged_gym`, please use the `1.0.2` branch~~. 
+
+For that NVIDIA updates `Isaac Lab` and `rsl_rl` lib so frequently, I am no longer capable of maintaining the compatibility with `legged_gym`.
+
+The `1.0.2` branch is now deprecated.
+
+## RSL RL MM Series Interface (2025-05-06)
 
 The RSL RL MM Series Interface is a new interface for the RSL RL framework. It is built upon `envs.MMVecEnv` and called only by  `rsl_rl.runners.on_policy_runner_mm`. The changes to the interface are as follows:
 
@@ -29,6 +34,11 @@ The RSL RL MM Series Interface is a new interface for the RSL RL framework. It i
 For update in `rsl_rl.runners.on_policy_runner_mm`, please check the `rsl_rl.runners.on_policy_runner_mm` module. You can simply refer to our project [GBC](https://github.com/sjtu-mvasl-robotics/GBC) for recommended usage.
 
 ## Introduction
+This is a unofficial fork of `rsl_rl` lib. Maintained by [@mvasl-robotics](https://github.com/sjtu-mvasl-robotics). However, this fork will no longer be maintained once I graduate from SJTU.
+
+This fork is used in our imitation learning project [GBC](https://github.com/sjtu-mvasl-robotics/GBC).
+
+## Original Introduction
 
 
 Fast and simple implementation of RL algorithms, designed to run fully on GPU.

@@ -11,6 +11,8 @@ import itertools
 
 from rsl_rl.modules import ActorCriticMMTransformer
 from rsl_rl.storage import RolloutStorageMM
+from rsl_rl.modules.rnd import RandomNetworkDistillation
+from rsl_rl.utils import string_to_callable
 import time
 
 class SmoothL2Loss(nn.Module):
@@ -73,6 +75,7 @@ class MMPPO:
         schedule="fixed",
         desired_kl=0.01,
         device="cpu",
+        normalize_advantage_per_mini_batch=False,
         ref_action_idx=0,
         # dagger
         # dagger parameters
@@ -93,9 +96,52 @@ class MMPPO:
         teacher_lr=5e-4,
         teacher_only_interval=0,
         default_action=None,
+        # RND parameters
+        rnd_cfg: dict | None = None,
+        # Symmetry parameters
+        symmetry_cfg: dict | None = None,
+        # Distributed training parameters
+        multi_gpu_cfg: dict | None = None,
+
+
         **kwargs # reserved for future use
     ):
         self.device = device
+        self.is_multi_gpu = multi_gpu_cfg is not None
+        if multi_gpu_cfg is not None:
+            self.gpu_global_rank = multi_gpu_cfg["global_rank"]
+            self.gpu_world_size = multi_gpu_cfg["world_size"]
+        else:
+            self.gpu_global_rank = 0
+            self.gpu_world_size = 1
+        
+        # RND components
+        if rnd_cfg is not None:
+            # Create RND module
+            self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg)
+            # Create RND optimizer
+            params = self.rnd.predictor.parameters()
+            self.rnd_optimizer = optim.Adam(params, lr=rnd_cfg.get("learning_rate", 1e-3))
+        else:
+            self.rnd = None
+            self.rnd_optimizer = None
+
+        # Symmetry components
+        if symmetry_cfg is not None:
+            use_symmetry = symmetry_cfg["use_data_augmentation"] or symmetry_cfg["use_mirror_loss"]
+            if not use_symmetry:
+                print("Symmetry not used for learning. We will use it for logging instead.")
+            if isinstance(symmetry_cfg["data_augmentation_func"], str):
+                symmetry_cfg["data_augmentation_func"] = string_to_callable(symmetry_cfg["data_augmentation_func"])
+
+            if symmetry_cfg["use_data_augmentation"] and not callable(symmetry_cfg["data_augmentation_func"]):
+                raise ValueError(
+                    "Data augmentation enabled but the function is not callable:"
+                    f" {symmetry_cfg['data_augmentation_func']}"
+                )
+            self.symmetry = symmetry_cfg
+        else:
+            self.symmetry = None
 
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -186,9 +232,15 @@ class MMPPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, actor_ref_obs_shape, critic_obs_shape, critic_ref_obs_shape, action_shape):
+    def init_storage(self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, actor_ref_obs_shape, critic_obs_shape, critic_ref_obs_shape, action_shape):
+        if self.rnd:
+            rnd_state_shape = [self.rnd.num_states]
+        else:
+            rnd_state_shape = None
         self.storage = RolloutStorageMM(
+            training_type,
             num_envs,
             num_transitions_per_env,
             obs_shape=actor_obs_shape,
@@ -196,6 +248,7 @@ class MMPPO:
             privileged_obs_shape=critic_obs_shape,
             privileged_ref_obs_shape=critic_ref_obs_shape,
             actions_shape=action_shape,
+            rnd_state_shape=rnd_state_shape,
             apply_dagger_actions=(self.teacher_coef is not None),
             device=self.device,
         )
@@ -230,6 +283,14 @@ class MMPPO:
     def process_env_step(self, rewards, dones, infos):
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
+        
+        # Compute the intrinsic rewards and add to extrinsic rewards
+        if self.rnd:
+            rnd_state = infos["observations"]["rnd_state"]
+            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
+            self.transition.rewards += self.intrinsic_rewards
+            self.transition.rnd_state = rnd_state.clone()
+
         # Bootstrapping on time outs
         if "time_outs" in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
@@ -245,13 +306,25 @@ class MMPPO:
     def compute_returns(self, last_critic_obs):
         assert self.storage is not None, "Storage is not initialized. Please call init_storage before compute_returns."
         last_values = self.actor_critic.evaluate(last_critic_obs).detach()
-        self.storage.compute_returns(last_values, self.gamma, self.lam)
+        self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch)
 
     def update(self, epoch=0):
-        mean_value_loss = torch.tensor(0.0).to(self.device)
-        mean_surrogate_loss = torch.tensor(0.0).to(self.device)
-        mean_imitation_loss = torch.tensor(0.0).to(self.device)
-        mean_dagger_loss = torch.tensor(0.0).to(self.device)
+        mean_value_loss = 0.0
+        mean_surrogate_loss = 0.0
+        mean_imitation_loss = 0.0
+        mean_dagger_loss = 0.0
+        mean_entropy = 0.0
+
+        if self.rnd:
+            mean_rnd_loss = 0.0
+        else:
+            mean_rnd_loss = None
+
+        if self.symmetry:
+            mean_symmetry_loss = 0.0
+        else:
+            mean_symmetry_loss = None
+
         # if self.actor_critic.is_recurrent:
         #     generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs) #
         # else:
@@ -273,15 +346,40 @@ class MMPPO:
             dagger_actions_batch,
             hid_states_batch,
             masks_batch,
+            rnd_state_batch,
         ) in generator:
+           
+
+            num_aug = 1
+
+            original_batch_size = obs_batch.shape[0]
+
+            if self.normalize_advantage_per_mini_batch:
+                with torch.no_grad():
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
+
+            if self.symmetry and self.symmetry["use_data_augmentation"]:
+                data_augmentation_func = self.symmetry["data_augmentation_func"]
+                obs_batch, ref_obs_batch, actions_batch = data_augmentation_func(
+                    obs=obs_batch, ref_obs=ref_obs_batch, actions=actions_batch, env=self.symmetry["_env"], obs_type="policy"
+                )
+
+                num_aug = int(obs_batch.shape[0] / original_batch_size)
+
+                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
+                target_values_batch = target_values_batch.repeat(num_aug, 1)
+                advantages_batch = advantages_batch.repeat(num_aug, 1)
+                returns_batch = returns_batch.repeat(num_aug, 1)
+
             self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch)
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
             value_batch = self.actor_critic.evaluate(
                 critic_obs_batch, ref_critic_observations=critic_ref_obs_batch
             )
-            mu_batch = self.actor_critic.action_mean
-            sigma_batch = self.actor_critic.action_std
-            entropy_batch = self.actor_critic.entropy
+
+            mu_batch = self.actor_critic.action_mean[:original_batch_size]
+            sigma_batch = self.actor_critic.action_std[:original_batch_size]
+            entropy_batch = self.actor_critic.entropy[:original_batch_size]
 
             # Imitation Entropy loss (optional, arxiv: 2409.08904)
             # This loss is calculated only when critic_ref_obs_batch is not None, otherwise 0.0
@@ -302,10 +400,22 @@ class MMPPO:
                     )
                     kl_mean = torch.mean(kl) #- imitation_loss # advanced kl
 
-                    if kl_mean > self.desired_kl * 2.0:
-                        self.learning_rate = max(self.min_lr, self.learning_rate / 1.5)
-                    elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                        self.learning_rate = min(self.max_lr, self.learning_rate * 1.5)
+                    if self.is_multi_gpu:
+                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                        kl_mean /= self.gpu_world_size
+
+                    # Update the learning rate
+                    if self.gpu_global_rank == 0:
+
+                        if kl_mean > self.desired_kl * 2.0:
+                            self.learning_rate = max(self.min_lr, self.learning_rate / 1.5)
+                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            self.learning_rate = min(self.max_lr, self.learning_rate * 1.5)
+
+                    if self.is_multi_gpu:
+                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                        torch.distributed.broadcast(lr_tensor, src=0)
+                        self.learning_rate = lr_tensor.item()
 
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
@@ -332,27 +442,74 @@ class MMPPO:
             
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+            if self.symmetry:
+                if not self.symmetry["use_data_augmentation"]:
+                    data_augmentation_func = self.symmetry["data_augmentation_func"]
+                    obs_batch, ref_obs_batch, _ = data_augmentation_func(
+                        obs=obs_batch, ref_obs=ref_obs_batch, actions=actions_batch, env=self.symmetry["_env"], obs_type="policy"
+                    )
+                    num_aug = int(obs_batch.shape[0] / original_batch_size)
+
+                    mean_actions_batch = self.actor_critic.act_inference(obs_batch.detach().clone())
+
+                    action_mean_orig = mean_actions_batch[:original_batch_size]
+                    _, _, actions_mean_symm_batch = data_augmentation_func(
+                        obs=None, ref_obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                    )
+
+                    mse_loss = torch.nn.MSELoss()
+                    symmetry_loss = mse_loss(
+                        mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
+                    )
+                    if self.symmetry["use_mirror_loss"]:
+                        loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+                    else:
+                        symmetry_loss = symmetry_loss.detach()
+
+                if self.rnd:
+                    predicted_embedding = self.rnd.predictor(rnd_state_batch)
+                    target_embedding = self.rnd.target(rnd_state_batch).detach()
+                    mse_loss = torch.nn.MSELoss()
+                    rnd_loss = mse_loss(predicted_embedding, target_embedding)    
+
+            imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch)      
+                    
             # if self.teacher_coef is not None:
             #     loss += imitation_loss * self.teacher_coef
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
-                
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            
-            imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch)
+
             if self.teacher_loss_coef is not None and epoch > self.teacher_supervising_intervals and (epoch+1)%self.teacher_apply_interval == 0:
                 backward_imitation_loss = imitation_loss * self.teacher_loss_coef
                 self.imitation_optimizer.zero_grad()
                 backward_imitation_loss.backward()
+
+            # for RND
+            if self.rnd:
+                self.rnd_optimizer.zero_grad()
+                rnd_loss.backward()
+
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            self.optimizer.step()
+            
+            
+            if self.teacher_loss_coef is not None and epoch > self.teacher_supervising_intervals and (epoch+1)%self.teacher_apply_interval == 0:
+                # backward_imitation_loss = imitation_loss * self.teacher_loss_coef
+                # self.imitation_optimizer.zero_grad()
+                # backward_imitation_loss.backward()
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
                 self.imitation_optimizer.step()
             
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_imitation_loss += imitation_loss.item()
-            
+            mean_entropy += entropy_batch.mean().item()
+
             if (epoch+1) % self.teacher_update_interval == 0 and self.dagger_optimizer is not None and epoch > self.teacher_supervising_intervals:
                 # dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, epoch)
                 dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch)
@@ -381,7 +538,87 @@ class MMPPO:
         
         self.storage.clear()
 
-        return mean_value_loss.item(), mean_surrogate_loss.item(), mean_imitation_loss.item(), mean_dagger_loss.item()
+        loss_dict = {
+            "mean_value_loss": mean_value_loss,
+            "mean_surrogate_loss": mean_surrogate_loss,
+            "mean_imitation_loss": mean_imitation_loss,
+            "mean_dagger_loss": mean_dagger_loss,	
+            "mean_entropy": mean_entropy,
+        }
+        if self.rnd:
+            loss_dict["mean_rnd_loss"] = mean_rnd_loss
+        if self.symmetry:
+            loss_dict["symmetry"] = mean_symmetry_loss
+
+        return loss_dict
+
+        # return mean_value_loss.ite, mean_surrogate_loss.item(), mean_imitation_loss.item(), mean_dagger_loss.item()
+
+    def broadcast_parameters(self):
+        """Broadcast model parameters to all GPUs. (Actor & Critic Only)"""
+
+        actor_params = [self.actor_critic.actor.state_dict()]
+        critic_params = [self.actor_critic.critic.state_dict()]
+        model_params = actor_params + critic_params
+        if self.rnd:
+            model_params.append(self.rnd.predictor.state_dict())
+        # broadcast the model parameters
+        torch.distributed.broadcast_object_list(model_params, src=0)
+        # load the model parameters on all GPUs from source GPU
+        self.actor_critic.actor.load_state_dict(model_params[0])
+        self.actor_critic.critic.load_state_dict(model_params[1])
+        if self.rnd:
+            self.rnd.predictor.load_state_dict(model_params[2])
+
+    def broadcast_parameters_dagger(self):
+        """Broadcast model parameters to all GPUs. (Dagger Only)"""
+        assert hasattr(self.actor_critic, "actor_dagger"), "actor_dagger not enabled in actor_critic, cannot broadcast parameters of None"
+        model_params = [self.actor_critic.actor_dagger.state_dict()]
+        torch.distributed.broadcast_object_list(model_params, src=0)
+        self.actor_critic.actor_dagger.load_state_dict(model_params[0])
+
+    def reduce_parameters(self):
+        """Collect gradients from all GPUs and average them."""
+        actor_grads = [param.grad.view(-1) for param in self.actor_critic.actor.parameters() if param.grad is not None]
+        critic_grads = [param.grad.view(-1) for param in self.actor_critic.critic.parameters() if param.grad is not None]
+        grads = actor_grads + critic_grads
+        if self.rnd:
+            grads += [param.grad.view(-1) for param in self.rnd.predictor.parameters() if param.grad is not None]
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        all_params = itertools.chain(
+            self.actor_critic.actor.parameters(),
+            self.actor_critic.critic.parameters(),
+            self.rnd.predictor.parameters() if self.rnd else []
+        )
+        offset = 0
+        for param in all_params:
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset: offset + numel].view_as(param.grad.data))
+                offset += numel
+
+    def reduce_parameters_dagger(self):
+        """Collect gradients from all GPUs and average them."""
+        assert hasattr(self.actor_critic, "actor_dagger"), "actor_dagger not enabled in actor_critic, cannot reduce parameters of None"
+        actor_grads = [param.grad.view(-1) for param in self.actor_critic.actor_dagger.parameters() if param.grad is not None]
+        grads = actor_grads
+        all_grads = torch.cat(grads)
+        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+        all_grads /= self.gpu_world_size
+
+        all_params = self.actor_critic.actor_dagger.parameters()
+        offset = 0
+        for param in all_params:
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset: offset + numel].view_as(param.grad.data))
+                offset += numel
+        
+
+
 
     def _imitation_loss(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch):
         if dagger_actions_batch is not None:
@@ -418,6 +655,8 @@ class MMPPO:
         loss = SmoothL2Loss()(output, gt)
         self.dagger_optimizer.zero_grad()
         loss.backward()
+        if self.is_multi_gpu:
+            self.reduce_parameters_dagger()
         nn.utils.clip_grad_norm_(self.actor_critic.actor_dagger.parameters(), self.max_grad_norm)
         self.dagger_optimizer.step()
         return loss.item()

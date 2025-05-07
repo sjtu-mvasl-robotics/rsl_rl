@@ -12,7 +12,7 @@ from typing import Optional, Tuple
 import time
 from peft import get_peft_model, LoraConfig, TaskType
 from peft.tuners.lora import Linear as LoRALinear
-
+from rsl_rl.utils import resolve_nn_activation
 
 class RMSNorm(nn.Module):
     """
@@ -739,6 +739,7 @@ class ActorCriticMMTransformer(nn.Module):
             num_layers=4,
             num_heads=8,
             init_noise_std=1.0,
+            noise_std_type: str = "scalar",
             load_dagger=False,
             load_dagger_path=None,
             load_actor_path=None,
@@ -765,10 +766,16 @@ class ActorCriticMMTransformer(nn.Module):
         print(f"Critic Transformer: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")
         # Action noise
-        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.noise_std_type = noise_std_type
+        if self.noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif self.noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         self.distribution = None
         # disable args validation for speedup
-        Normal.set_default_validate_args = False
+        Normal.set_default_validate_args(False)
         
     # def load_state_dict(self, state_dict, strict = True, assign = False):
     #     actor_weights = {k[len('actor.'):]: v for k, v in state_dict.items() if k.startswith('actor.')}
@@ -878,7 +885,13 @@ class ActorCriticMMTransformer(nn.Module):
 
     def update_distribution(self, observations, ref_observations=None):
         mean = self.actor(observations, ref_observations)
-        self.distribution = Normal(mean, 0.0 * mean + self.std)
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        self.distribution = Normal(mean, std)
 
     def act(self, observations, ref_observations=None, **kwargs):
         self.update_distribution(observations, ref_observations)
@@ -997,6 +1010,7 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
             num_layers=4,
             num_heads=8,
             init_noise_std=1.0,
+            noise_std_type: str = "scalar",
             load_dagger=False,
             load_dagger_path=None,
             load_actor_path=None,
@@ -1023,84 +1037,14 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
         print(f"Critic Transformer: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")
         # Action noise
-        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        self.noise_std_type = noise_std_type
+        if self.noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif self.noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         self.distribution = None
         # disable args validation for speedup
-        Normal.set_default_validate_args = False
+        Normal.set_default_validate_args(False)
         
-
-class ActorCriticDebugMLP(nn.Module):
-    is_recurrent = False
-    def __init__(
-            self,
-            num_actor_obs,
-            num_actor_ref_obs,
-            num_critic_obs,
-            num_critic_ref_obs,
-            num_actions,
-            max_len=16,
-            dim_model=128,
-            num_layers=4,
-            num_heads=8,
-            init_noise_std=1.0,
-            **kwargs
-    ):
-        super().__init__()
-        self.actor = DebugMLP(num_actor_obs, num_actor_ref_obs, num_actions)
-        self.critic = DebugMLP(num_critic_obs, num_critic_ref_obs, 1)
-        print(f"Actor Transformer: {self.actor}")
-        print(f"Critic Transformer: {self.critic}")
-        # Action noise
-        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-        self.distribution = None
-        # disable args validation for speedup
-        Normal.set_default_validate_args = False
-        
-    @staticmethod
-    # not used at the moment
-    def init_weights(sequential, scales):
-        [
-            torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
-            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
-        ]
-
-    def reset(self, dones=None):
-        pass
-
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError
-
-    @property
-    def action_mean(self):
-        return self.distribution.mean
-
-    @property
-    def action_std(self):
-        return self.distribution.stddev
-
-    @property
-    def entropy(self):
-        return self.distribution.entropy().sum(dim=-1)
-
-    def update_distribution(self, observations, ref_observations=None):
-        mean = self.actor(observations, ref_observations)
-        self.distribution = Normal(mean, 0.0 * mean + self.std)
-
-    def act(self, observations, ref_observations=None, **kwargs):
-        self.update_distribution(observations, ref_observations)
-        sample = self.distribution.sample()
-        return sample
-        
-    def act_inference(self, observations, ref_observations=None):
-        return self.actor(observations, ref_observations)
-
-    def get_actions_log_prob(self, actions):
-        return self.distribution.log_prob(actions).sum(dim=-1)
-
-    def act_inference(self, observations, ref_observations=None):
-        actions_mean = self.actor(observations, ref_observations)
-        return actions_mean
-
-    def evaluate(self, critic_observations, ref_critic_observations =None, **kwargs):
-        value = self.critic(critic_observations, ref_critic_observations)
-        return value

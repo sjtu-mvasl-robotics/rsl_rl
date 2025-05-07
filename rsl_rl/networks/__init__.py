@@ -3,8 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Submodule defining the environment definitions."""
+"""Definitions for neural networks."""
 
-from .vec_env import VecEnv, MMVecEnv
+from .memory import Memory
 
-__all__ = ["VecEnv", "MMVecEnv"]
+__all__ = ["Memory"]
