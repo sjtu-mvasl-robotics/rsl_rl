@@ -450,11 +450,11 @@ class MMPPO:
                 if not self.symmetry["use_data_augmentation"]:
                     data_augmentation_func = self.symmetry["data_augmentation_func"]
                     obs_batch, ref_obs_batch, _ = data_augmentation_func(
-                        obs=obs_batch, ref_obs=ref_obs_batch, actions=actions_batch, env=self.symmetry["_env"], obs_type="policy"
+                        obs=obs_batch, ref_obs=ref_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="policy"
                     )
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
-                    mean_actions_batch = self.actor_critic.act_inference(obs_batch.detach().clone())
+                    mean_actions_batch = self.actor_critic.act_inference(obs_batch.detach().clone(), (ref_obs_batch[0].detach().clone(), ref_obs_batch[1].detach().clone()))
 
                     action_mean_orig = mean_actions_batch[:original_batch_size]
                     _, _, actions_mean_symm_batch = data_augmentation_func(
@@ -463,12 +463,14 @@ class MMPPO:
 
                     mse_loss = torch.nn.MSELoss()
                     symmetry_loss = mse_loss(
-                        mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
+                        mean_actions_batch[:original_batch_size], actions_mean_symm_batch.detach()[:original_batch_size]
                     )
                     if self.symmetry["use_mirror_loss"]:
                         loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                     else:
                         symmetry_loss = symmetry_loss.detach()
+                    
+                    mean_symmetry_loss += symmetry_loss.item()
 
             if self.rnd:
                 predicted_embedding = self.rnd.predictor(rnd_state_batch)
