@@ -1,3 +1,8 @@
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 from __future__ import annotations
 from typing import Any, Mapping
 

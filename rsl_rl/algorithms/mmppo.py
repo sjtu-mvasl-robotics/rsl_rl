@@ -1,5 +1,10 @@
-#  Optimized from RSL_RL/PPO
-#  Created by Yifei Yao, 10/12/2024
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Optimized from RSL_RL/PPO
+# Created by Yifei Yao, 10/12/2024
 
 from __future__ import annotations
 
@@ -9,7 +14,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import itertools
 
-from rsl_rl.modules import ActorCriticMMTransformer
+from rsl_rl.modules import ActorCriticMMTransformer, AMPNet
 from rsl_rl.storage import RolloutStorageMM
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.utils import string_to_callable
@@ -100,6 +105,8 @@ class MMPPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # AMP parameters
+        amp_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
 
@@ -125,6 +132,17 @@ class MMPPO:
         else:
             self.rnd = None
             self.rnd_optimizer = None
+
+        # AMP components
+        if amp_cfg is not None:
+            net_cfg = amp_cfg.get("net_cfg", {})
+            self.amp = AMPNet(device=self.device, **net_cfg)
+            self.amp_cfg = amp_cfg
+            self.amp_optimizer = optim.Adam(self.amp.parameters(), lr=amp_cfg.get("learning_rate", 1e-3))
+        else:
+            self.amp = None
+            self.amp_cfg = None
+            self.amp_optimizer = None
 
         # Symmetry components
         if symmetry_cfg is not None:
@@ -250,15 +268,20 @@ class MMPPO:
             actions_shape=action_shape,
             rnd_state_shape=rnd_state_shape,
             apply_dagger_actions=(self.teacher_coef is not None),
+            amp_cfg=self.amp_cfg,
             device=self.device,
         )
 
 
     def test_mode(self):
         self.actor_critic.test()
+        if self.amp:
+            self.amp.eval()
 
     def train_mode(self):
         self.actor_critic.train()
+        if self.amp:
+            self.amp.train()
 
     def act(self, obs, ref_obs, critic_obs, ref_critic_obs):
         if self.actor_critic.is_recurrent:
@@ -328,6 +351,12 @@ class MMPPO:
         else:
             mean_symmetry_loss = None
 
+        if self.amp:
+            mean_amp_loss = 0.0
+            mean_gradient_penalty = 0.0
+            mean_pred_pos_acc = 0.0
+            mean_pred_neg_acc = 0.0
+
         # if self.actor_critic.is_recurrent:
         #     generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs) #
         # else:
@@ -350,6 +379,9 @@ class MMPPO:
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
+            obs_prev_state,
+            ref_obs_prev_state,
+            ref_obs_prev_mask,
         ) in generator:
            
 
@@ -383,6 +415,10 @@ class MMPPO:
             mu_batch = self.actor_critic.action_mean[:original_batch_size]
             sigma_batch = self.actor_critic.action_std[:original_batch_size]
             entropy_batch = self.actor_critic.entropy[:original_batch_size]
+
+            if self.amp:
+                obs_cur_state = string_to_callable(self.amp_cfg["amp_obs_extractor"])(obs_batch, env=self.amp_cfg["_env"])
+                ref_obs_cur_state, ref_obs_cur_mask = string_to_callable(self.amp_cfg["amp_ref_obs_extractor"])(ref_obs_batch, env=self.amp_cfg["_env"])
 
             # Imitation Entropy loss (optional, arxiv: 2409.08904)
             # This loss is calculated only when critic_ref_obs_batch is not None, otherwise 0.0
@@ -476,7 +512,20 @@ class MMPPO:
                 predicted_embedding = self.rnd.predictor(rnd_state_batch)
                 target_embedding = self.rnd.target(rnd_state_batch).detach()
                 mse_loss = torch.nn.MSELoss()
-                rnd_loss = mse_loss(predicted_embedding, target_embedding)    
+                rnd_loss = mse_loss(predicted_embedding, target_embedding) 
+
+            if self.amp:
+                policy_score = self.amp.forward(torch.cat([obs_prev_state, obs_cur_state], dim=-1))
+                expert_score = self.amp.forward(torch.cat([ref_obs_prev_state, ref_obs_cur_state], dim=-1))
+                policy_loss = self.amp.policy_loss(policy_score)
+                expert_loss = self.amp.expert_loss(expert_score, ref_obs_cur_mask)
+                gradient_penalty = self.amp.expert_grad_penalty(obs_cur_state, ref_obs_cur_state, ref_obs_cur_mask * ref_obs_prev_mask)
+                amp_loss = 0.5 * (policy_loss + expert_loss) + gradient_penalty * self.amp_cfg["gradient_penalty_coeff"]
+                pred_pos_acc = self.amp.policy_acc(policy_score)
+                pred_neg_acc = self.amp.expert_acc(expert_score, ref_obs_cur_mask * ref_obs_prev_mask)
+                
+
+                    
 
             imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch)      
                     
@@ -495,6 +544,15 @@ class MMPPO:
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
                 rnd_loss.backward()
+                mean_rnd_loss += rnd_loss.item()
+
+            if self.amp and isinstance(amp_loss, torch.Tensor): # skip first epoch where amp_loss is 0.0 (float)
+                self.amp_optimizer.zero_grad()
+                amp_loss.backward()
+                mean_amp_loss += amp_loss.item()
+                mean_gradient_penalty += gradient_penalty.item() * self.amp_cfg["gradient_penalty_coeff"]
+                mean_pred_pos_acc += pred_pos_acc.item()
+                mean_pred_neg_acc += pred_neg_acc.item()
 
             if self.is_multi_gpu:
                 self.reduce_parameters()
@@ -527,7 +585,10 @@ class MMPPO:
         mean_surrogate_loss /= num_updates
         mean_imitation_loss /= num_updates
         mean_dagger_loss /= num_updates
-        
+        mean_amp_loss /= num_updates
+        mean_gradient_penalty /= num_updates
+        mean_pred_pos_acc /= num_updates
+        mean_pred_neg_acc /= num_updates
         if epoch > 15000 and epoch % 200 == 0:
             self.min_lr = max(5e-6, self.min_lr / 1.5)
         
@@ -554,6 +615,11 @@ class MMPPO:
             loss_dict["mean_rnd_loss"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.amp:
+            loss_dict["mean_amp_loss"] = mean_amp_loss
+            loss_dict["mean_gradient_penalty"] = mean_gradient_penalty
+            loss_dict["mean_pred_pos_acc"] = mean_pred_pos_acc
+            loss_dict["mean_pred_neg_acc"] = mean_pred_neg_acc
 
         return loss_dict
 
@@ -567,13 +633,19 @@ class MMPPO:
         model_params = actor_params + critic_params
         if self.rnd:
             model_params.append(self.rnd.predictor.state_dict())
+        if self.amp:
+            model_params.append(self.amp.state_dict())
         # broadcast the model parameters
         torch.distributed.broadcast_object_list(model_params, src=0)
         # load the model parameters on all GPUs from source GPU
         self.actor_critic.actor.load_state_dict(model_params[0])
         self.actor_critic.critic.load_state_dict(model_params[1])
+        amp_idx = 2
         if self.rnd:
             self.rnd.predictor.load_state_dict(model_params[2])
+            amp_idx += 1
+        if self.amp:
+            self.amp.load_state_dict(model_params[amp_idx])
 
     def broadcast_parameters_dagger(self):
         """Broadcast model parameters to all GPUs. (Dagger Only)"""
@@ -589,6 +661,8 @@ class MMPPO:
         grads = actor_grads + critic_grads
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.predictor.parameters() if param.grad is not None]
+        if self.amp:
+            grads += [param.grad.view(-1) for param in self.amp.parameters() if param.grad is not None]
         all_grads = torch.cat(grads)
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
@@ -596,7 +670,8 @@ class MMPPO:
         all_params = itertools.chain(
             self.actor_critic.actor.parameters(),
             self.actor_critic.critic.parameters(),
-            self.rnd.predictor.parameters() if self.rnd else []
+            self.rnd.predictor.parameters() if self.rnd else [],
+            self.amp.parameters() if self.amp else []
         )
         offset = 0
         for param in all_params:

@@ -4,7 +4,9 @@ Re-implemented some components for better imitation learning.
 
 **!!! Important !!!**:
 
-~~This version (`2.x.x-devx`) is not compatible with `legged_gym` since the interface (original interface) has been severely modified by ETHZ. To install the version for `legged_gym`, please use the `1.0.2` branch~~. 
+~~This version (`2.x.x-devx`) is not compatible with `legged_gym` since the interface (original interface) has been severely modified by ETHZ and NVIDIA. To install the version for `legged_gym`, please use the `1.0.2` branch~~. 
+
+* Notice Update 2025-05-14:
 
 For that NVIDIA updates `Isaac Lab` and `rsl_rl` lib so frequently, I am no longer capable of maintaining the compatibility with `legged_gym`.
 

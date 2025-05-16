@@ -12,3 +12,14 @@ from .utils import (
     string_to_callable,
     unpad_trajectories,
 )
+
+from .network_utils import build_backbone
+
+__all__ = [
+    "resolve_nn_activation",
+    "split_and_pad_trajectories",
+    "store_code_state",
+    "string_to_callable",
+    "unpad_trajectories",
+    "build_backbone",
+]

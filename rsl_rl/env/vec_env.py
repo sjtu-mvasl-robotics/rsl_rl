@@ -1,3 +1,4 @@
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
 # Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
 # All rights reserved.
 #

@@ -1,5 +1,7 @@
-#  Copyright 2021 ETH Zurich, NVIDIA CORPORATION
-#  SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ import rsl_rl
 from rsl_rl.algorithms import MMPPO
 from rsl_rl.env import MMVecEnv
 from rsl_rl.modules import *
-from rsl_rl.utils import store_code_state
+from rsl_rl.utils import store_code_state, string_to_callable
 
 
 class OnPolicyRunnerMM:
@@ -131,6 +133,12 @@ class OnPolicyRunnerMM:
         if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
             self.alg_cfg["symmetry_cfg"]["_env"] = self.env
 
+        if "amp_cfg" in self.alg_cfg and self.alg_cfg["amp_cfg"] is not None:
+            self.alg_cfg["amp_cfg"]["_env"] = self.env
+            self.amp_cfg = self.alg_cfg["amp_cfg"]
+        else:
+            self.amp_cfg = None
+
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
         self.alg: MMPPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -219,6 +227,9 @@ class OnPolicyRunnerMM:
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        if self.amp_cfg:
+            amp_rewbuffer = deque(maxlen=100)
+            cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         if self.alg.rnd:
@@ -249,6 +260,12 @@ class OnPolicyRunnerMM:
                         critic_obs=critic_obs,
                         ref_critic_obs=critic_ref_obs_tuple,
                     )
+                    if self.amp_cfg:
+                        prev_obs = obs.clone()
+                        prev_obs = prev_obs.to(self.device)
+                        prev_obs = self.obs_normalizer(prev_obs)
+                        amp_prev_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(prev_obs, env=self.amp_cfg["_env"])
+
                     obs, ref_obs_tuple, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # move to the right device
                     obs, critic_obs, rewards, dones = (
@@ -292,6 +309,11 @@ class OnPolicyRunnerMM:
                         # clip rewards < 0 to 0
                         # rewards = torch.clamp(rewards, min=0.0)
 
+                        if self.amp_cfg:
+                            amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(obs, env=self.amp_cfg["_env"])
+                            amp_rewards = self.alg.amp.amp_reward(amp_prev_obs, amp_obs, epsilon=self.amp_cfg["epsilon"])
+                            rewards += amp_rewards * self.amp_cfg["amp_reward_scale"]
+                            cur_amp_reward_sum += amp_rewards
                         if self.alg.rnd:
                             cur_ereward_sum += rewards
                             cur_ireward_sum += intrinsic_rewards  # type: ignore
@@ -309,6 +331,9 @@ class OnPolicyRunnerMM:
                             irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
+                        if self.amp_cfg:
+                            amp_rewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_amp_reward_sum[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -380,6 +405,8 @@ class OnPolicyRunnerMM:
             self.writer.add_scalar("Loss/rnd", locs["loss_dict"]["mean_rnd_loss"], locs["it"])
         if self.alg.symmetry:
             self.writer.add_scalar("Loss/symmetry", locs["loss_dict"]["symmetry"], locs["it"])
+        if self.amp_cfg:
+            self.writer.add_scalar("Loss/amp", locs["loss_dict"]["mean_amp_loss"], locs["it"])
         
 
         
@@ -388,11 +415,20 @@ class OnPolicyRunnerMM:
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+
+        if self.amp_cfg:
+            self.writer.add_scalar("AMP/mean_gradient_penalty", locs["loss_dict"]["mean_gradient_penalty"], locs["it"])
+            self.writer.add_scalar("AMP/mean_pred_pos_acc", locs["loss_dict"]["mean_pred_pos_acc"], locs["it"])
+            self.writer.add_scalar("AMP/mean_pred_neg_acc", locs["loss_dict"]["mean_pred_neg_acc"], locs["it"])
+
         if len(locs["rewbuffer"]) > 0:
             if self.alg.rnd:
                 self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
+
+            if self.amp_cfg:
+                self.writer.add_scalar("AMP/mean_reward", statistics.mean(locs["amp_rewbuffer"]), locs["it"])
           
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -429,7 +465,14 @@ class OnPolicyRunnerMM:
                                f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n""")
             if self.alg.symmetry:
                 log_string += (f"""{'Symmetry loss:':>{pad}} {locs['loss_dict']['symmetry']:.4f}\n""")
-            
+
+            if self.amp_cfg:
+                log_string += (f"""{'Mean amp loss:':>{pad}} {locs['loss_dict']['mean_amp_loss']:.4f}\n""")
+                log_string += (f"""{'Mean gradient penalty:':>{pad}} {locs['loss_dict']['mean_gradient_penalty']:.4f}\n""")
+                log_string += (f"""{'Mean pred pos acc:':>{pad}} {locs['loss_dict']['mean_pred_pos_acc']:.4f}\n""")
+                log_string += (f"""{'Mean pred neg acc:':>{pad}} {locs['loss_dict']['mean_pred_neg_acc']:.4f}\n""")
+                log_string += (f"""{'Mean amp reward:':>{pad}} {statistics.mean(locs['amp_rewbuffer']):.2f}\n""")
+
             log_string += (f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
@@ -526,6 +569,8 @@ class OnPolicyRunnerMM:
 
         if self.alg.rnd:
             self.alg.rnd.train()
+        if self.amp_cfg:
+            self.alg.amp.train()
         if self.empirical_normalization:
             self.obs_normalizer.train()
             self.critic_obs_normalizer.train()
@@ -534,6 +579,8 @@ class OnPolicyRunnerMM:
         self.alg.actor_critic.eval()
         if self.alg.rnd:
             self.alg.rnd.eval()
+        if self.amp_cfg:
+            self.alg.amp.eval()
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.critic_obs_normalizer.eval()

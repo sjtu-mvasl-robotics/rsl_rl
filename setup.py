@@ -5,7 +5,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="rsl_rl",
-    version="2.3.1.dev1",
+    version="2.3.1.dev2",
     packages=find_packages(),
     author="ETH Zurich, NVIDIA CORPORATION, SJTU MVASL Lab",
     maintainer="Nikita Rudin, David Hoeller",

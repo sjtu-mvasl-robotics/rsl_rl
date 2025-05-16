@@ -1,6 +1,10 @@
-# Copyright 2024 SJTU MVASL Lab
-# Written by Yifei Yao, 2024-12-21
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
+# All rights reserved.
+#
 # SPDX-License-Identifier: BSD-3-Clause
+
+
+# Created by Yifei Yao, 2024-12-21
 
 from __future__ import annotations
 import torch

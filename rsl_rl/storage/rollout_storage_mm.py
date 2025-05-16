@@ -1,12 +1,14 @@
-#  Copyright 2021 ETH Zurich, NVIDIA CORPORATION
-#  SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
 
 
 from __future__ import annotations
 
 import torch
 
-from rsl_rl.utils import split_and_pad_trajectories
+from rsl_rl.utils import split_and_pad_trajectories, string_to_callable
 
 
 class RolloutStorageMM:
@@ -29,10 +31,11 @@ class RolloutStorageMM:
             self.action_sigma = None
             self.hidden_states = None
             self.rnd_state = None
+
         def clear(self):
             self.__init__()
 
-    def __init__(self, training_type, num_envs, num_transitions_per_env, obs_shape, ref_obs_shape, privileged_obs_shape, privileged_ref_obs_shape, actions_shape, apply_dagger_actions = False, rnd_state_shape = None, device="cpu"):
+    def __init__(self, training_type, num_envs, num_transitions_per_env, obs_shape, ref_obs_shape, privileged_obs_shape, privileged_ref_obs_shape, actions_shape, apply_dagger_actions = False, rnd_state_shape = None, amp_cfg = None, device="cpu"):
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
@@ -42,6 +45,8 @@ class RolloutStorageMM:
         self.privileged_ref_obs_shape = privileged_ref_obs_shape
         self.actions_shape = actions_shape
         self.rnd_state_shape = rnd_state_shape
+        self.amp_cfg = amp_cfg
+     
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
         if privileged_obs_shape[0] is not None:
@@ -125,6 +130,7 @@ class RolloutStorageMM:
             self.sigma[self.step].copy_(transition.action_sigma)
         if self.rnd_state_shape is not None:
             self.rnd_state[self.step].copy_(transition.rnd_state)
+        
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
 
@@ -245,8 +251,9 @@ class RolloutStorageMM:
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
                 batch_idx = indices[start:end]
+                prev_batch_idx = torch.where(batch_idx > self.num_envs, batch_idx - self.num_envs, batch_idx) # since the batch is not circular, we don't allow index < 0. The first batch will be ignored.
 
-                obs_batch = observations[batch_idx]
+                obs_batch = observations[batch_idx] # shape: (mini_batch_size, num_envs, *obs_shape)
                 ref_obs_batch = reference_observations[batch_idx] if reference_observations is not None else None
                 ref_obs_mask_batch = reference_observations_mask[batch_idx] if reference_observations_mask is not None else None
                 ref_obs_batch_rtn = (ref_obs_batch, ref_obs_mask_batch) if ref_obs_batch is not None else None
@@ -267,11 +274,22 @@ class RolloutStorageMM:
                     rnd_state_batch = rnd_state[batch_idx]
                 else:
                     rnd_state_batch = None
+
+                if self.amp_cfg and reference_observations is not None and reference_observations_mask is not None:
+                    obs_prev_state = string_to_callable(self.amp_cfg["amp_obs_extractor"])(observations[prev_batch_idx], env=self.amp_cfg["_env"])
+                    ref_obs_prev_state, ref_obs_prev_mask = string_to_callable(self.amp_cfg["amp_ref_obs_extractor"])((
+                        reference_observations[prev_batch_idx],
+                        reference_observations_mask[prev_batch_idx]
+                    ), env=self.amp_cfg["_env"])
+                else:
+                    obs_prev_state = None
+                    ref_obs_prev_state = None
+                    ref_obs_prev_mask = None
                 
                 yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     None,
                     None,
-                ), None, rnd_state_batch
+                ), None, rnd_state_batch, obs_prev_state, ref_obs_prev_state, ref_obs_prev_mask
 
     # for RNNs only (not used for mmPPO)
     # Update 20250506: Deprecated

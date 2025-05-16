@@ -13,6 +13,7 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .actor_critic_mm_transformer import ActorCriticMMTransformer, ActorCriticMMTransformerV2, ActorCriticDebugMLP
 from .student_teacher_transformer import StudentTeacherMMTransformer
+from .amp import AMPNet
 
 __all__ = [
     "ActorCritic",
@@ -25,4 +26,5 @@ __all__ = [
     "ActorCriticMMTransformerV2",
     "ActorCriticDebugMLP",
     "StudentTeacherMMTransformer",
+    "AMPNet",
 ]
