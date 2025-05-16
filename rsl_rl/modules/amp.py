@@ -99,6 +99,7 @@ class AMPNet(nn.Module):
         """
         tgt_score = torch.ones_like(y) * self.expert_score
         loss = self.loss_fn(y, tgt_score)
+        tgt_mask = tgt_mask.unsqueeze(-1).float()
         loss = (loss * tgt_mask).sum() / (tgt_mask.sum() + 1e-6)
         return loss
     
