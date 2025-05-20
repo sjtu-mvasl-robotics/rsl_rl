@@ -514,16 +514,8 @@ class MMPPO:
                 mse_loss = torch.nn.MSELoss()
                 rnd_loss = mse_loss(predicted_embedding, target_embedding) 
 
-            if self.amp:
-                policy_score = self.amp.forward(torch.cat([obs_prev_state, obs_cur_state], dim=-1))
-                expert_score = self.amp.forward(torch.cat([ref_obs_prev_state, ref_obs_cur_state], dim=-1))
-                policy_loss = self.amp.policy_loss(policy_score)
-                expert_loss = self.amp.expert_loss(expert_score, ref_obs_cur_mask)
-                gradient_penalty = self.amp.expert_grad_penalty(obs_cur_state, ref_obs_cur_state, ref_obs_cur_mask * ref_obs_prev_mask)
-                amp_loss = 0.5 * (policy_loss + expert_loss) + gradient_penalty * self.amp_cfg["gradient_penalty_coeff"]
-                pred_pos_acc = self.amp.policy_acc(policy_score)
-                pred_neg_acc = self.amp.expert_acc(expert_score, ref_obs_cur_mask * ref_obs_prev_mask)
-                
+           
+            
 
                     
 
@@ -534,6 +526,26 @@ class MMPPO:
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
+
+            if self.amp:
+                amp_optimization_steps = self.amp_cfg.get("amp_optimization_steps", 3)
+
+                for _ in range(amp_optimization_steps):
+                    policy_score = self.amp.forward(torch.cat([obs_prev_state, obs_cur_state], dim=-1))
+                    expert_score = self.amp.forward(torch.cat([ref_obs_prev_state, ref_obs_cur_state], dim=-1))
+                    policy_loss = self.amp.policy_loss(policy_score)
+                    expert_loss = self.amp.expert_loss(expert_score, ref_obs_cur_mask)
+                    gradient_penalty = self.amp.expert_grad_penalty(obs_cur_state, ref_obs_cur_state, ref_obs_cur_mask * ref_obs_prev_mask)
+                    amp_loss = 0.5 * (policy_loss + expert_loss) + gradient_penalty * self.amp_cfg["gradient_penalty_coeff"]
+                    pred_pos_acc = self.amp.policy_acc(policy_score)
+                    pred_neg_acc = self.amp.expert_acc(expert_score, ref_obs_cur_mask * ref_obs_prev_mask)
+                    self.amp_optimizer.zero_grad()
+                    amp_loss.backward()
+                    
+                mean_amp_loss += amp_loss.item()
+                mean_gradient_penalty += gradient_penalty.item() * self.amp_cfg["gradient_penalty_coeff"]
+                mean_pred_pos_acc += pred_pos_acc.item()
+                mean_pred_neg_acc += pred_neg_acc.item()
 
             if self.teacher_loss_coef is not None and epoch > self.teacher_supervising_intervals and (epoch+1)%self.teacher_apply_interval == 0:
                 backward_imitation_loss = imitation_loss * self.teacher_loss_coef
@@ -546,13 +558,13 @@ class MMPPO:
                 rnd_loss.backward()
                 mean_rnd_loss += rnd_loss.item()
 
-            if self.amp and isinstance(amp_loss, torch.Tensor): # skip first epoch where amp_loss is 0.0 (float)
-                self.amp_optimizer.zero_grad()
-                amp_loss.backward()
-                mean_amp_loss += amp_loss.item()
-                mean_gradient_penalty += gradient_penalty.item() * self.amp_cfg["gradient_penalty_coeff"]
-                mean_pred_pos_acc += pred_pos_acc.item()
-                mean_pred_neg_acc += pred_neg_acc.item()
+            # if self.amp and isinstance(amp_loss, torch.Tensor): # skip first epoch where amp_loss is 0.0 (float)
+            #     self.amp_optimizer.zero_grad()
+            #     amp_loss.backward()
+            #     mean_amp_loss += amp_loss.item()
+            #     mean_gradient_penalty += gradient_penalty.item() * self.amp_cfg["gradient_penalty_coeff"]
+            #     mean_pred_pos_acc += pred_pos_acc.item()
+            #     mean_pred_neg_acc += pred_neg_acc.item()
 
             if self.is_multi_gpu:
                 self.reduce_parameters()
