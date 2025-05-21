@@ -597,10 +597,11 @@ class MMPPO:
         mean_surrogate_loss /= num_updates
         mean_imitation_loss /= num_updates
         mean_dagger_loss /= num_updates
-        mean_amp_loss /= num_updates
-        mean_gradient_penalty /= num_updates
-        mean_pred_pos_acc /= num_updates
-        mean_pred_neg_acc /= num_updates
+        if self.amp:
+            mean_amp_loss /= num_updates
+            mean_gradient_penalty /= num_updates
+            mean_pred_pos_acc /= num_updates
+            mean_pred_neg_acc /= num_updates
         if epoch > 15000 and epoch % 200 == 0:
             self.min_lr = max(5e-6, self.min_lr / 1.5)
         

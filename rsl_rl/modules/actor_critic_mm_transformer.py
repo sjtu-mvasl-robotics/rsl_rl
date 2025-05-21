@@ -412,7 +412,7 @@ class MMTransformerV2(nn.Module):
             name = "",
             ls_init_values = 1e-3,
             apply_pooling = False,
-            apply_mlp_residual = False,
+            apply_mlp_residual = True,
             **kwargs
     ):
         super().__init__()
