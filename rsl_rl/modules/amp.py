@@ -83,7 +83,7 @@ class AMPNet(nn.Module):
         pred = self.out_activation(y)
         tgt = torch.ones_like(y) * self.policy_score
         bound = (self.policy_score + self.expert_score) / 2
-        acc = ((pred < bound) == tgt).float().mean()
+        acc = ((pred < bound).float() == (tgt < bound).float()).float().mean()
         return acc
     
     def expert_loss(self, y: torch.Tensor, tgt_mask: torch.Tensor) -> torch.Tensor:
@@ -107,7 +107,7 @@ class AMPNet(nn.Module):
         pred = self.out_activation(y)
         tgt = torch.ones_like(y) * self.expert_score
         bound = (self.policy_score + self.expert_score) / 2
-        acc = ((pred > bound) == tgt).float() # shape: (num_envs, )
+        acc = ((pred > bound).float() == (tgt > bound).float()).float() # shape: (num_envs, )
         tgt_mask = tgt_mask.unsqueeze(-1).float()
         acc = (acc * tgt_mask).sum() / (tgt_mask.sum() + 1e-6)
         return acc
