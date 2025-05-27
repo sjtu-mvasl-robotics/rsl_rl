@@ -168,7 +168,7 @@ class AMPNet(nn.Module):
             expert_score = self.out_activation(expert_score) # shape: (num_envs, 1)
 
             reward = -torch.log(
-                (1 - expert_score).clamp(min=epsilon)
+                (self.expert_score - expert_score).clamp(min=epsilon)
             ) # shape: (num_envs, 1)
         
         return reward.squeeze(-1)

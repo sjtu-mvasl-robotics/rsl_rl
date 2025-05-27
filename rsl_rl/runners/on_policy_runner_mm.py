@@ -513,6 +513,10 @@ class OnPolicyRunnerMM:
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["critic_obs_norm_state_dict"] = self.critic_obs_normalizer.state_dict()
+            if self.ref_obs_normalizer is not None:
+                saved_dict["ref_obs_norm_state_dict"] = self.ref_obs_normalizer.state_dict()
+            if self.critic_ref_obs_normalizer is not None:
+                saved_dict["critic_ref_obs_norm_state_dict"] = self.critic_ref_obs_normalizer.state_dict()
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()

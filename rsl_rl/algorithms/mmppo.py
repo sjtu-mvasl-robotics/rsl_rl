@@ -75,6 +75,8 @@ class MMPPO:
         min_lr=1e-4,
         max_lr_after_certain_epoch=1e-3,
         max_lr_restriction_epoch=2500,
+        min_lr_after_certain_epoch=1e-5,
+        min_lr_restriction_epoch=2500,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
         schedule="fixed",
@@ -168,6 +170,8 @@ class MMPPO:
         self.min_lr = min_lr
         self.max_lr_after_certain_epoch = max_lr_after_certain_epoch
         self.max_lr_restriction_epoch = max_lr_restriction_epoch
+        self.min_lr_after_certain_epoch = min_lr_after_certain_epoch
+        self.min_lr_restriction_epoch = min_lr_restriction_epoch
         assert min_lr <= learning_rate <= max_lr, "learning_rate should be in range [min_lr, max_lr], and min_lr <= max_lr"
         self.ref_action_idx = ref_action_idx
         self.teacher_coef = teacher_coef
@@ -426,6 +430,9 @@ class MMPPO:
             # Loss: \sum_i [\sqrt(2 * \pi * \sigma_i^2) + (mu_i - ref_action_i)^2 / (2 * \sigma_i^2)]
             if self.max_lr_restriction_epoch != 0 and epoch > self.max_lr_restriction_epoch:
                 self.max_lr = self.max_lr_after_certain_epoch
+            
+            if self.min_lr_restriction_epoch != 0 and epoch > self.min_lr_restriction_epoch:
+                self.min_lr = self.min_lr_after_certain_epoch
             
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
