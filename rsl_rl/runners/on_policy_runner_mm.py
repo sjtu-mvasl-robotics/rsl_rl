@@ -13,7 +13,7 @@ from collections import deque
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
-from rsl_rl.algorithms import MMPPO
+from rsl_rl.algorithms import MMPPO, MMDistillation
 from rsl_rl.env import MMVecEnv
 from rsl_rl.modules import *
 from rsl_rl.utils import store_code_state, string_to_callable

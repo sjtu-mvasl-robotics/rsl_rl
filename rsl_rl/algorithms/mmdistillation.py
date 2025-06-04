@@ -1,22 +1,25 @@
-# Copyright (c) 2021-2025, ETH Zurich and NVIDIA CORPORATION
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# torch
+# Optimized from RSL_RL/PPO
+# Created by Yifei Yao, 04/06/2025
+
+
+# Warning: This code is still under development. DO NOT USE IT!!!
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 # rsl-rl
-from rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
-from rsl_rl.storage import RolloutStorage
+from rsl_rl.modules import StudentTeacherMMTransformerV2, StudentTeacherMMTransformer
+from rsl_rl.storage import RolloutStorageMM
 
-
-class Distillation:
+class MMDistillation:
     """Distillation algorithm for training a student model to mimic a teacher model."""
 
-    policy: StudentTeacher | StudentTeacherRecurrent
+    policy: StudentTeacherMMTransformerV2 | StudentTeacherMMTransformer
     """The student teacher model."""
 
     def __init__(
@@ -47,8 +50,8 @@ class Distillation:
         self.policy = policy
         self.policy.to(self.device)
         self.storage = None  # initialized later
-        self.optimizer = optim.Adam(self.policy.student.parameters(), lr=learning_rate)
-        self.transition = RolloutStorage.Transition()
+        self.optimizer = optim.AdamW(self.policy.student.parameters(), lr=learning_rate)
+        self.transition = RolloutStorageMM.Transition()
         self.last_hidden_states = None
 
         # distillation parameters
@@ -70,7 +73,7 @@ class Distillation:
         self, training_type, num_envs, num_transitions_per_env, student_obs_shape, teacher_obs_shape, actions_shape
     ):
         # create rollout storage
-        self.storage = RolloutStorage(
+        self.storage = RolloutStorageMM(
             training_type,
             num_envs,
             num_transitions_per_env,

@@ -12,7 +12,7 @@ from .rnd import RandomNetworkDistillation
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .actor_critic_mm_transformer import ActorCriticMMTransformer, ActorCriticMMTransformerV2, ActorCriticDebugMLP
-from .student_teacher_transformer import StudentTeacherMMTransformer
+from .student_teacher_transformer import StudentTeacherMMTransformer, StudentTeacherMMTransformerV2
 from .amp import AMPNet
 
 __all__ = [
@@ -26,5 +26,6 @@ __all__ = [
     "ActorCriticMMTransformerV2",
     "ActorCriticDebugMLP",
     "StudentTeacherMMTransformer",
+    "StudentTeacherMMTransformerV2",
     "AMPNet",
 ]

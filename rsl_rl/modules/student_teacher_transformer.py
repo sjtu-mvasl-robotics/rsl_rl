@@ -23,9 +23,12 @@ class StudentTeacherMMTransformer(nn.Module):
             num_student_ref_obs,
             num_actions,
             max_len=16,
-            dim_model=128,
-            num_layers=4,
-            num_heads=8,
+            student_dim_model=128,
+            student_num_layers=4,
+            student_num_heads=8,
+            teacher_dim_model=128,
+            teacher_num_layers=4,
+            teacher_num_heads=8,
             init_noise_std=1.0,
             noise_std_type: str = "scalar",
             dropout=0.05,
@@ -36,9 +39,9 @@ class StudentTeacherMMTransformer(nn.Module):
         self.load_teacher = False
         
         
-        self.student = MMTransformer(num_student_obs, num_student_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="student", dropout=dropout, **kwargs)
+        self.student = MMTransformer(num_student_obs, num_student_ref_obs, num_actions, student_dim_model, max_len=max_len, num_heads=student_num_heads, num_layers=student_num_layers, name="student", dropout=dropout, **kwargs)
 
-        self.teacher = MMTransformer(num_teacher_obs, num_teacher_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="teacher", dropout=dropout, **kwargs)
+        self.teacher = MMTransformer(num_teacher_obs, num_teacher_ref_obs, num_actions, teacher_dim_model, max_len=max_len, num_heads=teacher_num_heads, num_layers=teacher_num_layers, name="teacher", dropout=dropout, **kwargs)
 
         self.teacher.eval()
             
@@ -76,7 +79,7 @@ class StudentTeacherMMTransformer(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, observations, ref_observations=None):
-        mean = self.actor(observations, ref_observations)
+        mean = self.student(observations, ref_observations)
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
         elif self.noise_std_type == "log":
@@ -125,3 +128,42 @@ class StudentTeacherMMTransformer(nn.Module):
             return True
         else:
             raise ValueError("state_dict does not contain student or teacher parameters")
+
+class StudentTeacherMMTransformerV2(StudentTeacherMMTransformer):
+    def __init__(
+        self,
+        teacher_term_dict,
+        teacher_ref_term_dict,
+        student_term_dict,
+        student_ref_term_dict,
+        num_actions,
+        max_len=16,
+        student_dim_model=128,
+        student_num_layers=4,
+        student_num_heads=8,
+        teacher_dim_model=128,
+        teacher_num_layers=4,
+        teacher_num_heads=8,
+        init_noise_std=1.0,
+        noise_std_type: str = "scalar",
+        dropout=0.05,
+        **kwargs
+    ):
+        nn.Module.__init__(self)
+        self.teacher = MMTransformerV2(num_actions, teacher_dim_model, teacher_term_dict["policy"], teacher_ref_term_dict["policy"], max_len=max_len, num_heads=teacher_num_heads, num_layers=teacher_num_layers, name="teacher", dropout=dropout, **kwargs)
+        self.student = MMTransformerV2(num_actions, student_dim_model, student_term_dict["policy"], student_ref_term_dict["policy"], max_len=max_len, num_heads=student_num_heads, num_layers=student_num_layers, name="student", dropout=dropout, **kwargs)
+        self.teacher.eval()
+        print(f"Student Transformer: {self.student}")
+        print(f"Teacher Transformer: {self.teacher}")
+        # Action noise
+        self.noise_std_type = noise_std_type
+        if self.noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif self.noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        self.distribution = None
+        # disable args validation for speedup
+        Normal.set_default_validate_args(False)
+        
