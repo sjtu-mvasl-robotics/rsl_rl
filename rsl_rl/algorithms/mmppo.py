@@ -97,6 +97,7 @@ class MMPPO:
         teacher_loss_coef_decay_interval=100,
         # dagger update parameters        
         teacher_supervising_intervals=0, # when epoch < teacher_supervising_intervals, PPO won't imitate dagger actions and dagger will not be updated
+        teacher_updating_intervals=0, # when epoch > teacher_supervising_intervals, dagger will be updated
         teacher_apply_interval=5, # imitation loss will be add to PPO in * iters
         teacher_coef_mode="kl", # "kl" or "norm"
         teacher_update_interval=1,
@@ -185,6 +186,7 @@ class MMPPO:
         self.teacher_coef_mode = teacher_coef_mode
         self.teacher_only_interval = teacher_only_interval
         self.teacher_supervising_intervals = teacher_supervising_intervals
+        self.teacher_updating_intervals = teacher_updating_intervals
         self.teacher_apply_interval = teacher_apply_interval
         
         assert teacher_coef is not None or teacher_only_interval == 0, "teacher_only_interval should be 0 if teacher_coef is None"
@@ -214,7 +216,7 @@ class MMPPO:
         self.transition = RolloutStorageMM.Transition()
 
         if self.teacher_coef is not None and self.teacher_loss_coef is not None:
-            assert self.teacher_coef_mode in ["kl", "norm"], "teacher_coef_mode should be either 'kl' or 'norm'"
+            assert self.teacher_coef_mode in ["kl", "norm", "original_kl"], "teacher_coef_mode should be either 'kl' or 'norm' or 'original_kl'"
             if self.teacher_coef_range is None:
                 self.teacher_coef_range = (self.teacher_coef, self.teacher_coef)
             else:
@@ -297,7 +299,8 @@ class MMPPO:
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
         if self.teacher_coef is not None:
-            self.transition.dagger_actions = self.actor_critic.act_dagger(obs, ref_obs).detach()
+            self.transition.dagger_actions = self.actor_critic.act_dagger(obs, ref_observations=ref_obs).detach()
+            _ = self.actor_critic.get_actions_log_prob_dagger(self.transition.dagger_actions)
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.reference_observations = ref_obs[0] if ref_obs is not None else None
@@ -360,6 +363,8 @@ class MMPPO:
             mean_gradient_penalty = 0.0
             mean_pred_pos_acc = 0.0
             mean_pred_neg_acc = 0.0
+            mean_pred_pos_prob = 0.0
+            mean_pred_neg_prob = 0.0
 
         # if self.actor_critic.is_recurrent:
         #     generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs) #
@@ -536,25 +541,30 @@ class MMPPO:
 
             if self.amp:
                 # amp_optimization_steps = self.amp_cfg.get("amp_optimization_steps", 3)
-
-                # for _ in range(amp_optimization_steps):
                 policy_score = self.amp.forward(torch.cat([obs_prev_state, obs_cur_state], dim=-1))
                 expert_score = self.amp.forward(torch.cat([ref_obs_prev_state, ref_obs_cur_state], dim=-1))
+                
+                pred_pos_prob = self.amp.out_activation(policy_score).mean()
+                pred_neg_prob = self.amp.out_activation(expert_score).mean()
+                pred_pos_acc = self.amp.policy_acc(policy_score)
+                pred_neg_acc = self.amp.expert_acc(expert_score, ref_obs_cur_mask * ref_obs_prev_mask)
                 policy_loss = self.amp.policy_loss(policy_score)
                 expert_loss = self.amp.expert_loss(expert_score, ref_obs_cur_mask)
                 gradient_penalty = self.amp.expert_grad_penalty(obs_cur_state, ref_obs_cur_state, ref_obs_cur_mask * ref_obs_prev_mask)
                 amp_loss = 0.5 * (policy_loss + expert_loss) + gradient_penalty * self.amp_cfg["gradient_penalty_coeff"]
-                pred_pos_acc = self.amp.policy_acc(policy_score)
-                pred_neg_acc = self.amp.expert_acc(expert_score, ref_obs_cur_mask * ref_obs_prev_mask)
-                self.amp_optimizer.zero_grad()
-                amp_loss.backward()
+
+                if (epoch % self.amp_cfg["amp_update_interval"] == 0) or (epoch < self.amp_cfg["amp_pretrain_steps"]):
+                    self.amp_optimizer.zero_grad()
+                    amp_loss.backward()
                 
                 mean_amp_loss += amp_loss.item()
                 mean_gradient_penalty += gradient_penalty.item() * self.amp_cfg["gradient_penalty_coeff"]
                 mean_pred_pos_acc += pred_pos_acc.item()
                 mean_pred_neg_acc += pred_neg_acc.item()
+                mean_pred_pos_prob += pred_pos_prob.item()
+                mean_pred_neg_prob += pred_neg_prob.item()
 
-            if self.teacher_loss_coef is not None and epoch > self.teacher_supervising_intervals and (epoch+1)%self.teacher_apply_interval == 0:
+            if self.teacher_loss_coef is not None and epoch > self.teacher_updating_intervals and (epoch+1)%self.teacher_apply_interval == 0:
                 backward_imitation_loss = imitation_loss * self.teacher_loss_coef
                 self.imitation_optimizer.zero_grad()
                 backward_imitation_loss.backward()
@@ -579,14 +589,14 @@ class MMPPO:
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
-            if self.amp:
+            if self.amp and (epoch % self.amp_cfg["amp_update_interval"] == 0) or (epoch < self.amp_cfg["amp_pretrain_steps"]):
                 self.amp_optimizer.step()
 
             if self.teacher_loss_coef is not None and epoch > self.teacher_supervising_intervals and (epoch+1)%self.teacher_apply_interval == 0:
                 # backward_imitation_loss = imitation_loss * self.teacher_loss_coef
                 # self.imitation_optimizer.zero_grad()
                 # backward_imitation_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.actor_critic.actor_dagger.parameters(), self.max_grad_norm)
                 self.imitation_optimizer.step()
             
             mean_value_loss += value_loss.item()
@@ -606,11 +616,14 @@ class MMPPO:
         mean_surrogate_loss /= num_updates
         mean_imitation_loss /= num_updates
         mean_dagger_loss /= num_updates
+        mean_entropy /= num_updates
         if self.amp:
             mean_amp_loss /= num_updates
             mean_gradient_penalty /= num_updates
             mean_pred_pos_acc /= num_updates
             mean_pred_neg_acc /= num_updates
+            mean_pred_pos_prob /= num_updates
+            mean_pred_neg_prob /= num_updates
         if epoch > 15000 and epoch % 200 == 0:
             self.min_lr = max(5e-6, self.min_lr / 1.5)
         
@@ -642,6 +655,8 @@ class MMPPO:
             loss_dict["mean_gradient_penalty"] = mean_gradient_penalty
             loss_dict["mean_pred_pos_acc"] = mean_pred_pos_acc
             loss_dict["mean_pred_neg_acc"] = mean_pred_neg_acc
+            loss_dict["mean_pred_pos_prob"] = mean_pred_pos_prob
+            loss_dict["mean_pred_neg_prob"] = mean_pred_neg_prob
 
         return loss_dict
 
@@ -732,9 +747,26 @@ class MMPPO:
                 imitation_loss = torch.sum(
                     (1 / actions_batch.shape[-1]) * (torch.sum((torch.square(mu_batch - dagger_actions_batch) / (2.0 * torch.square(sigma_batch) + 1e-5)), axis=-1) +  0.92 * torch.sum(torch.clamp_min(torch.log(sigma_batch), 0.0), axis=-1))
                 )
-            
+
+            elif self.teacher_coef_mode == "original_kl":
+                mu_batch = self.actor_critic.action_mean
+                sigma_batch = self.actor_critic.action_std
+                with torch.no_grad():
+                    self.actor_critic.act_dagger(obs_batch, ref_obs_batch)
+                    dagger_mu_batch = self.actor_critic.action_mean_dagger.detach()
+                    dagger_sigma_batch = self.actor_critic.action_std_dagger.detach()
+                imitation_loss = torch.sum(
+                    torch.log(sigma_batch / dagger_sigma_batch + 1.0e-5)
+                    + (torch.square(dagger_sigma_batch) + torch.square(dagger_mu_batch - mu_batch))
+                    / (2.0 * torch.square(sigma_batch))
+                    - 0.5,
+                    axis=-1,
+                )
+                imitation_loss = imitation_loss.mean()
             elif self.teacher_coef_mode == "norm":
                 predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                with torch.no_grad():
+                    dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=ref_obs_batch)
                 imitation_loss = torch.norm(
                     (predicted_actions - dagger_actions_batch)
                 ).mean()
@@ -743,18 +775,20 @@ class MMPPO:
             imitation_loss = torch.tensor(0.0).to(self.device)   
         return imitation_loss
     
-    def _imitation_loss_original(self, actions_batch, critic_ref_obs_batch, mu_batch, sigma_batch, action_scale = 0.5):
-        ref_action_batch = critic_ref_obs_batch[0][:, self.ref_action_idx: self.ref_action_idx + actions_batch.shape[-1]]
-        ref_action_mask = critic_ref_obs_batch[1].long()
-        action_processed = ref_action_batch / action_scale
-        imitation_loss = torch.sum((
-            (1 / actions_batch.shape[-1]) * (torch.sum((torch.square(mu_batch - action_processed) / (2.0 * torch.square(sigma_batch) + 1e-5)), axis=-1) +  0.92 * torch.sum(torch.clamp_min(torch.log(sigma_batch), 0.0), axis=-1))
-        ) * ref_action_mask) / (ref_action_mask.sum() + 1e-5)
-        return imitation_loss
+    # def _imitation_loss_original(self, actions_batch, critic_ref_obs_batch, mu_batch, sigma_batch, action_scale = 0.5):
+    #     ref_action_batch = critic_ref_obs_batch[0][:, self.ref_action_idx: self.ref_action_idx + actions_batch.shape[-1]]
+    #     ref_action_mask = critic_ref_obs_batch[1].long()
+    #     action_processed = ref_action_batch / action_scale
+    #     imitation_loss = torch.sum((
+    #         (1 / actions_batch.shape[-1]) * (torch.sum((torch.square(mu_batch - action_processed) / (2.0 * torch.square(sigma_batch) + 1e-5)), axis=-1) +  0.92 * torch.sum(torch.clamp_min(torch.log(sigma_batch), 0.0), axis=-1))
+    #     ) * ref_action_mask) / (ref_action_mask.sum() + 1e-5)
+    #     return imitation_loss
     
     def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch):
         output = self.actor_critic.act_dagger_inference(obs_batch, ref_observations=ref_obs_batch)
-        gt = self.teacher_coef * dagger_actions_batch + (1 - self.teacher_coef) * actions_batch
+        with torch.no_grad():
+            gt = self.teacher_coef * output + (1 - self.teacher_coef) * self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch)
+        gt = gt.detach()
         loss = SmoothL2Loss()(output, gt)
         self.dagger_optimizer.zero_grad()
         loss.backward()

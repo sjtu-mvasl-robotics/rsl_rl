@@ -44,6 +44,7 @@ class AMPNet(nn.Module):
             activation: str = "elu",
             out_activation: str = "tanh",
             device: str = "cpu",
+            label_smoothing: float = 0.0,
             **kwargs
     ):
         super().__init__()
@@ -66,6 +67,7 @@ class AMPNet(nn.Module):
         self.out_layer = nn.Linear(backbone_output_dim, 1)
         self.out_activation = resolve_nn_activation(out_activation)
         self.policy_score = -1 if out_activation == "tanh" else 0 # sigmoid has a range of [0, 1]
+        self.label_smoothing = label_smoothing
         self.expert_score = 1
         self.loss_fn = HingeLoss(reduction="none") if out_activation == "tanh" else nn.BCEWithLogitsLoss(reduction="none") # hinge loss for tanh, binary cross entropy for sigmoid
         self.to(device)
@@ -75,7 +77,7 @@ class AMPNet(nn.Module):
         return x
     
     def policy_loss(self, y: torch.Tensor) -> torch.Tensor:
-        tgt_score = torch.ones_like(y) * self.policy_score
+        tgt_score = torch.ones_like(y) * (self.policy_score + self.label_smoothing)
         loss = self.loss_fn(y, tgt_score) # shape: (num_envs, 1)
         return loss.mean()
     
@@ -97,7 +99,7 @@ class AMPNet(nn.Module):
         Returns:
             loss: torch.Tensor, shape: (1,)
         """
-        tgt_score = torch.ones_like(y) * self.expert_score
+        tgt_score = torch.ones_like(y) * (self.expert_score - self.label_smoothing)
         loss = self.loss_fn(y, tgt_score)
         tgt_mask = tgt_mask.unsqueeze(-1).float()
         loss = (loss * tgt_mask).sum() / (tgt_mask.sum() + 1e-6)
@@ -105,7 +107,7 @@ class AMPNet(nn.Module):
     
     def expert_acc(self, y: torch.Tensor, tgt_mask: torch.Tensor) -> torch.Tensor:
         pred = self.out_activation(y)
-        tgt = torch.ones_like(y) * self.expert_score
+        tgt = torch.ones_like(y) * (self.expert_score - self.label_smoothing)
         bound = (self.policy_score + self.expert_score) / 2
         acc = ((pred > bound).float() == (tgt > bound).float()).float() # shape: (num_envs, )
         tgt_mask = tgt_mask.unsqueeze(-1).float()
@@ -148,7 +150,7 @@ class AMPNet(nn.Module):
 
         return grad_penalty
 
-    def amp_reward(self, cur_state: torch.Tensor, next_state: torch.Tensor, epsilon: float = 1e-4) -> torch.Tensor:
+    def amp_reward(self, cur_state: torch.Tensor, next_state: torch.Tensor, epsilon: float = 1e-4, reward_shift: float = 0.55) -> torch.Tensor:
         """
         Compute the AMP reward for the given current and next states.
 
@@ -158,7 +160,7 @@ class AMPNet(nn.Module):
             cur_state: torch.Tensor, shape: (num_envs, state_dim)
             next_state: torch.Tensor, shape: (num_envs, state_dim)
             epsilon: float, the threshold for the saturated cross entropy
-
+            reward_shift: float, the shift of the reward (we tend to avoid positive reward when p_policy is close to 0 in order to avoid rapid reward growth)
         Returns:
             amp_reward: torch.Tensor, shape: (1,)
         """
@@ -168,7 +170,20 @@ class AMPNet(nn.Module):
             expert_score = self.out_activation(expert_score) # shape: (num_envs, 1)
 
             reward = -torch.log(
-                (self.expert_score - expert_score).clamp(min=epsilon)
+                (self.expert_score - expert_score - self.label_smoothing).clamp(min=epsilon)
             ) # shape: (num_envs, 1)
+
+            reward -= reward_shift
+            reward = reward.clamp(min=0.0)
         
         return reward.squeeze(-1)
+    
+    def amp_score(self, cur_state: torch.Tensor, next_state: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the AMP score for the given current and next states.
+        """
+        assert cur_state.shape == next_state.shape
+        with torch.no_grad():
+            score = self.forward(torch.cat([cur_state, next_state], dim=-1)) # shape: (num_envs, 1)
+            score = self.out_activation(score) # shape: (num_envs, 1)
+            return score.squeeze(-1)

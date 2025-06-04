@@ -229,7 +229,11 @@ class OnPolicyRunnerMM:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         if self.amp_cfg:
             amp_rewbuffer = deque(maxlen=100)
+            amp_scorebuffer = deque(maxlen=100)
+            amp_score_avgbuffer = deque(maxlen=100)
             cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_amp_score_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_amp_score_avg = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         if self.alg.rnd:
@@ -312,8 +316,11 @@ class OnPolicyRunnerMM:
                         if self.amp_cfg:
                             amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(obs, env=self.amp_cfg["_env"])
                             amp_rewards = self.alg.amp.amp_reward(amp_prev_obs, amp_obs, epsilon=self.amp_cfg["epsilon"])
+                            amp_score = self.alg.amp.amp_score(amp_prev_obs, amp_obs)
                             rewards += amp_rewards * self.amp_cfg["amp_reward_scale"]
-                            cur_amp_reward_sum += amp_rewards
+                            cur_amp_reward_sum += amp_rewards * self.amp_cfg["amp_reward_scale"]
+                            cur_amp_score_sum += amp_score
+                            cur_amp_score_avg = cur_amp_score_sum / (cur_episode_length + 1)
                         if self.alg.rnd:
                             cur_ereward_sum += rewards
                             cur_ireward_sum += intrinsic_rewards  # type: ignore
@@ -334,6 +341,11 @@ class OnPolicyRunnerMM:
                         if self.amp_cfg:
                             amp_rewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             cur_amp_reward_sum[new_ids] = 0
+                        
+                            amp_scorebuffer.extend(cur_amp_score_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_amp_score_sum[new_ids] = 0
+                            amp_score_avgbuffer.extend(cur_amp_score_avg[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_amp_score_avg[new_ids] = 0
 
                 stop = time.time()
                 collection_time = stop - start
@@ -346,7 +358,7 @@ class OnPolicyRunnerMM:
                 if self.training_type == "rl":
                     self.alg.compute_returns(critic_obs)
 
-            loss_dict = self.alg.update()
+            loss_dict = self.alg.update(epoch=it)
 
             stop = time.time()
             learn_time = stop - start
@@ -420,6 +432,8 @@ class OnPolicyRunnerMM:
             self.writer.add_scalar("AMP/mean_gradient_penalty", locs["loss_dict"]["mean_gradient_penalty"], locs["it"])
             self.writer.add_scalar("AMP/mean_pred_pos_acc", locs["loss_dict"]["mean_pred_pos_acc"], locs["it"])
             self.writer.add_scalar("AMP/mean_pred_neg_acc", locs["loss_dict"]["mean_pred_neg_acc"], locs["it"])
+            self.writer.add_scalar("AMP/mean_pred_pos_prob", locs["loss_dict"]["mean_pred_pos_prob"], locs["it"])
+            self.writer.add_scalar("AMP/mean_pred_neg_prob", locs["loss_dict"]["mean_pred_neg_prob"], locs["it"])
 
         if len(locs["rewbuffer"]) > 0:
             if self.alg.rnd:
@@ -429,6 +443,7 @@ class OnPolicyRunnerMM:
 
             if self.amp_cfg:
                 self.writer.add_scalar("AMP/mean_reward", statistics.mean(locs["amp_rewbuffer"]), locs["it"])
+                self.writer.add_scalar("AMP/mean_score", statistics.mean(locs["amp_score_avgbuffer"]), locs["it"])
           
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -471,7 +486,10 @@ class OnPolicyRunnerMM:
                 log_string += (f"""{'Mean gradient penalty:':>{pad}} {locs['loss_dict']['mean_gradient_penalty']:.4f}\n""")
                 log_string += (f"""{'Mean pred pos acc:':>{pad}} {locs['loss_dict']['mean_pred_pos_acc']:.4f}\n""")
                 log_string += (f"""{'Mean pred neg acc:':>{pad}} {locs['loss_dict']['mean_pred_neg_acc']:.4f}\n""")
-                log_string += (f"""{'Mean amp reward:':>{pad}} {statistics.mean(locs['amp_rewbuffer']):.2f}\n""")
+                log_string += (f"""{'Mean pred pos prob:':>{pad}} {locs['loss_dict']['mean_pred_pos_prob']:.4f}\n""")
+                log_string += (f"""{'Mean pred neg prob:':>{pad}} {locs['loss_dict']['mean_pred_neg_prob']:.4f}\n""")
+                log_string += (f"""{'Mean amp reward:':>{pad}} {statistics.mean(locs['amp_rewbuffer']):.4f}\n""")
+                log_string += (f"""{'Mean amp score:':>{pad}} {statistics.mean(locs['amp_score_avgbuffer']):.4f}\n""")
 
             log_string += (f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""

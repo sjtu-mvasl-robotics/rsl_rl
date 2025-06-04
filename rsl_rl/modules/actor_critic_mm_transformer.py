@@ -747,7 +747,7 @@ class ActorCriticMMTransformer(nn.Module):
             load_dagger=False,
             load_dagger_path=None,
             load_actor_path=None,
-            enable_lora=False,
+            enable_lora=True,
             dropout=0.05,
             **kwargs
     ):
@@ -757,6 +757,16 @@ class ActorCriticMMTransformer(nn.Module):
         self.actor_dagger = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, **kwargs) if load_dagger else None
         if load_actor_path:
             self.load_actor_weights(load_actor_path)
+
+        # Action noise
+        self.noise_std_type = noise_std_type
+        if self.noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif self.noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        
         if load_dagger:
             self.load_dagger_weights(load_dagger_path)
             lora_r = kwargs.get('lora_r', 8)
@@ -769,14 +779,7 @@ class ActorCriticMMTransformer(nn.Module):
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")
-        # Action noise
-        self.noise_std_type = noise_std_type
-        if self.noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-        elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -831,6 +834,20 @@ class ActorCriticMMTransformer(nn.Module):
         # load the weights
         # self.actor.load_state_dict(dagger_weights)
         self.actor_dagger.load_state_dict(dagger_weights)
+        self.actor.load_state_dict(dagger_weights)
+        if self.noise_std_type == "scalar":
+            assert "std" in model_state_dict.keys(), f"Key 'std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.std.data = model_state_dict["std"]
+            self.std_dagger = nn.Parameter(model_state_dict["std"])
+        elif self.noise_std_type == "log":
+            assert "log_std" in model_state_dict.keys(), f"Key 'log_std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.log_std.data = model_state_dict["log_std"]
+            self.log_std_dagger = nn.Parameter(model_state_dict["log_std"])
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        
+        self.distribution_dagger = None
+            
         print(f"Loaded dagger weights from {path} to actor_dagger")
         
     def apply_dagger_lora(self, r=8, alpha=16, dropout=0.05):
@@ -886,6 +903,18 @@ class ActorCriticMMTransformer(nn.Module):
     @property
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
+    
+    @property
+    def action_mean_dagger(self):
+        return self.distribution_dagger.mean
+    
+    @property
+    def action_std_dagger(self):
+        return self.distribution_dagger.stddev
+    
+    @property
+    def entropy_dagger(self):
+        return self.distribution_dagger.entropy().sum(dim=-1)
 
     def update_distribution(self, observations, ref_observations=None):
         mean = self.actor(observations, ref_observations)
@@ -902,10 +931,20 @@ class ActorCriticMMTransformer(nn.Module):
         sample = self.distribution.sample()
         return sample
     
-    @torch.no_grad()
+    def update_distribution_dagger(self, observations, ref_observations=None):
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        mean = self.actor_dagger(observations, ref_observations)
+        if self.noise_std_type == "scalar":
+            std = self.std_dagger.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std_dagger).expand_as(mean)
+        self.distribution_dagger = Normal(mean, std)
+   
     def act_dagger(self, observations, ref_observations=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
-        return self.actor_dagger(observations, ref_observations)
+        self.update_distribution_dagger(observations, ref_observations)
+        sample = self.distribution_dagger.sample()
+        return sample
     
     def act_dagger_inference(self, observations, ref_observations=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
@@ -917,6 +956,9 @@ class ActorCriticMMTransformer(nn.Module):
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
+    
+    def get_actions_log_prob_dagger(self, actions):
+        return self.distribution_dagger.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations, ref_observations=None):
         actions_mean = self.actor(observations, ref_observations)
@@ -1026,6 +1068,14 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
         assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
         self.actor = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", dropout=dropout, **kwargs)
         self.actor_dagger = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, **kwargs) if load_dagger else None
+        # Action noise
+        self.noise_std_type = noise_std_type
+        if self.noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        elif self.noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         if load_actor_path:
             self.load_actor_weights(load_actor_path)
         if load_dagger:
@@ -1040,14 +1090,7 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")
-        # Action noise
-        self.noise_std_type = noise_std_type
-        if self.noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-        elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
