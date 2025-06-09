@@ -150,7 +150,7 @@ class AMPNet(nn.Module):
 
         return grad_penalty
 
-    def amp_reward(self, cur_state: torch.Tensor, next_state: torch.Tensor, epsilon: float = 1e-4, reward_shift: float = 0.55) -> torch.Tensor:
+    def amp_reward(self, cur_state: torch.Tensor, next_state: torch.Tensor, epsilon: float = 1e-4, reward_shift: float = 0.25) -> torch.Tensor:
         """
         Compute the AMP reward for the given current and next states.
 
@@ -174,7 +174,7 @@ class AMPNet(nn.Module):
             ) # shape: (num_envs, 1)
 
             reward -= reward_shift
-            reward = reward.clamp(min=0.0)
+            reward = reward.clamp(min=-0.1)
         
         return reward.squeeze(-1)
     

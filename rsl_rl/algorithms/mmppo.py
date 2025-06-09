@@ -73,10 +73,10 @@ class MMPPO:
         learning_rate=1e-3,
         max_lr=1e-2,
         min_lr=1e-4,
-        max_lr_after_certain_epoch=1e-3,
-        max_lr_restriction_epoch=2500,
-        min_lr_after_certain_epoch=1e-5,
-        min_lr_restriction_epoch=2500,
+        max_lr_after_certain_epoch=5e-3,
+        max_lr_restriction_epoch=25000,
+        min_lr_after_certain_epoch=5e-5,
+        min_lr_restriction_epoch=25000,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
         schedule="fixed",
@@ -589,7 +589,7 @@ class MMPPO:
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
-            if self.amp and (epoch % self.amp_cfg["amp_update_interval"] == 0) or (epoch < self.amp_cfg["amp_pretrain_steps"]):
+            if self.amp and ((epoch % self.amp_cfg["amp_update_interval"] == 0) or (epoch < self.amp_cfg["amp_pretrain_steps"])):
                 self.amp_optimizer.step()
 
             if self.teacher_loss_coef is not None and epoch > self.teacher_supervising_intervals and (epoch+1)%self.teacher_apply_interval == 0:
