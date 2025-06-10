@@ -121,7 +121,7 @@ class MMPPO:
         amp_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
-        auto_mix_precision: bool = True, # do not mix this with amp_cfg (that amp stands for Adversarial Motion Prior)
+        auto_mix_precision: bool = False, # do not mix this with amp_cfg (that amp stands for Adversarial Motion Prior)
 
 
         **kwargs # reserved for future use

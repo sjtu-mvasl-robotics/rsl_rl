@@ -533,11 +533,11 @@ class MMTransformerV2(nn.Module):
         ref_obs_size = sum(ref_term_dict.values()) if ref_term_dict else 0
         self.in_size = obs_size + ref_obs_size
         self.mlp_residual = nn.Sequential(
-            nn.Linear(obs_size + ref_obs_size, 512),
+            nn.Linear(obs_size + ref_obs_size, 768),
             nn.GELU(),
-            nn.Linear(512, 256),
+            nn.Linear(768, 384),
             nn.GELU(),
-            nn.Linear(256, dim_out),
+            nn.Linear(384, dim_out),
         ) if apply_mlp_residual else None
         self.gate_linear = nn.Linear(dim_model, dim_out) if apply_mlp_residual else None
         # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
@@ -646,7 +646,7 @@ class MMTransformerV2(nn.Module):
         # -------------------
         # Final fully connected layer
         # -------------------
-        x = self.fc(x)  # Shape: (B, output_dim)
+        y = self.fc(x)  # Shape: (B, output_dim)
         
         if self.mlp_residual is not None:
             obs_in = obs
@@ -658,9 +658,9 @@ class MMTransformerV2(nn.Module):
                 
             # x = x + self.mlp_residual(obs_in) * self.mlp_weight
             gate = F.sigmoid(self.gate_linear(x))
-            x = gate * x + (1 - gate) * self.mlp_residual(obs_in)
+            y = gate * y + (1 - gate) * self.mlp_residual(obs_in)
         # x = self.out_ls(x)
-        return x
+        return y
 
 class Transformer(nn.Module):
     '''
