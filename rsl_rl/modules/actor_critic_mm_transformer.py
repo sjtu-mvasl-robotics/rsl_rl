@@ -18,13 +18,36 @@ from peft import get_peft_model, LoraConfig, TaskType
 from peft.tuners.lora import Linear as LoRALinear
 from rsl_rl.utils import resolve_nn_activation
 
+def group_by_concat_list(orig_dict: dict, concat_list: list | None = None):
+    key_to_idx = {k: i for i, k in enumerate(orig_dict)}
+
+    if concat_list is None:
+        grouped_keys = [[k] for k in orig_dict]
+        grouped_values = [[v] for v in orig_dict.values()]
+        group_idx = [[i] for i in range(len(orig_dict))]
+        return grouped_keys, grouped_values, group_idx
+
+    elements_in_groups = {element for sublist in concat_list for element in sublist}
+
+    grouped_keys = list(concat_list)
+    grouped_values = [[orig_dict[item] for item in sublist] for sublist in grouped_keys]
+    group_idx = [[key_to_idx[item] for item in sublist] for sublist in grouped_keys]
+
+    for key in orig_dict:
+        if key not in elements_in_groups:
+            grouped_keys.append([key])
+            grouped_values.append([orig_dict[key]])
+            group_idx.append([key_to_idx[key]])
+
+    return grouped_keys, grouped_values, group_idx
+
 class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization.
     y = x / sqrt(mean(x**2) + eps) * weight + bias
     No mean subtraction.
     """
-    def __init__(self, normalized_shape, eps: float = 1e-8, bias: bool = True):
+    def __init__(self, normalized_shape, eps: float = 1e-5, bias: bool = True):
         super().__init__()
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
@@ -38,12 +61,61 @@ class RMSNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(self.normalized_shape)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.float() # ensure x is float32
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         x_norm = x / rms
         x_norm = x_norm * self.weight
         if self.bias is not None:
             x_norm = x_norm + self.bias
         return x_norm
+    
+class SwiGLUEmbedding(nn.Module):
+    """A SwiGLU block for embedding a single observation group."""
+    def __init__(self, input_dim: int, d_model: int, expansion_factor: int = 2):
+        super().__init__()
+        hidden_dim = int(expansion_factor * d_model)
+        
+        # The SwiGLU magic: two linear layers for the gate and value
+        self.w1 = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.w3 = nn.Linear(input_dim, hidden_dim, bias=False)
+        
+        # The final projection layer
+        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
+
+    def forward(self, x):
+        # x is a single group's observation, e.g., (B, group_input_dim)
+        gate = F.silu(self.w1(x)) # Swish activation for the gate
+        value = self.w3(x)
+        
+        # Element-wise multiplication, followed by the final projection
+        return self.w2(gate * value)
+    
+class HistoryEncoder(nn.Module):
+    """
+    HistoryEncoder is a temporal encoder for history observations.
+    It uses 1D convolutions for temporal feature extraction and a powerful SwiGLU layer for the final projection.
+    """
+    def __init__(self, history_length: int, group_per_step_dim: int, d_model: int):
+        super().__init__()
+        self.conv_net = nn.Sequential(
+            nn.Conv1d(in_channels=group_per_step_dim, out_channels=32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
+        )
+        flattened_size = 64 * history_length
+        
+        self.projection = SwiGLUEmbedding(flattened_size, d_model)
+
+    def forward(self, x_seq: torch.Tensor):
+        # x_seq has shape (B, history_length, group_per_step_dim)
+        x_conv_in = x_seq.permute(0, 2, 1)
+        conv_out = self.conv_net(x_conv_in)
+        conv_out_flat = torch.flatten(conv_out, 1)
+            
+            # Use the powerful projection layer
+        token = self.projection(conv_out_flat)
+        
+        return token
 
 ############################################################################################################
 #
@@ -109,33 +181,45 @@ class ObservationEmbeddingWithObsLen(nn.Module):
 ############################################################################################################
 
 class ObservationEmbeddingV2(nn.Module):
-    def __init__(self, d_model: int, term_dict: dict[str, int], apply_norm: bool = False):
+    def __init__(self, d_model: int, term_dict: dict[str, int], apply_norm: bool = False, concatenate_term_names: list[list[str]] | None = None, history_length: int = 1):
         super().__init__()
-        self.term_names = list(term_dict.keys())
-        self.term_dims  = list(term_dict.values())
-        self.seq_len    = len(self.term_names)
-        self.d_model    = d_model
-        self.embeddings = nn.ModuleList([
-            nn.Linear(dim, d_model) for dim in self.term_dims
+        self.term_names     = list(term_dict.keys())
+        self.term_dims      = list(term_dict.values())
+        self.group_term_names, self.group_term_dims, self.group_term_idx = group_by_concat_list(term_dict, concatenate_term_names)
+        self.seq_len        = len(self.group_term_names)
+        self.d_model        = d_model
+        self.history_length = history_length
+        self.embeddings     = nn.ModuleList([
+            SwiGLUEmbedding(sum(dims), d_model) if self.history_length <= 1 else HistoryEncoder(self.history_length, sum(dims)//self.history_length, d_model) for dims in self.group_term_dims
         ])
-        self.term_embed = nn.Embedding(self.seq_len, d_model)
-        self.norm = RMSNorm(d_model) if apply_norm else nn.Identity()
-        start = 0
+        self.term_embed     = nn.Embedding(self.seq_len, d_model)
+        self.norm           = RMSNorm(d_model) if apply_norm else nn.Identity()
+        start               = 0
         self.term_slices = []
-        for dim in self.term_dims:
+        for dim in self.term_dims: # reserve original term slices for later slicing & concatenation
             self.term_slices.append(slice(start, start + dim))
             start += dim
 
     def forward(self, obs: torch.Tensor):
         # obs shape: (B, num_obs)
         token_list = []
-        for i, sl in enumerate(self.term_slices):
-            token_i = self.embeddings[i](obs[:, sl])          # (B, d_model)
+
+        for i, group_term_dims, group_term_idx in zip(range(self.seq_len), self.group_term_dims, self.group_term_idx):
+            if self.history_length > 1:
+                group_obs = torch.cat([
+                    obs[:, self.term_slices[j]].view(
+                        -1,
+                        self.history_length,
+                        self.term_dims[j] // self.history_length
+                    ) for j in group_term_idx], dim=-1) # (B, history_length, sum(group_term_dims) // history_length)
+            else:
+                group_obs = torch.cat([obs[:, self.term_slices[j]] for j in group_term_idx], dim=-1) # (B, sum(group_term_dims))
+            token_i = self.embeddings[i](group_obs) # (B, d_model)
             token_list.append(token_i)
-        x = torch.stack(token_list, dim=1)                    # (B, seq_len, d_model)
+        x = torch.stack(token_list, dim=1) # (B, seq_len, d_model)
         x = self.norm(x)
-        idx = torch.arange(self.seq_len, device=obs.device).unsqueeze(0)  # (1, seq_len)
-        x = x + self.term_embed(idx)                          # (B, seq_len, d_model)
+        idx = torch.arange(self.seq_len, device=obs.device).unsqueeze(0) # (1, seq_len)
+        x = x + self.term_embed(idx) # (B, seq_len, d_model)
         return x
 
 
@@ -405,6 +489,9 @@ class MMTransformerV2(nn.Module):
             dim_model,
             term_dict: dict,
             ref_term_dict: dict | None = None,
+            concatenate_term_names: list[list[str]] | None = None,
+            concatenate_ref_term_names: list[list[str]] | None = None,
+            history_length: int = 1,
             num_heads = 8,
             num_layers = 4,
             ffn_ratio = 4,
@@ -412,16 +499,16 @@ class MMTransformerV2(nn.Module):
             name = "",
             ls_init_values = 1e-3,
             apply_pooling = False,
-            apply_mlp_residual = True,
+            apply_mlp_residual = True, # Warning: Do not set this to True if you are using a ref & without ref switching environment!
             **kwargs
     ):
         super().__init__()
         self.name = name
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
-        self.obs_embedding = ObservationEmbeddingV2(dim_model, term_dict)
+        self.obs_embedding = ObservationEmbeddingV2(dim_model, term_dict, concatenate_term_names=concatenate_term_names, history_length=history_length)
         if ref_term_dict:
-            self.ref_obs_embedding = ObservationEmbeddingV2(dim_model, ref_term_dict)
+            self.ref_obs_embedding = ObservationEmbeddingV2(dim_model, ref_term_dict, concatenate_term_names=concatenate_ref_term_names, history_length=history_length)
         else:
             self.ref_obs_embedding = None
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim_model))
@@ -452,7 +539,7 @@ class MMTransformerV2(nn.Module):
             nn.GELU(),
             nn.Linear(256, dim_out),
         ) if apply_mlp_residual else None
-        self.mlp_weight = nn.Parameter(torch.ones(1)) if apply_mlp_residual else None
+        self.gate_linear = nn.Linear(dim_model, dim_out) if apply_mlp_residual else None
         # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
 
     def forward(
@@ -569,7 +656,9 @@ class MMTransformerV2(nn.Module):
             if obs_in.size(1) != self.in_size: # use zero padding
                 obs_in = F.pad(obs_in, (0, self.in_size - obs_in.size(1)), value=0.0)
                 
-            x = x + self.mlp_residual(obs_in) * self.mlp_weight
+            # x = x + self.mlp_residual(obs_in) * self.mlp_weight
+            gate = F.sigmoid(self.gate_linear(x))
+            x = gate * x + (1 - gate) * self.mlp_residual(obs_in)
         # x = self.out_ls(x)
         return x
 
@@ -1051,6 +1140,9 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
             term_dict,
             ref_term_dict,
             num_actions,
+            history_length=1,
+            concatenate_term_names=None,
+            concatenate_ref_term_names=None,
             max_len=16,
             dim_model=128,
             num_layers=4,
@@ -1066,8 +1158,8 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
     ):
         nn.Module.__init__(self)
         assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
-        self.actor = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", dropout=dropout, **kwargs)
-        self.actor_dagger = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, **kwargs) if load_dagger else None
+        self.actor = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", dropout=dropout, concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], history_length=history_length, **kwargs)
+        self.actor_dagger = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], history_length=history_length, **kwargs) if load_dagger else None
         # Action noise
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
@@ -1086,7 +1178,7 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
             if enable_lora:
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             
-        self.critic = MMTransformerV2(1, dim_model, term_dict["critic"], ref_term_dict["critic"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", dropout=dropout, **kwargs) # 1 for value function
+        self.critic = MMTransformerV2(1, dim_model, term_dict["critic"], ref_term_dict["critic"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", dropout=dropout, concatenate_term_names=concatenate_term_names["critic"], concatenate_ref_term_names=concatenate_ref_term_names["critic"], history_length=history_length, **kwargs) # 1 for value function
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")

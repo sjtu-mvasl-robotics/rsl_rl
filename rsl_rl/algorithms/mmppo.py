@@ -20,6 +20,15 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.utils import string_to_callable
 import time
 
+def print_gpu_memory_summary(point_in_code: str):
+    """Prints a detailed summary of the VRAM usage."""
+    return # disable debug print. Comment this out to enable debug print.
+    # The 'abbreviated=True' version is a quick summary.
+    # 'abbreviated=False' gives a detailed, multi-line report.
+    print(f"--- GPU Memory Summary at: {point_in_code} ---")
+    print(torch.cuda.memory_summary(abbreviated=False))
+    print("--- End of Summary ---")
+
 class SmoothL2Loss(nn.Module):
     """
     Smooth L2 loss (Huber loss), where:
@@ -112,6 +121,7 @@ class MMPPO:
         amp_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        auto_mix_precision: bool = True, # do not mix this with amp_cfg (that amp stands for Adversarial Motion Prior)
 
 
         **kwargs # reserved for future use
@@ -135,6 +145,13 @@ class MMPPO:
         else:
             self.rnd = None
             self.rnd_optimizer = None
+
+        self.auto_mix_precision = auto_mix_precision
+        if auto_mix_precision:
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
+
 
         # AMP components
         if amp_cfg is not None:
@@ -371,6 +388,7 @@ class MMPPO:
         # else:
         assert self.actor_critic.is_recurrent == False, "MM-PPO does not support recurrent actor-critic networks."
         assert self.storage is not None, "Storage is not initialized. Please call init_storage before update."
+        print_gpu_memory_summary("before mini_batch_generator")
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for (
             obs_batch,
@@ -415,11 +433,12 @@ class MMPPO:
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
-            self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch)
-            actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-            value_batch = self.actor_critic.evaluate(
-                critic_obs_batch, ref_critic_observations=critic_ref_obs_batch
-            )
+            with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch)
+                actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
+                value_batch = self.actor_critic.evaluate(
+                    critic_obs_batch, ref_critic_observations=critic_ref_obs_batch
+                )
 
             mu_batch = self.actor_critic.action_mean[:original_batch_size]
             sigma_batch = self.actor_critic.action_std[:original_batch_size]
@@ -433,6 +452,8 @@ class MMPPO:
             # This loss is calculated only when critic_ref_obs_batch is not None, otherwise 0.0
             # By default, we assume that ref_action_batch = critic_ref_obs_batch[0][:, ref_action_idx: num_actions + ref_action_idx] where ref_action_idx = 0
             # Loss: \sum_i [\sqrt(2 * \pi * \sigma_i^2) + (mu_i - ref_action_i)^2 / (2 * \sigma_i^2)]
+            
+            print_gpu_memory_summary("After forward pass")
             if self.max_lr_restriction_epoch != 0 and epoch > self.max_lr_restriction_epoch:
                 self.max_lr = self.max_lr_after_certain_epoch
             
@@ -472,23 +493,24 @@ class MMPPO:
                         param_group["lr"] = self.learning_rate
 
             # Surrogate loss
-            ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                    -self.clip_param, self.clip_param
+            with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+                surrogate = -torch.squeeze(advantages_batch) * ratio
+                surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
                 )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
+                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+                # Value function loss
+                if self.use_clipped_value_loss:
+                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                        -self.clip_param, self.clip_param
+                    )
+                    value_losses = (value_batch - returns_batch).pow(2)
+                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                else:
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
 
             
 
@@ -502,26 +524,28 @@ class MMPPO:
                     )
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
-                    mean_actions_batch = self.actor_critic.act_inference(obs_batch.detach().clone(), (ref_obs_batch[0].detach().clone(), ref_obs_batch[1].detach().clone()))
+                    with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                        mean_actions_batch = self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch)
 
-                    action_mean_orig = mean_actions_batch[:original_batch_size]
-                    _, _, actions_mean_symm_batch = data_augmentation_func(
-                        obs=None, ref_obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
-                    )
+                        action_mean_orig = mean_actions_batch[:original_batch_size]
+                        _, _, actions_mean_symm_batch = data_augmentation_func(
+                            obs=None, ref_obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                        )
 
-                    mse_loss = torch.nn.MSELoss()
-                    symmetry_loss = mse_loss(
-                        mean_actions_batch[:original_batch_size], actions_mean_symm_batch.detach()[:original_batch_size]
-                    )
-                    if self.symmetry["use_mirror_loss"]:
-                        loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
-                    else:
-                        symmetry_loss = symmetry_loss.detach()
+                        mse_loss = torch.nn.MSELoss()
+                        symmetry_loss = mse_loss(
+                            mean_actions_batch[:original_batch_size], actions_mean_symm_batch.detach()[:original_batch_size]
+                        )
+                        if self.symmetry["use_mirror_loss"]:
+                            loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+                        else:
+                            symmetry_loss = symmetry_loss.detach()
                     
                     mean_symmetry_loss += symmetry_loss.item()
 
             if self.rnd:
-                predicted_embedding = self.rnd.predictor(rnd_state_batch)
+                with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                    predicted_embedding = self.rnd.predictor(rnd_state_batch)
                 target_embedding = self.rnd.target(rnd_state_batch).detach()
                 mse_loss = torch.nn.MSELoss()
                 rnd_loss = mse_loss(predicted_embedding, target_embedding) 
@@ -532,12 +556,17 @@ class MMPPO:
                     
 
             imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch)      
-                    
+            print_gpu_memory_summary("Before optimizer.zero_grad")
             # if self.teacher_coef is not None:
             #     loss += imitation_loss * self.teacher_coef
             # Gradient step
             self.optimizer.zero_grad()
-            loss.backward()
+            if not self.auto_mix_precision:
+                loss.backward()
+            else:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+            print_gpu_memory_summary("After backward pass")
 
             if self.amp:
                 # amp_optimization_steps = self.amp_cfg.get("amp_optimization_steps", 3)
@@ -567,12 +596,20 @@ class MMPPO:
             if self.teacher_loss_coef is not None and epoch > self.teacher_updating_intervals and (epoch+1)%self.teacher_apply_interval == 0:
                 backward_imitation_loss = imitation_loss * self.teacher_loss_coef
                 self.imitation_optimizer.zero_grad()
-                backward_imitation_loss.backward()
+                if not self.auto_mix_precision:
+                    backward_imitation_loss.backward()
+                else:
+                    self.scaler.scale(backward_imitation_loss).backward()
+                    self.scaler.unscale_(self.imitation_optimizer)
 
             # for RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()
-                rnd_loss.backward()
+                if not self.auto_mix_precision:
+                    rnd_loss.backward()
+                else:
+                    self.scaler.scale(rnd_loss).backward()
+                    self.scaler.unscale_(self.rnd_optimizer)
                 mean_rnd_loss += rnd_loss.item()
 
             # if self.amp and isinstance(amp_loss, torch.Tensor): # skip first epoch where amp_loss is 0.0 (float)
@@ -587,7 +624,10 @@ class MMPPO:
                 self.reduce_parameters()
 
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-            self.optimizer.step()
+            if not self.auto_mix_precision:
+                self.optimizer.step()
+            else:
+                self.scaler.step(self.optimizer)
 
             if self.amp and ((epoch % self.amp_cfg["amp_update_interval"] == 0) or (epoch < self.amp_cfg["amp_pretrain_steps"])):
                 self.amp_optimizer.step()
@@ -597,7 +637,15 @@ class MMPPO:
                 # self.imitation_optimizer.zero_grad()
                 # backward_imitation_loss.backward()
                 nn.utils.clip_grad_norm_(self.actor_critic.actor_dagger.parameters(), self.max_grad_norm)
-                self.imitation_optimizer.step()
+                if not self.auto_mix_precision:
+                    self.imitation_optimizer.step()
+                else:
+                    self.scaler.step(self.imitation_optimizer)
+
+            if self.auto_mix_precision:
+                self.scaler.update()
+
+            print_gpu_memory_summary("After optimizer.step")
             
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
@@ -636,7 +684,7 @@ class MMPPO:
             self.teacher_loss_coef = min(
                 self.teacher_loss_coef_range[1],
                 self.teacher_loss_coef + (1 - self.teacher_loss_coef_decay) * (self.teacher_loss_coef_range[1] - self.teacher_loss_coef_range[0]),)
-        
+        print_gpu_memory_summary("End of epoch")
         self.storage.clear()
 
         loss_dict = {
@@ -742,7 +790,8 @@ class MMPPO:
         if dagger_actions_batch is not None:
             dagger_actions_batch = dagger_actions_batch.detach()
             if self.teacher_coef_mode == "kl":
-                mu_batch = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                    mu_batch = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
                 sigma_batch = self.actor_critic.action_std.detach()
                 imitation_loss = torch.sum(
                     (1 / actions_batch.shape[-1]) * (torch.sum((torch.square(mu_batch - dagger_actions_batch) / (2.0 * torch.square(sigma_batch) + 1e-5)), axis=-1) +  0.92 * torch.sum(torch.clamp_min(torch.log(sigma_batch), 0.0), axis=-1))
@@ -764,9 +813,11 @@ class MMPPO:
                 )
                 imitation_loss = imitation_loss.mean()
             elif self.teacher_coef_mode == "norm":
-                predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
                 with torch.no_grad():
-                    dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                    with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=ref_obs_batch)
                 imitation_loss = torch.norm(
                     (predicted_actions - dagger_actions_batch)
                 ).mean()
@@ -784,7 +835,7 @@ class MMPPO:
     #     ) * ref_action_mask) / (ref_action_mask.sum() + 1e-5)
     #     return imitation_loss
     
-    def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch):
+    def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch): # for this function, we haven't figured out how to use autocast. Maybe a seperate scaler is needed.
         output = self.actor_critic.act_dagger_inference(obs_batch, ref_observations=ref_obs_batch)
         with torch.no_grad():
             gt = self.teacher_coef * output + (1 - self.teacher_coef) * self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch)
