@@ -148,7 +148,7 @@ class MMPPO:
 
         self.auto_mix_precision = auto_mix_precision
         if auto_mix_precision:
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.amp.GradScaler(device=self.device)
         else:
             self.scaler = None
 
@@ -224,7 +224,7 @@ class MMPPO:
                 self.actor_critic.actor.parameters(),
                 self.actor_critic.critic.parameters()
             ),
-            lr=learning_rate)
+            lr=learning_rate) if self.teacher_coef is not None else None
         # self.optimizer = optim.AdamW(
         #     self.actor_critic.parameters(),
         #     lr=learning_rate

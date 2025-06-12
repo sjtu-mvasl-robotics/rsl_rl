@@ -61,13 +61,14 @@ class RMSNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(self.normalized_shape)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
         x = x.float() # ensure x is float32
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         x_norm = x / rms
         x_norm = x_norm * self.weight
         if self.bias is not None:
             x_norm = x_norm + self.bias
-        return x_norm
+        return x_norm.to(input_dtype)
     
 class SwiGLUEmbedding(nn.Module):
     """A SwiGLU block for embedding a single observation group."""

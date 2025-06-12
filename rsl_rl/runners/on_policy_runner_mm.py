@@ -538,7 +538,16 @@ class OnPolicyRunnerMM:
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
-            
+        if self.alg.amp is not None:
+            saved_dict["amp_state_dict"] = self.alg.amp.state_dict()
+            saved_dict["amp_optimizer_state_dict"] = self.alg.amp_optimizer.state_dict()
+        if self.alg.scaler is not None:
+            saved_dict["scaler_state_dict"] = self.alg.scaler.state_dict()
+        
+        if self.alg.teacher_coef is not None:
+            saved_dict["imitation_optimizer_state_dict"] = self.alg.imitation_optimizer.state_dict()
+            saved_dict["dagger_optimizer_state_dict"] = self.alg.dagger_optimizer.state_dict()
+        
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -560,6 +569,14 @@ class OnPolicyRunnerMM:
                 self.critic_ref_obs_normalizer.load_state_dict(loaded_dict["critic_ref_obs_norm_state_dict"])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        if self.alg.teacher_coef is not None:
+            self.alg.imitation_optimizer.load_state_dict(loaded_dict["imitation_optimizer_state_dict"])
+            self.alg.dagger_optimizer.load_state_dict(loaded_dict["dagger_optimizer_state_dict"])
+        if self.alg.scaler is not None:
+            self.alg.scaler.load_state_dict(loaded_dict["scaler_state_dict"])
+        if self.alg.amp is not None:
+            self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
+            self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
         self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
