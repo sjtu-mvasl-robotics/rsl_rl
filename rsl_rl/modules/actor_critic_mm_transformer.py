@@ -96,7 +96,7 @@ class HistoryEncoder(nn.Module):
     HistoryEncoder is a temporal encoder for history observations.
     It uses 1D convolutions for temporal feature extraction and a powerful SwiGLU layer for the final projection.
     """
-    def __init__(self, history_length: int, group_per_step_dim: int, d_model: int):
+    def __init__(self, history_length: int, group_per_step_dim: int, d_model: int, use_swiglu: bool = False, swiglu_expansion_factor: int = 2):
         super().__init__()
         self.conv_net = nn.Sequential(
             nn.Conv1d(in_channels=group_per_step_dim, out_channels=32, kernel_size=3, padding=1),
@@ -105,7 +105,7 @@ class HistoryEncoder(nn.Module):
         )
         flattened_size = 64 * history_length
         
-        self.projection = SwiGLUEmbedding(flattened_size, d_model)
+        self.projection = SwiGLUEmbedding(flattened_size, d_model, swiglu_expansion_factor) if use_swiglu else nn.Linear(flattened_size, d_model)
 
     def forward(self, x_seq: torch.Tensor):
         # x_seq has shape (B, history_length, group_per_step_dim)
