@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "RSL RL for GBC: Enhanced Framework for Whole-Body Humanoid Imitation"
+version: "2.3.1.dev2"
+date-released: "2025-08-01"
+url: "https://github.com/sjtu-mvasl-robotics/rsl_rl"
+repository-code: "https://github.com/sjtu-mvasl-robotics/rsl_rl"
+abstract: "Enhanced RSL RL framework for GBC (Generalized Behavior-Cloning Framework for Whole-Body Humanoid Imitation). Re-implemented components for better imitation learning support, including multi-modal interfaces and transformer architectures."
+authors:
+  - family-names: "Yao"
+    given-names: "Yifei"
+    orcid: "https://orcid.org/0009-0002-0709-4364"
+    affiliation: "Shanghai Jiao Tong University, MVASL Lab"
+license: "BSD-3-Clause"
+keywords:
+  - "reinforcement learning"
+  - "imitation learning"
+  - "pytorch"
+  - "robotics"
+  - "machine learning"
+  - "deep learning"
+  - "humanoid robotics"
+  - "behavior cloning"
+preferred-citation:
+  type: software
+  title: "RSL RL for GBC: Enhanced Framework for Whole-Body Humanoid Imitation"
+  authors:
+    - family-names: "Yao"
+      given-names: "Yifei"
+      orcid: "https://orcid.org/0009-0002-0709-4364"
+      affiliation: "Shanghai Jiao Tong University, MVASL Lab"
+  version: "2.3.1.dev2"
+  date-released: "2025-08-01"
+  url: "https://github.com/sjtu-mvasl-robotics/rsl_rl"

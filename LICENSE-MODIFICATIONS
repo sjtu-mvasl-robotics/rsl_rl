@@ -3,7 +3,6 @@ All rights reserved.
 
 This software contains modifications and enhancements to the original RSL RL 
 framework developed by ETH Zurich and NVIDIA CORPORATION & AFFILIATES.
-See licenses/original/LICENSE-ORIGINAL for the original licensing terms.
 
 Redistribution and use in source and binary forms, with or without modification,
 are permitted provided that the following conditions are met:
@@ -32,21 +31,27 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## Original Work Attribution
 
-This work is based on the original RSL RL framework:
+This work is based on and contains substantial portions of the original RSL RL 
+framework. Please see the original LICENSE file for the licensing terms of the 
+base framework.
+
+The original RSL RL framework is:
 - Copyright (c) 2021, ETH Zurich, Nikita Rudin  
 - Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES
-- Original repository: https://github.com/leggedrobotics/rsl_rl
-- Original license: licenses/original/LICENSE-ORIGINAL
 
-## Modifications for GBC Project
+Original repository: https://github.com/leggedrobotics/rsl_rl
 
-This enhanced version includes modifications specifically designed for the 
-GBC (Generalized Behavior-Cloning Framework for Whole-Body Humanoid Imitation) project:
+## Modifications and Enhancements
+
+This fork includes the following major modifications and enhancements by 
+Shanghai Jiao Tong University, MVASL Lab:
 
 - RSL RL MM Series Interface for multi-modal imitation learning
 - Enhanced environment interface with reference observation support
 - Student-teacher transformer architectures
 - Multi-modal PPO implementation
 - Distillation algorithms for knowledge transfer
+- Integration with GBC (Gradient-Based Control) project
 
-All modifications are licensed under the same BSD-3-Clause license terms.
+All modifications are licensed under the same BSD-3-Clause license terms as 
+stated above.

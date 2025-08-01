@@ -101,3 +101,47 @@ Environment repositories using the framework:
 
 * `Legged-Gym` (built on top of NVIDIA Isaac Gym): https://leggedrobotics.github.io/legged_gym/
 * `Orbit` (built on top of NVIDIA Isaac Sim): https://isaac-orbit.github.io/
+
+## Citation
+
+If you use this software in your research, please cite it as follows:
+
+```bibtex
+@software{rsl_rl_gbc_2025,
+  title = {RSL RL for GBC: Enhanced Framework for Whole-Body Humanoid Imitation},
+  author = {Yao, Yifei},
+  url = {https://github.com/sjtu-mvasl-robotics/rsl_rl},
+  version = {2.3.1.dev2},
+  year = {2025},
+  month = {8},
+  day = {1},
+  note = {Enhanced version of RSL RL for GBC project. Original RSL RL by ETH Zurich and NVIDIA.}
+}
+```
+
+For the original RSL RL framework, please cite:
+```bibtex
+@misc{rsl_rl_original,
+  title = {RSL RL},
+  author = {Rudin, Nikita and Hoeller, David and Reist, Philipp and Hutter, Marco},
+  url = {https://github.com/leggedrobotics/rsl_rl},
+  year = {2021}
+}
+```
+
+You can also use the DOI from Zenodo (available after creating a release): [![DOI](https://zenodo.org/badge/DOI/YOUR_DOI_HERE.svg)](https://doi.org/YOUR_DOI_HERE)
+
+## License
+
+This enhanced version is licensed under BSD-3-Clause:
+- **This Version**: Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab, Yifei Yao
+
+**Original Framework Attribution**:
+- Copyright (c) 2021, ETH Zurich, Nikita Rudin
+- Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES
+- Original license: `licenses/original/LICENSE-ORIGINAL`
+- Original repository: https://github.com/leggedrobotics/rsl_rl
+
+This work contains substantial modifications specifically designed for the GBC 
+(Generalized Behavior-Cloning Framework for Whole-Body Humanoid Imitation) project, 
+while preserving compatibility with the original framework's interface where possible.
