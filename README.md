@@ -1,6 +1,6 @@
-# RSL RL
+# RSL RL for GBC
 
-Re-implemented some components for better imitation learning.
+Re-implemented some components for better imitation learning. For details please refer to [GBC](https://github.com/sjtu-mvasl-robotics/GBC.git)
 
 **!!! Important !!!**:
 
@@ -134,7 +134,7 @@ You can also use the DOI from Zenodo (available after creating a release): [![DO
 ## License
 
 This enhanced version is licensed under BSD-3-Clause:
-- **This Version**: Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab, Yifei Yao
+- **This Version**: Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab, Yifei Yao & Chengyuan Luo
 
 **Original Framework Attribution**:
 - Copyright (c) 2021, ETH Zurich, Nikita Rudin
