@@ -12,6 +12,10 @@ authors:
     given-names: "Yifei"
     orcid: "https://orcid.org/0009-0002-0709-4364"
     affiliation: "Shanghai Jiao Tong University, MVASL Lab"
+
+  - family-names: "Luo"
+    given-names: "Chengyuan"
+    affiliation: "Shanghai Jiao Tong University, MVASL Lab"
 license: "BSD-3-Clause"
 keywords:
   - "reinforcement learning"
@@ -29,6 +33,9 @@ preferred-citation:
     - family-names: "Yao"
       given-names: "Yifei"
       orcid: "https://orcid.org/0009-0002-0709-4364"
+      affiliation: "Shanghai Jiao Tong University, MVASL Lab"
+    - family-names: "Luo"
+      given-names: "Chengyuan"
       affiliation: "Shanghai Jiao Tong University, MVASL Lab"
   version: "2.3.1.dev2"
   date-released: "2025-08-01"

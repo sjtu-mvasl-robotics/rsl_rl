@@ -109,7 +109,7 @@ If you use this software in your research, please cite it as follows:
 ```bibtex
 @software{rsl_rl_gbc_2025,
   title = {RSL RL for GBC: Enhanced Framework for Whole-Body Humanoid Imitation},
-  author = {Yao, Yifei},
+  author = {Yao, Yifei and Luo, Chengyuan},
   url = {https://github.com/sjtu-mvasl-robotics/rsl_rl},
   version = {2.3.1.dev2},
   year = {2025},
