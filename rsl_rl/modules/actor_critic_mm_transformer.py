@@ -534,7 +534,7 @@ class MMTransformerV2(nn.Module):
         ref_obs_size = sum(ref_term_dict.values()) if ref_term_dict else 0
         self.in_size = obs_size + ref_obs_size
         self.mlp_residual = nn.Sequential(
-            nn.Linear(obs_size + ref_obs_size, 768),
+            nn.Linear(obs_size, 768),
             nn.GELU(),
             nn.Linear(768, 384),
             nn.GELU(),
@@ -651,11 +651,11 @@ class MMTransformerV2(nn.Module):
         
         if self.mlp_residual is not None:
             obs_in = obs
-            if ref_obs is not None:
-                obs_in = torch.cat([obs, ref_obs_tensor], dim=1)
+            # if ref_obs is not None:
+            #     obs_in = torch.cat([obs, ref_obs_tensor], dim=1)
             
-            if obs_in.size(1) != self.in_size: # use zero padding
-                obs_in = F.pad(obs_in, (0, self.in_size - obs_in.size(1)), value=0.0)
+            # if obs_in.size(1) != self.in_size: # use zero padding
+            #     obs_in = F.pad(obs_in, (0, self.in_size - obs_in.size(1)), value=0.0)
                 
             # x = x + self.mlp_residual(obs_in) * self.mlp_weight
             gate = F.sigmoid(self.gate_linear(x))
@@ -845,8 +845,7 @@ class ActorCriticMMTransformer(nn.Module):
         assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
         self.actor = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", dropout=dropout, **kwargs)
         self.actor_dagger = MMTransformer(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, **kwargs) if load_dagger else None
-        if load_actor_path:
-            self.load_actor_weights(load_actor_path)
+        
 
         # Action noise
         self.noise_std_type = noise_std_type
@@ -866,6 +865,11 @@ class ActorCriticMMTransformer(nn.Module):
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             
         self.critic = MMTransformer(num_critic_obs, num_critic_ref_obs, 1, dim_model, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", dropout=dropout, **kwargs) # 1 for value function
+        
+        if load_actor_path:
+            self.load_actor_weights(load_actor_path)
+            
+            
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")
@@ -894,16 +898,28 @@ class ActorCriticMMTransformer(nn.Module):
         model_state_dict = state_dict['model_state_dict']
         # load the actor_dagger weights through layer name matching (starting with 'actor')
         actor_weights = {k[len('actor.'):]: v for k, v in model_state_dict.items() if k.startswith('actor')}
+        critic_weights = {k[len('critic.'):]: v for k, v in model_state_dict.items() if k.startswith('critic')}
         actor_state_dict = self.actor.state_dict()
+        critic_state_dict = self.critic.state_dict()
         # perform weights checking
         for k, v in actor_weights.items():
             if k not in actor_state_dict:
-                raise KeyError(f"Key {k} not found in actor_dagger state_dict")
+                raise KeyError(f"Key {k} not found in actor state_dict")
             if actor_state_dict[k].shape != v.shape:
                 raise ValueError(f"Shape mismatch for key {k}: {actor_state_dict[k].shape} vs {v.shape}")
+            
+        # perform actor state dict fullfilling
+        for k, v in actor_state_dict.items():
+            if k not in actor_weights:
+                actor_weights[k] = v
+                
+        for k, v in critic_state_dict.items():
+            if k not in critic_weights:
+                critic_weights[k] = v
         # load the weights
         # self.actor.load_state_dict(dagger_weights)
         self.actor.load_state_dict(actor_weights)
+        self.critic.load_state_dict(critic_weights)
         print(f"Loaded dagger weights from {path} to actor_dagger")
         
     def load_dagger_weights(self, path):
@@ -1169,8 +1185,7 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        if load_actor_path:
-            self.load_actor_weights(load_actor_path)
+        
         if load_dagger:
             self.load_dagger_weights(load_dagger_path)
             lora_r = kwargs.get('lora_r', 8)
@@ -1180,6 +1195,8 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             
         self.critic = MMTransformerV2(1, dim_model, term_dict["critic"], ref_term_dict["critic"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", dropout=dropout, concatenate_term_names=concatenate_term_names["critic"], concatenate_ref_term_names=concatenate_ref_term_names["critic"], history_length=history_length, **kwargs) # 1 for value function
+        if load_actor_path:
+            self.load_actor_weights(load_actor_path)
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")
