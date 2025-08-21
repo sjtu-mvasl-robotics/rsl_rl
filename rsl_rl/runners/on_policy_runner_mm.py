@@ -229,6 +229,7 @@ class OnPolicyRunnerMM:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         if self.amp_cfg:
             amp_rewbuffer = deque(maxlen=100)
+            amp_prev_neg_score = 0.45
             amp_scorebuffer = deque(maxlen=100)
             amp_score_avgbuffer = deque(maxlen=100)
             cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
@@ -317,6 +318,8 @@ class OnPolicyRunnerMM:
                             amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(obs, env=self.amp_cfg["_env"])
                             amp_rewards = self.alg.amp.amp_reward(amp_prev_obs, amp_obs, epsilon=self.amp_cfg["epsilon"])
                             amp_score = self.alg.amp.amp_score(amp_prev_obs, amp_obs)
+                            amp_relative_score = amp_score - amp_prev_neg_score
+                            amp_rewards += amp_relative_score * 5
                             rewards += amp_rewards * self.amp_cfg["amp_reward_scale"]
                             cur_amp_reward_sum += amp_rewards * self.amp_cfg["amp_reward_scale"]
                             cur_amp_score_sum += amp_score
@@ -359,6 +362,8 @@ class OnPolicyRunnerMM:
                     self.alg.compute_returns(critic_obs)
 
             loss_dict = self.alg.update(epoch=it)
+            if self.amp_cfg is not None:
+                amp_prev_neg_score = loss_dict["mean_pred_pos_prob"]
 
             stop = time.time()
             learn_time = stop - start

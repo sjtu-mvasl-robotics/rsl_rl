@@ -534,7 +534,7 @@ class MMTransformerV2(nn.Module):
         ref_obs_size = sum(ref_term_dict.values()) if ref_term_dict else 0
         self.in_size = obs_size + ref_obs_size
         self.mlp_residual = nn.Sequential(
-            nn.Linear(obs_size, 768),
+            nn.Linear(self.in_size, 768),
             nn.GELU(),
             nn.Linear(768, 384),
             nn.GELU(),
@@ -651,15 +651,16 @@ class MMTransformerV2(nn.Module):
         
         if self.mlp_residual is not None:
             obs_in = obs
-            # if ref_obs is not None:
-            #     obs_in = torch.cat([obs, ref_obs_tensor], dim=1)
+            if ref_obs is not None:
+                obs_in = torch.cat([obs, ref_obs_tensor], dim=1)
             
-            # if obs_in.size(1) != self.in_size: # use zero padding
-            #     obs_in = F.pad(obs_in, (0, self.in_size - obs_in.size(1)), value=0.0)
+            if obs_in.size(1) != self.in_size: # use zero padding
+                obs_in = F.pad(obs_in, (0, self.in_size - obs_in.size(1)), value=0.0)
                 
             # x = x + self.mlp_residual(obs_in) * self.mlp_weight
-            gate = F.sigmoid(self.gate_linear(x))
-            y = gate * y + (1 - gate) * self.mlp_residual(obs_in)
+            # gate = F.sigmoid(self.gate_linear(x))
+            # y = gate * y + (1 - gate) * self.mlp_residual(obs_in)
+            y = y + self.mlp_residual(obs_in)
         # x = self.out_ls(x)
         return y
 
@@ -920,7 +921,7 @@ class ActorCriticMMTransformer(nn.Module):
         # self.actor.load_state_dict(dagger_weights)
         self.actor.load_state_dict(actor_weights)
         self.critic.load_state_dict(critic_weights)
-        print(f"Loaded dagger weights from {path} to actor_dagger")
+        print(f"Loaded actor weights from {path} to actor and critic")
         
     def load_dagger_weights(self, path):
         state_dict = torch.load(path, map_location="cpu")
