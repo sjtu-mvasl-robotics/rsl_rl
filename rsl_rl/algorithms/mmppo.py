@@ -14,7 +14,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import itertools
 
-from rsl_rl.modules import ActorCriticMMTransformer, AMPNet
+from rsl_rl.modules import ActorCriticMMTransformer, AMPNet, ActorCriticMMTransformerV2, ActorCriticMMGPT
 from rsl_rl.storage import RolloutStorageMM
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.utils import string_to_callable
@@ -67,7 +67,7 @@ class L2Loss(nn.Module):
         return loss.mean()
 
 class MMPPO:
-    actor_critic: ActorCriticMMTransformer
+    actor_critic: ActorCriticMMTransformer | ActorCriticMMTransformerV2 | ActorCriticMMGPT
 
     def __init__(
         self,
@@ -307,8 +307,8 @@ class MMPPO:
             self.amp.train()
 
     def act(self, obs, ref_obs, critic_obs, ref_critic_obs):
-        if self.actor_critic.is_recurrent:
-            self.transition.hidden_states = self.actor_critic.get_hidden_states()
+        # if self.actor_critic.is_recurrent:
+        #     self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values
         self.transition.actions = self.actor_critic.act(obs, ref_observations=ref_obs).detach()
         self.transition.values = self.actor_critic.evaluate(critic_obs, ref_critic_observations=ref_critic_obs).detach()
@@ -383,8 +383,8 @@ class MMPPO:
             mean_pred_pos_prob = 0.0
             mean_pred_neg_prob = 0.0
 
-        # if self.actor_critic.is_recurrent:
-        #     generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs) #
+        if self.actor_critic.is_recurrent:
+            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         # else:
         assert self.actor_critic.is_recurrent == False, "MM-PPO does not support recurrent actor-critic networks."
         assert self.storage is not None, "Storage is not initialized. Please call init_storage before update."
@@ -409,6 +409,9 @@ class MMPPO:
             obs_prev_state,
             ref_obs_prev_state,
             ref_obs_prev_mask,
+            obs_cur_state,
+            ref_obs_cur_state,
+            ref_obs_cur_mask,
         ) in generator:
            
 
@@ -434,19 +437,16 @@ class MMPPO:
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
             with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch)
+                self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, mask=masks_batch)
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
                 value_batch = self.actor_critic.evaluate(
-                    critic_obs_batch, ref_critic_observations=critic_ref_obs_batch
+                    critic_obs_batch, ref_critic_observations=critic_ref_obs_batch,
+                    masks=masks_batch
                 )
 
             mu_batch = self.actor_critic.action_mean[:original_batch_size]
             sigma_batch = self.actor_critic.action_std[:original_batch_size]
             entropy_batch = self.actor_critic.entropy[:original_batch_size]
-
-            if self.amp:
-                obs_cur_state = string_to_callable(self.amp_cfg["amp_obs_extractor"])(obs_batch, env=self.amp_cfg["_env"])
-                ref_obs_cur_state, ref_obs_cur_mask = string_to_callable(self.amp_cfg["amp_ref_obs_extractor"])(ref_obs_batch, env=self.amp_cfg["_env"])
 
             # Imitation Entropy loss (optional, arxiv: 2409.08904)
             # This loss is calculated only when critic_ref_obs_batch is not None, otherwise 0.0
@@ -525,7 +525,7 @@ class MMPPO:
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
                     with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                        mean_actions_batch = self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch)
+                        mean_actions_batch = self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch, mask=masks_batch)
 
                         action_mean_orig = mean_actions_batch[:original_batch_size]
                         _, _, actions_mean_symm_batch = data_augmentation_func(
@@ -568,7 +568,8 @@ class MMPPO:
                 self.scaler.unscale_(self.optimizer)
             print_gpu_memory_summary("After backward pass")
 
-            if self.amp:
+            if self.amp and (obs_prev_state is not None and obs_cur_state is not None and ref_obs_prev_state is not None and ref_obs_cur_state is not None and ref_obs_prev_mask is not None and ref_obs_cur_mask is not None):
+
                 # amp_optimization_steps = self.amp_cfg.get("amp_optimization_steps", 3)
                 policy_score = self.amp.forward(torch.cat([obs_prev_state, obs_cur_state], dim=-1))
                 expert_score = self.amp.forward(torch.cat([ref_obs_prev_state, ref_obs_cur_state], dim=-1))

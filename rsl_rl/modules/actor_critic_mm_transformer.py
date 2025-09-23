@@ -286,7 +286,9 @@ class MMTransformer(nn.Module):
     def forward(
         self, 
         obs: torch.Tensor, 
-        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        masks=None,
+        **kwargs
     ) -> torch.Tensor:
         """
         Forward pass for the multi-modality transformer.
@@ -443,7 +445,9 @@ class MMTransformerWithSeqLen(nn.Module):
     def forward(
         self, 
         obs: torch.Tensor, 
-        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        masks=None,
+        **kwargs
     ) -> torch.Tensor:
 
         embeddings = []
@@ -546,7 +550,9 @@ class MMTransformerV2(nn.Module):
     def forward(
         self, 
         obs: torch.Tensor, 
-        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        masks=None,
+        **kwargs
     ) -> torch.Tensor:
         """
         Forward pass for the multi-modality transformer.
@@ -712,7 +718,9 @@ class Transformer(nn.Module):
     def forward(
         self, 
         obs: torch.Tensor, 
-        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        masks=None,
+        **kwargs
     ) -> torch.Tensor:
         """
         Forward pass for the multi-modality transformer.
@@ -794,7 +802,9 @@ class DebugMLP(nn.Module):
     def forward(
         self, 
         obs: torch.Tensor, 
-        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        masks=None,
+        **kwargs
     ) -> torch.Tensor:
         """
         Forward pass for the multi-modality transformer.
@@ -878,18 +888,7 @@ class ActorCriticMMTransformer(nn.Module):
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
-        
-    # def load_state_dict(self, state_dict, strict = True, assign = False):
-    #     actor_weights = {k[len('actor.'):]: v for k, v in state_dict.items() if k.startswith('actor.')}
-    #     critic_weights = {k[len('critic.'):]: v for k, v in state_dict.items() if k.startswith('critic.')}
-    #     # load the actor weights through layer name matching (starting with 'actor')
-    #     self.actor.load_state_dict(actor_weights, strict = strict)
-    #     self.critic.load_state_dict(critic_weights, strict = strict)
-    #     print(f"Loaded actor weights from {state_dict} to actor")
-    #     if self.actor_dagger is not None:
-    #         dagger_weights = {k[len('actor_dagger.'):]: v for k, v in state_dict.items() if k.startswith('actor_dagger')}
-    #         self.actor_dagger.load_state_dict(dagger_weights, strict = strict)
-    #         print(f"Loaded dagger weights from {state_dict} to actor_dagger")
+
 
     def load_actor_weights(self, path):
         state_dict = torch.load(path, map_location="cpu")
@@ -1023,8 +1022,8 @@ class ActorCriticMMTransformer(nn.Module):
     def entropy_dagger(self):
         return self.distribution_dagger.entropy().sum(dim=-1)
 
-    def update_distribution(self, observations, ref_observations=None):
-        mean = self.actor(observations, ref_observations)
+    def update_distribution(self, observations, ref_observations=None, **kwargs):
+        mean = self.actor(observations, ref_observations, **kwargs)
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
         elif self.noise_std_type == "log":
@@ -1034,13 +1033,13 @@ class ActorCriticMMTransformer(nn.Module):
         self.distribution = Normal(mean, std)
 
     def act(self, observations, ref_observations=None, **kwargs):
-        self.update_distribution(observations, ref_observations)
+        self.update_distribution(observations, ref_observations, **kwargs)
         sample = self.distribution.sample()
         return sample
     
-    def update_distribution_dagger(self, observations, ref_observations=None):
+    def update_distribution_dagger(self, observations, ref_observations=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
-        mean = self.actor_dagger(observations, ref_observations)
+        mean = self.actor_dagger(observations, ref_observations, **kwargs)
         if self.noise_std_type == "scalar":
             std = self.std_dagger.expand_as(mean)
         elif self.noise_std_type == "log":
@@ -1049,17 +1048,14 @@ class ActorCriticMMTransformer(nn.Module):
    
     def act_dagger(self, observations, ref_observations=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
-        self.update_distribution_dagger(observations, ref_observations)
+        self.update_distribution_dagger(observations, ref_observations, **kwargs)
         sample = self.distribution_dagger.sample()
         return sample
     
     def act_dagger_inference(self, observations, ref_observations=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
-        actions_mean = self.actor_dagger(observations, ref_observations)
+        actions_mean = self.actor_dagger(observations, ref_observations, **kwargs)
         return actions_mean
-    
-    def act_inference(self, observations, ref_observations=None):
-        return self.actor(observations, ref_observations)
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
@@ -1067,12 +1063,12 @@ class ActorCriticMMTransformer(nn.Module):
     def get_actions_log_prob_dagger(self, actions):
         return self.distribution_dagger.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations, ref_observations=None):
-        actions_mean = self.actor(observations, ref_observations)
+    def act_inference(self, observations, ref_observations=None, **kwargs):
+        actions_mean = self.actor(observations, ref_observations, **kwargs)
         return actions_mean
 
-    def evaluate(self, critic_observations, ref_critic_observations =None, **kwargs):
-        value = self.critic(critic_observations, ref_critic_observations)
+    def evaluate(self, critic_observations, ref_critic_observations=None, **kwargs):
+        value = self.critic(critic_observations, ref_critic_observations, **kwargs)
         return value
 
 class ActorCriticDebugMLP(nn.Module):
@@ -1128,27 +1124,27 @@ class ActorCriticDebugMLP(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
-    def update_distribution(self, observations, ref_observations=None):
-        mean = self.actor(observations, ref_observations)
+    def update_distribution(self, observations, ref_observations=None, **kwargs):
+        mean = self.actor(observations, ref_observations, **kwargs)
         self.distribution = Normal(mean, 0.0 * mean + self.std)
 
     def act(self, observations, ref_observations=None, **kwargs):
-        self.update_distribution(observations, ref_observations)
+        self.update_distribution(observations, ref_observations, **kwargs)
         sample = self.distribution.sample()
         return sample
         
-    def act_inference(self, observations, ref_observations=None):
-        return self.actor(observations, ref_observations)
+    # def act_inference(self, observations, ref_observations=None, **kwargs):
+    #     return self.actor(observations, ref_observations, **kwargs)
 
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations, ref_observations=None):
-        actions_mean = self.actor(observations, ref_observations)
+    def act_inference(self, observations, ref_observations=None, **kwargs):
+        actions_mean = self.actor(observations, ref_observations, **kwargs)
         return actions_mean
 
-    def evaluate(self, critic_observations, ref_critic_observations =None, **kwargs):
-        value = self.critic(critic_observations, ref_critic_observations)
+    def evaluate(self, critic_observations, ref_critic_observations=None, **kwargs):
+        value = self.critic(critic_observations, ref_critic_observations, **kwargs)
         return value
     
 
