@@ -14,12 +14,32 @@ import torch.optim as optim
 import torch.nn.functional as F
 import itertools
 
+from torch.xpu import memory
+
 from rsl_rl.modules import ActorCriticMMTransformer, AMPNet, ActorCriticMMTransformerV2, ActorCriticMMGPT
 from rsl_rl.storage import RolloutStorageMM
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.utils import string_to_callable
 import time
 
+class DebugHook:
+    def __init__(self, name):
+        self.name = name
+
+    def __call__(self, module, input):
+        tensor = input[0]
+        print(f"--- Hook at: {self.name} ---")
+        print(f"dtype: {tensor.dtype}, shape: {tensor.shape}, device: {tensor.device}")
+        print(f"has_nan: {torch.isnan(tensor).any().item()}")
+        print(f"std: {tensor.std().item():.6f}, mean: {tensor.mean().item():.6f}")
+        print(f"min: {tensor.min().item():.6f}, max: {tensor.max().item():.6f}")
+        if tensor.std().item() == 0.0:
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print("!!!!!! WARNING: STANDARD DEVIATION IS ZERO !!!!!!")
+            print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("-" * (len(self.name) + 14))
+        
+        
 def print_gpu_memory_summary(point_in_code: str):
     """Prints a detailed summary of the VRAM usage."""
     return # disable debug print. Comment this out to enable debug print.
@@ -386,7 +406,7 @@ class MMPPO:
         if self.actor_critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         # else:
-        assert self.actor_critic.is_recurrent == False, "MM-PPO does not support recurrent actor-critic networks."
+        # assert self.actor_critic.is_recurrent == False, "MM-PPO does not support recurrent actor-critic networks."
         assert self.storage is not None, "Storage is not initialized. Please call init_storage before update."
         print_gpu_memory_summary("before mini_batch_generator")
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -437,11 +457,11 @@ class MMPPO:
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
             with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, mask=masks_batch)
+                self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, mask=masks_batch, memory=hid_states_batch)
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
                 value_batch = self.actor_critic.evaluate(
                     critic_obs_batch, ref_critic_observations=critic_ref_obs_batch,
-                    masks=masks_batch
+                    masks=masks_batch, memory=hid_states_batch
                 )
 
             mu_batch = self.actor_critic.action_mean[:original_batch_size]
@@ -562,7 +582,53 @@ class MMPPO:
             # Gradient step
             self.optimizer.zero_grad()
             if not self.auto_mix_precision:
-                loss.backward()
+                try:
+                    loss.backward()
+                except RuntimeError as e:
+                    print(f"Backward NaN detected, beginning debug hooks...")
+                    
+                    print("Saving the problematic batch to 'debug_batch.pt' for further analysis.")
+                    torch.save({
+                        'obs_batch': obs_batch,
+                        'ref_obs_batch': ref_obs_batch,
+                        'critic_obs_batch': critic_obs_batch,
+                        'critic_ref_obs_batch': critic_ref_obs_batch,
+                        'actions_batch': actions_batch,
+                        'target_values_batch': target_values_batch,
+                        'advantages_batch': advantages_batch,
+                        'returns_batch': returns_batch,
+                        'old_actions_log_prob_batch': old_actions_log_prob_batch,   
+                        'old_mu_batch': old_mu_batch,
+                        'old_sigma_batch': old_sigma_batch,
+                        'dagger_actions_batch': dagger_actions_batch,
+                        'hid_states_batch': hid_states_batch,
+                        'masks_batch': masks_batch,
+                        'rnd_state_batch': rnd_state_batch,
+                        'obs_prev_state': obs_prev_state,
+                        'ref_obs_prev_state': ref_obs_prev_state,
+                        'ref_obs_prev_mask': ref_obs_prev_mask,
+                        'obs_cur_state': obs_cur_state,
+                        'ref_obs_cur_state': ref_obs_cur_state,
+                        'ref_obs_cur_mask': ref_obs_cur_mask,
+                    }, 'debug_batch.pt')
+                    
+                    print("Registering debug hooks to actor.decoder and critic.decoder...")
+                    actor_hooks = []
+                    critic_hooks = []
+                    for i, layer in enumerate(self.actor_critic.actor.decoder.encoder.layers):
+                        hook = layer.register_forward_pre_hook(DebugHook(f"actor.decoder.layer.{i}"))
+                        actor_hooks.append(hook)
+                    for i, layer in enumerate(self.actor_critic.critic.decoder.encoder.layers):
+                        hook = layer.register_forward_pre_hook(DebugHook(f"critic.decoder.layer.{i}"))
+                        critic_hooks.append(hook)
+                    # Re-run forward pass to trigger hooks: act & evaluate
+                    self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, mask=masks_batch, memory=hid_states_batch)
+                    _ = self.actor_critic.evaluate(
+                        critic_obs_batch, ref_critic_observations=critic_ref_obs_batch,
+                        masks=masks_batch, memory=hid_states_batch
+                    )
+                    print("Debug hooks executed. Please check the outputs above for anomalies.")
+                    raise e
             else:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)

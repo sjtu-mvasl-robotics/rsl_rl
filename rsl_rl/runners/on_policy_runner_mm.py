@@ -86,7 +86,7 @@ class OnPolicyRunnerMM:
 
         actor_critic_name = self.policy_cfg.pop("class_name")
         actor_critic_class = eval(actor_critic_name)  # ActorCritic
-        if actor_critic_name == "ActorCriticMMTransformerV2":
+        if actor_critic_name == "ActorCriticMMTransformerV2" or actor_critic_name == "ActorCriticMMGPT":
             def get_term_dict(dict_names, dict_dims):
                 ret = dict(
                     (key, dict((name, dim[0]) for name, dim in zip(dict_names[key], dict_dims[key]) if dim[0] > 0))
@@ -95,16 +95,24 @@ class OnPolicyRunnerMM:
                 if "critic" not in ret:
                     ret["critic"] = ret["policy"]
                 return ret
-            actor_critic_dim = {
-                "term_dict": get_term_dict(
-                    self.env.unwrapped.observation_manager.active_terms,
-                    self.env.unwrapped.observation_manager.group_obs_term_dim,
-                ),
-                "ref_term_dict": get_term_dict(
-                    self.env.unwrapped.ref_observation_manager.active_terms,
-                    self.env.unwrapped.ref_observation_manager.group_ref_obs_term_dim,
-                ),
-            }
+            # actor_critic_dim += {
+            #     "term_dict": get_term_dict(
+            #         self.env.unwrapped.observation_manager.active_terms,
+            #         self.env.unwrapped.observation_manager.group_obs_term_dim,
+            #     ),
+            #     "ref_term_dict": get_term_dict(
+            #         self.env.unwrapped.ref_observation_manager.active_terms,
+            #         self.env.unwrapped.ref_observation_manager.group_ref_obs_term_dim,
+            #     ),
+            # }
+            actor_critic_dim["term_dict"] = get_term_dict(
+                self.env.unwrapped.observation_manager.active_terms,
+                self.env.unwrapped.observation_manager.group_obs_term_dim,
+            )
+            actor_critic_dim["ref_term_dict"] = get_term_dict(
+                self.env.unwrapped.ref_observation_manager.active_terms,
+                self.env.unwrapped.ref_observation_manager.group_ref_obs_term_dim,
+            )
         elif actor_critic_name == "StudentTeacherMMTransformer":
             actor_critic_dim = {
                 "num_teacher_obs": num_critic_obs,
@@ -318,8 +326,8 @@ class OnPolicyRunnerMM:
                             amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(obs, env=self.amp_cfg["_env"])
                             amp_rewards = self.alg.amp.amp_reward(amp_prev_obs, amp_obs, epsilon=self.amp_cfg["epsilon"])
                             amp_score = self.alg.amp.amp_score(amp_prev_obs, amp_obs)
-                            amp_relative_score = amp_score - amp_prev_neg_score
-                            amp_rewards += amp_relative_score * 5
+                            # amp_relative_score = amp_score - amp_prev_neg_score
+                            # amp_rewards += amp_relative_score * 5
                             rewards += amp_rewards * self.amp_cfg["amp_reward_scale"]
                             cur_amp_reward_sum += amp_rewards * self.amp_cfg["amp_reward_scale"]
                             cur_amp_score_sum += amp_score

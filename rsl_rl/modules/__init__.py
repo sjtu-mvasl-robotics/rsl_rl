@@ -11,7 +11,7 @@ from .normalizer import EmpiricalNormalization
 from .rnd import RandomNetworkDistillation
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
-from .actor_critic_mm_transformer import ActorCriticMMTransformer, ActorCriticMMTransformerV2, ActorCriticDebugMLP
+from .actor_critic_mm_transformer import ActorCriticMMTransformer, ActorCriticMMTransformerV2, ActorCriticDebugMLP, SwiGLUEmbedding, group_by_concat_list
 from .actor_critic_mm_gpt import ActorCriticMMGPT
 from .student_teacher_transformer import StudentTeacherMMTransformer, StudentTeacherMMTransformerV2
 from .amp import AMPNet
@@ -25,6 +25,8 @@ __all__ = [
     "StudentTeacherRecurrent",
     "ActorCriticMMTransformer",
     "ActorCriticMMTransformerV2",
+    "group_by_concat_list",
+    "SwiGLUEmbedding",
     "ActorCriticDebugMLP",
     "StudentTeacherMMTransformer",
     "StudentTeacherMMTransformerV2",

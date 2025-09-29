@@ -4,10 +4,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
-
 import warnings
-from rsl_rl.modules import ActorCritic, ActorCriticMMTransformer
-from rsl_rl.networks import Memory
+from rsl_rl.modules import ActorCritic, ActorCriticMMTransformer, SwiGLUEmbedding, group_by_concat_list
+from rsl_rl.networks import Memory, RoPETransformer
 from rsl_rl.utils import resolve_nn_activation, unpad_trajectories
 import torch
 import torch.nn as nn
@@ -15,10 +14,10 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend
 from torch.distributions import Normal
 import math
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Dict
 
 
-# Sequence Compressor
+# Sequence Compressor (Deprecated)
 class SequenceCompressor(nn.Module):
     """
     Compress the input sequence by a given stride using linear projection and max pooling.
@@ -30,6 +29,7 @@ class SequenceCompressor(nn.Module):
         self.pool = nn.MaxPool1d(kernel_size=stride, stride=stride)
 
     def forward(self, seq: torch.Tensor, masks: torch.Tensor):
+        raise NotImplementedError("This class is deprecated. Please use Conv1dCompressor instead.")
         # seq: [T, B, D], masks: [T, B]
         T, B, D = seq.shape
         
@@ -57,11 +57,60 @@ class SequenceCompressor(nn.Module):
         return compressed_seq, new_masks
     
 
+# Compressor using Conv1d
+class Conv1dCompressor(nn.Module):
+    def __init__(self, d_model: int, stride: int, kernel_size: int):
+        super().__init__()
+        self.stride = stride
+        self.kernel_size = kernel_size
+        self.padding = (self.kernel_size - self.stride) // 2
+        
+        self.conv = nn.Conv1d(d_model, d_model, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+        self.pool = nn.MaxPool1d(kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+
+    def forward(self, seq: torch.Tensor, masks: torch.Tensor):
+        # seq: [T, B, D], masks: [T, B]
+        
+        # 1. Pre-padding to ensure correct structure
+        T, B, D = seq.shape
+        padding_needed = (self.stride - T % self.stride) % self.stride
+        if padding_needed > 0:
+            seq = F.pad(seq, (0, 0, 0, 0, 0, padding_needed))
+            masks = F.pad(masks, (0, 0, 0, padding_needed), value=False)
+
+        # 2. Conv1d
+        compressed_seq = self.conv(seq.permute(1, 2, 0)).permute(2, 0, 1)
+        
+        # 3. MaxPool1d for new masks
+        mask_for_pool = masks.permute(1, 0).unsqueeze(1).float()
+        new_mask_permuted = self.pool(mask_for_pool)
+        new_masks = new_mask_permuted.squeeze(1).permute(1, 0).bool()
+        
+        return compressed_seq, new_masks
+    
+    
+class ConvTranspose1dCompressor(nn.Module):
+    def __init__(self, d_model, stride=2, kernel_size=4):
+        super().__init__()
+        padding = (kernel_size - stride) // 2
+        
+        self.unconv = nn.ConvTranspose1d(d_model, d_model, kernel_size=kernel_size, stride=stride, padding=padding)
+
+    def forward(self, compressed_seq: torch.Tensor, original_len: int):
+
+        seq_permuted = compressed_seq.permute(1, 2, 0)
+        
+        upsampled_permuted = self.unconv(seq_permuted)
+        
+        upsampled_seq = upsampled_permuted.permute(2, 0, 1)
+        
+        return upsampled_seq[:original_len, :, :]
+
 class ObservationSeqEmbedding(nn.Module):
     """
     Embed a sequence of observations into a sequence of embeddings using an MLP.
     """
-    def __init__(self, obs_dim: int, d_model: int, mlp_hidden_dims=[256, 128], activation="elu"):
+    def __init__(self, obs_dim: int, d_model: int, mlp_hidden_dims=[64, 32], activation="elu"):
         super().__init__()
         layers = []
         current_dim = obs_dim
@@ -71,13 +120,56 @@ class ObservationSeqEmbedding(nn.Module):
             current_dim = hidden_dim
         layers.append(nn.Linear(current_dim, d_model))
         self.projector = nn.Sequential(*layers)
+        # self.norm = nn.LayerNorm(d_model)
 
     def forward(self, obs_seq: torch.Tensor):
         # obs_seq shape: [T, B, obs_dim]
         T, B, _ = obs_seq.shape
-        obs_flat = obs_seq.view(T * B, -1)
+        obs_flat = obs_seq.reshape(T * B, -1)
         embedding_flat = self.projector(obs_flat)
-        return embedding_flat.view(T, B, -1)
+        # embedding_flat = self.norm(embedding_flat)
+        return embedding_flat.reshape(T, B, -1)
+    
+class ObservationSeqEmbeddingV2(nn.Module):
+    def __init__(self, d_model: int, term_dict: Dict[str, int], concatenate_term_names: Optional[List[List[str]]] = None, **kwargs):
+        super().__init__()
+        
+        self.term_names = list(term_dict.keys())
+        self.term_dims = list(term_dict.values())
+        
+        self.group_term_names, self.group_term_dims, self.group_term_idx = group_by_concat_list(term_dict, concatenate_term_names)
+        
+        self.num_groups = len(self.group_term_names)
+        self.d_model = d_model
+        self.embeddings = nn.ModuleList([
+            SwiGLUEmbedding(sum(dims), d_model, 1) for dims in self.group_term_dims
+        ])
+        
+        self.norm = nn.LayerNorm(d_model)
+        
+        start = 0
+        self.term_slices = []
+        for dim in self.term_dims:
+            self.term_slices.append(slice(start, start + dim))
+            start += dim
+
+    def forward(self, obs_seq: torch.Tensor):
+        # [T, B, obs_dim]
+        T, B, _ = obs_seq.shape
+        
+        # [T * B, obs_dim]
+        obs_flat = obs_seq.view(T * B, -1)
+        
+        token_list = []
+        for i, group_term_idx in enumerate(self.group_term_idx):
+            group_obs_flat = torch.cat([obs_flat[:, self.term_slices[j]] for j in group_term_idx], dim=-1)
+            
+            token_i = self.embeddings[i](group_obs_flat) # [T * B, d_model]
+            token_list.append(token_i)
+        structural_token_seq = torch.stack(token_list, dim=1)
+        pooled_embedding_flat = torch.mean(structural_token_seq, dim=1)
+        normalized_embedding_flat = self.norm(pooled_embedding_flat)
+        return normalized_embedding_flat.view(T, B, self.d_model)
     
 
 class MMGPT(nn.Module):
@@ -86,15 +178,20 @@ class MMGPT(nn.Module):
         obs_size, # actually, it should be named by obs_dim, but I maintained the original name for consistency
         ref_obs_size,
         dim_out,
-        dim_model = 256,
-        num_heads = 8,
-        num_layers = 3,
+        dim_model = 64,
+        num_heads = 2,
+        num_layers = 2,
         ffn_ratio = 4,
         dropout = 0.0,
         name = "",
+        term_dict = None,
+        ref_term_dict = None,
+        concatenate_term_names: Optional[List[List[str]]] = None,
+        ref_concatenate_term_names: Optional[List[List[str]]] = None,
         num_steps_per_env = 24, # default, remember to parse this!
-        max_seq_len = 16, 
-        mlp_hidden_dims = [256, 128],
+        max_seq_len = 24, 
+        mlp_hidden_dims = [],
+        apply_rope = False, # default: APE; set True to use RoPE
         **kwargs
     ):
         
@@ -102,47 +199,116 @@ class MMGPT(nn.Module):
         self.name = name
         self.obs_dim = obs_size
         self.ref_obs_dim = ref_obs_size
+        self.num_steps_per_env = num_steps_per_env
+        self.apply_rope = apply_rope
         if kwargs:
             print(
                 f"MMGPT {self.name}.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
             )
         self.stride = math.ceil(num_steps_per_env / max_seq_len) if num_steps_per_env > max_seq_len else 1
-        self.compressed_len = (num_steps_per_env + self.stride - 1) // self.stride
+        # self.compressed_len = (num_steps_per_env + self.stride - 1) // self.stride
         # example calculation: num_steps_per_env=24, max_seq_len=16 -> stride=2, compressed_len=12
-        self.obs_embedding = ObservationSeqEmbedding(obs_size, dim_model, mlp_hidden_dims)
-        self.ref_obs_embedding = ObservationSeqEmbedding(ref_obs_size, dim_model, mlp_hidden_dims) if ref_obs_size > 0 else None
+        # self.obs_embedding = ObservationSeqEmbedding(obs_size, dim_model, mlp_hidden_dims)
+        # self.ref_obs_embedding = ObservationSeqEmbedding(ref_obs_size, dim_model, mlp_hidden_dims) if ref_obs_size > 0 else None
+        self.obs_embedding = ObservationSeqEmbeddingV2(dim_model, term_dict, concatenate_term_names)
+        self.ref_obs_embedding = ObservationSeqEmbeddingV2(dim_model, ref_term_dict, ref_concatenate_term_names) if ref_obs_size > 0 else None
+        self.obs_norm = nn.LayerNorm(dim_model)
+        self.ref_obs_norm = nn.LayerNorm(dim_model) if ref_obs_size > 0 else None
 
-        self.compressor = SequenceCompressor(dim_model, self.stride) if self.stride > 1 else None
+        # self.compressor = SequenceCompressor(dim_model, self.stride) if self.stride > 1 else None
+        self.kernel_size = self.stride * 2 if self.stride > 1 else 1
+        self.padding = (self.kernel_size - self.stride) // 2 if self.kernel_size > self.stride else 0
+        padding_needed = (self.stride - self.num_steps_per_env % self.stride) % self.stride if self.stride > 1 else 0
+        L_in_padded = self.num_steps_per_env + padding_needed
         
-        self.pos_emb = nn.Embedding(self.compressed_len * 2, dim_model) # *2 for obs and ref_obs
+        if self.stride > 1:
+            self.compressed_len = math.floor((L_in_padded + 2 * self.padding - self.kernel_size) / self.stride) + 1
+        else:
+            self.compressed_len = self.num_steps_per_env
+        self.compressor = Conv1dCompressor(dim_model, self.stride, self.kernel_size) if self.stride > 1 else None
+        self.ref_compressor = Conv1dCompressor(dim_model, self.stride, self.kernel_size) if self.stride > 1 and ref_obs_size > 0 else None
+        self.upsampler = ConvTranspose1dCompressor(dim_model, self.stride, self.kernel_size) if self.stride > 1 else None
+        
+        self.pos_emb = nn.Embedding(self.compressed_len, dim_model) if not self.apply_rope else None # *2 for obs and ref_obs
         self.modality_emb = nn.Embedding(2, dim_model) # 0 for obs, 1 for ref_obs
-        encoder_layer = nn.TransformerEncoderLayer(d_model=dim_model, nhead=num_heads, dim_feedforward=ffn_ratio*dim_model, dropout=dropout, activation='gelu', batch_first=True)
-        self.decoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(dim_model, dim_out)
-        
+        if not self.apply_rope:
+            encoder_layer = nn.TransformerEncoderLayer(d_model=dim_model, nhead=num_heads, dim_feedforward=ffn_ratio*dim_model, dropout=dropout, activation='gelu', batch_first=True, norm_first=True)
+            self.decoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        else:
+            self.decoder = RoPETransformer(
+                d_model=dim_model,
+                num_heads=num_heads,
+                num_encoder_layers=num_layers,
+                dim_feedforward=ffn_ratio*dim_model,
+                dropout=dropout,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+                max_seq_len=max_seq_len * 2,
+                use_sdpa=True,
+            )
+        self.fc = nn.Sequential(
+            nn.Linear(dim_model, dim_model * ffn_ratio),
+            nn.ELU(),
+            nn.Linear(dim_model * ffn_ratio, dim_out)
+        )
+
         self.inference_buffer_obs = None # for storing inference-time past key values
         self.inference_buffer_ref_obs = None
         self.inference_buffer_ref_obs_mask = None
+        self.current_timesteps = None  # Track current timesteps for each environment [B,]
         self.num_envs_cache = 0
         
     @staticmethod
     def unpad(padded_sequence, masks):
         return padded_sequence.permute(1, 0, 2)[masks.permute(1, 0)] # shape [valid_length, dim]
+    
+    def generate_mask(self) -> torch.Tensor:
+        """
+        Generate a mask of shape [T_in, B] based on current_timesteps.
+        For each environment b, if its timestep is t (0 <= t < T_in),
+        then positions [0, T_in-t-1] in the sequence are False (masked out), 
+        and positions [T_in-t, T_in-1] are True.
+        
+        Returns:
+            torch.Tensor: shape [T_in, B], True indicates valid positions, False indicates padding positions
+        """
+        if self.current_timesteps is None:
+            raise RuntimeError("current_timesteps not initialized. Call _init_inference_buffer first.")
+        
+        T_in = self.num_steps_per_env
+        B = self.current_timesteps.shape[0]
+        device = self.current_timesteps.device
+        
+        # Create time index matrix [T_in, B], each column represents timesteps 0, 1, ..., T_in-1
+        time_indices = torch.arange(T_in, device=device).unsqueeze(1).expand(T_in, B)
+        
+        # For each environment b, valid positions start from T_in - current_timesteps[b]
+        # i.e., when time_indices >= T_in - current_timesteps[b], it's True
+        start_positions = T_in - self.current_timesteps.unsqueeze(0)  # [1, B]
+        mask = time_indices >= start_positions  # [T_in, B]
+        
+        return mask
 
     def _init_inference_buffer(self, num_envs, device):
         self.num_envs_cache = num_envs
-        obs_buffer_shape = (self.compressed_len, num_envs, self.obs_dim)
+        obs_buffer_shape = (self.num_steps_per_env, num_envs, self.obs_dim)
         self.inference_buffer_obs = torch.zeros(obs_buffer_shape, device=device)
+        # Initialize timestep tracking array, initially set to 0
+        self.current_timesteps = torch.zeros(num_envs, dtype=torch.long, device=device)
         if self.ref_obs_dim > 0:
-            ref_obs_buffer_shape = (self.compressed_len, num_envs, self.ref_obs_dim)
+            ref_obs_buffer_shape = (self.num_steps_per_env , num_envs, self.ref_obs_dim)
             self.inference_buffer_ref_obs = torch.zeros(ref_obs_buffer_shape, device=device)
-            self.inference_buffer_ref_obs_mask = torch.zeros((self.compressed_len, num_envs), dtype=torch.bool, device=device)
+            self.inference_buffer_ref_obs_mask = torch.zeros((self.num_steps_per_env, num_envs), dtype=torch.bool, device=device)
             
     def reset(self, dones=None):
         if self.inference_buffer_obs is None:
             return
         if dones is None: # reset all
             self.inference_buffer_obs.fill_(0.0)
+            # Reset all environments' timesteps to 0
+            if self.current_timesteps is not None:
+                self.current_timesteps.fill_(0)
             if self.ref_obs_dim > 0:
                 if self.inference_buffer_ref_obs is not None:
                     self.inference_buffer_ref_obs.fill_(0.0)
@@ -152,6 +318,9 @@ class MMGPT(nn.Module):
             # dones are at the environment level
             mask = (dones == 1)
             self.inference_buffer_obs[:, mask, :] = 0.0
+            # Reset timesteps to 0 for completed environments: timesteps[dones] = 0
+            if self.current_timesteps is not None:
+                self.current_timesteps[mask] = 0
             if self.ref_obs_dim > 0:
                 if self.inference_buffer_ref_obs is not None:
                     self.inference_buffer_ref_obs[:, mask, :] = 0.0
@@ -161,7 +330,8 @@ class MMGPT(nn.Module):
     def _forward_batch(self, 
                 obs: torch.Tensor,
                 ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                masks: Optional[torch.Tensor] = None,
+                masks: Optional[torch.Tensor] = None, # fake optional. Must be provided in batch mode
+                memory: Optional[Tuple[torch.Tensor, torch.Tensor | None]] = None, # memory token for both modalities
                 unpad_output: bool = True,
                 upsample: bool = True,
                 ):
@@ -169,11 +339,19 @@ class MMGPT(nn.Module):
         Forward pass for the multi-modality transformer in batch mode.
         """
         T_in, B, _ = obs.shape
-        device = obs.device
-        
+        device = obs.device        
         obs_emb = self.obs_embedding(obs) # [T_in, B, D]
+        res_obs_emb = obs_emb
+        # Compress OBS
+        if self.compressor is not None:
+            obs_emb, new_masks = self.compressor(obs_emb, masks)
+            T_c = obs_emb.shape[0]
+        else:
+            new_masks = masks
+            T_c = T_in
+        obs_emb = self.obs_norm(obs_emb)
         # Modality embedding
-        obs_emb = obs_emb + self.modality_emb(torch.zeros(T_in, B, dtype=torch.long, device=device))
+        obs_emb = obs_emb + self.modality_emb(torch.zeros(T_c, B, dtype=torch.long, device=device))
         
         # Process second modality if available
         has_ref = ref_obs is not None and self.ref_obs_dim > 0
@@ -184,51 +362,75 @@ class MMGPT(nn.Module):
             assert ref_B == B, "Batch size of obs and ref_obs must match"
             assert ref_T_in == T_in, "Sequence length of obs and ref_obs must match"
             ref_obs_emb = self.ref_obs_embedding(ref_obs_tensor) # [ref_T_in, B, D]
-            ref_obs_emb = ref_obs_emb + self.modality_emb(torch.ones(ref_T_in, B, dtype=torch.long, device=device))
+            res_ref_obs_emb = ref_obs_emb
+            # Merge masks
+            ref_obs_mask = ref_obs_mask & masks
+            # Compress ref_obs
+            if self.ref_compressor is not None:
+                ref_obs_emb, new_ref_masks = self.ref_compressor(ref_obs_emb, ref_obs_mask)
+            else:
+                new_ref_masks = ref_obs_mask
+
+            ref_obs_emb = self.ref_obs_norm(ref_obs_emb)
+            # Modality embedding
+            ref_obs_emb = ref_obs_emb + self.modality_emb(torch.ones(T_c, B, dtype=torch.long, device=device))
             
             # Sequence merging. [obs0, ref_obs0, obs1, ref_obs1, ...]
             combined_seq = torch.stack([obs_emb, ref_obs_emb], dim=1)
-            combined_seq = combined_seq.reshape(2 * T_in, B, -1) # [2*T_in, B, D]
+            combined_seq = combined_seq.reshape(2 * T_c, B, -1) # [2*T_c, B, D]
             T_combined = combined_seq.shape[0]
-            
-            obs_attn_mask = masks # [T_in, B]
-            ref_attn_mask = masks & ref_obs_mask # [T_in, B]
-            stacked_masks = torch.stack([obs_attn_mask, ref_attn_mask], dim=1) # [T_in, 2, B]
-            combined_masks = stacked_masks.reshape(T_combined, B) # [2*T_in, B]
+            # Merge masks
+            combined_masks = torch.stack([new_masks, new_ref_masks], dim=1) # [T_c, 2, B]
+            combined_masks = combined_masks.reshape(T_combined, B) # [2*T_c, B]
         else:
-            combined_seq = obs_emb # [T_in, B, D]
+            combined_seq = obs_emb # [T_c, B, D]
             T_combined = combined_seq.shape[0]
-            combined_masks = masks # [T_in, B]
-            
-        # Compression
-        if self.compressor is not None and upsample:
-            continued_seq, new_masks = self.compressor(combined_seq, combined_masks) 
-        else:
-            continued_seq, new_masks = combined_seq, combined_masks
-        T = continued_seq.shape[0] # compressed length
-        pos = torch.arange(T, device=device).unsqueeze(1).expand(T, B)
-        src = continued_seq + self.pos_emb(pos) # [T, B, D]
-        # For compatibility, use simpler attention without explicit causal mask
-        src_key_padding_mask = ~new_masks.T # [B, T], True for padding positions
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device)
-        gpt_out = self.decoder(
-            src.permute(1, 0, 2), # [B, T, D]
-            mask=causal_mask,
-            src_key_padding_mask=src_key_padding_mask,
-            is_causal=True,
-        )
-        if self.stride > 1 and upsample:
-            upsampled_out = gpt_out.permute(1, 0, 2).repeat_interleave(self.stride, dim=0)[:T_combined, :, :] # [T_combined, B, D]
-        else:
-            upsampled_out = gpt_out.permute(1, 0, 2) # [T_combined, B, D]
+            combined_masks = new_masks # [T_c, B]
 
+        src_key_padding_mask = ~combined_masks.T # [B, T], True for padding positions
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(T_combined, device=device,dtype=torch.bool)
+        
+        #with torch.nn.attention.sdpa_kernel(SDPBackend.MATH):
+        if not self.apply_rope:
+            pos = torch.arange(T_c, device=device).unsqueeze(1).expand(T_c, B)
+            if has_ref: # T_combined == 2 * T_c, then we need to repeat interleavely the pos (Original [0, 1, 2], new [0,0,1,1,2,2])
+                pos = pos.repeat_interleave(2, dim=0)
+            src = combined_seq + self.pos_emb(pos) # [T_combined, B, D]
+            
+            gpt_out = self.decoder(
+                src.permute(1, 0, 2), # [B, T, D]
+                mask=causal_mask,
+                src_key_padding_mask=src_key_padding_mask,
+                # is_causal=True,
+            )
+        else:
+            gpt_out = self.decoder(
+                combined_seq.permute(1, 0, 2), # [B, T, D]
+                src_mask=causal_mask,
+                src_key_padding_mask=src_key_padding_mask,
+                # is_causal=True,
+                interleave=has_ref,
+            )
+    
+        # Sample obs out seq
         obs_indices = torch.arange(0, T_combined, 2, device=device) if has_ref else torch.arange(0, T_combined, 1, device=device) # obs are at even positions or all positions
-        obs_feature_seq_padded = upsampled_out[obs_indices, :, :] # [T_in, B, D] or [T_in, B, D]. We drop ref_obs features since attention has been applied.
-        out_seq = self.fc(obs_feature_seq_padded) # [T_in, B, dim_out]
+        obs_out_seq = gpt_out.permute(1, 0, 2)[obs_indices, :, :] # [T_c, B, D]
+
+        if self.upsampler is not None and upsample:
+            upsampled_out = self.upsampler(obs_out_seq, T_in) # [T_in, B, D]
+        else:
+            upsampled_out = obs_out_seq # [T_in, B, D]
+            
+        upsampled_out += res_obs_emb
+        if has_ref:
+            upsampled_out += res_ref_obs_emb * ref_obs_mask.unsqueeze(-1).float()
+        
+        upsampled_out = self.fc(upsampled_out) # [T_in, B, dim_out]
+
         if unpad_output:
-            return self.unpad(out_seq, masks) # [valid_length, dim_out]
+            return self.unpad(upsampled_out, masks) # [valid_length, dim_out]
         else: # return output last timestep
-            return out_seq[-1, :, :] # [B, dim_out]
+            return upsampled_out[-1, :, :] # [B, dim_out]
     
     def _forward_inference(self, 
                 obs: torch.Tensor,
@@ -247,6 +449,10 @@ class MMGPT(nn.Module):
         self.inference_buffer_obs = torch.roll(self.inference_buffer_obs, shifts=-1, dims=0)
         self.inference_buffer_obs[-1, :, :] = obs
         
+        # For each new action, increment the corresponding environment's timestep by 1 (but not exceeding T_in)
+        if self.current_timesteps is not None:
+            self.current_timesteps = torch.clamp(self.current_timesteps + 1, max=self.num_steps_per_env)
+        
         # right here, we always maintain the reference buffer, in case we need it later
         if self.inference_buffer_ref_obs is not None:
             self.inference_buffer_ref_obs = torch.roll(self.inference_buffer_ref_obs, shifts=-1, dims=0)
@@ -261,7 +467,7 @@ class MMGPT(nn.Module):
                 self.inference_buffer_ref_obs_mask[-1, :].fill_(False)
             
         obs_seq = self.inference_buffer_obs # [T_in, B, dim_in]
-        masks = torch.ones_like(obs_seq[..., 0], dtype=torch.bool) # [T_in, B]. During inference, the stacks are controlled to be always valid
+        masks = self.generate_mask() # [T_in, B]    
         if self.ref_obs_embedding is not None:
             ref_obs_seq = self.inference_buffer_ref_obs
             ref_obs_mask = self.inference_buffer_ref_obs_mask
@@ -270,16 +476,17 @@ class MMGPT(nn.Module):
             ref_obs = None
             
         # call _forward_batch
-        return self._forward_batch(obs_seq, ref_obs, masks, unpad_output=False, upsample=False) # [B, dim_out]
+        return self._forward_batch(obs_seq, ref_obs, masks, unpad_output=False) # [B, dim_out]
         
 
     def forward(self, 
                 obs: torch.Tensor, 
                 ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
                 masks: Optional[torch.Tensor] = None,
+                memory: Optional[Tuple[torch.Tensor, torch.Tensor | None]] = None, # memory token for both modalities
                 **kwargs):
         """
-        Forward pass for the multi-modality transformer.
+        Forward pass for the mm transformer.
 
         Args:
             obs (torch.Tensor): Observation tensor of shape (T, B, dim_in).
@@ -288,6 +495,7 @@ class MMGPT(nn.Module):
                 - ref_obs_tensor (torch.Tensor): Reference observations of shape (T,B, dim_in).
                 - ref_obs_mask (torch.Tensor): Mask tensor of shape (T, B) indicating the presence of ref_obs.
             masks (torch.Tensor): Mask tensor of shape (T, B) indicating valid observations among the trajectory.
+            memory (Optional[Tuple[torch.Tensor, torch.Tensor | None]]): Memory tokens for both modalities.
             **kwargs: Only added to avoid errors when unexpected arguments are passed.
             
         ** Important **: Unlike mm transformer, here, padded environments, B, tends to be larger than num_envs.
@@ -297,7 +505,7 @@ class MMGPT(nn.Module):
         """
         is_batch_mode = masks is not None
         if is_batch_mode:
-            return self._forward_batch(obs, ref_obs, masks)
+            return self._forward_batch(obs, ref_obs, masks, memory=memory)
         else:
             return self._forward_inference(obs, ref_obs)
 
@@ -311,12 +519,16 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                  num_critic_obs,
                  num_critic_ref_obs,
                  num_actions,
-                 dim_model=256,
-                 num_heads=8,
-                 num_layers=3,
+                 term_dict,
+                 ref_term_dict,
+                 concatenate_term_names: Optional[List[List[str]]] = None,
+                 concatenate_ref_term_names: Optional[List[List[str]]] = None,
+                 dim_model=64,
+                 num_heads=2,
+                 num_layers=2,
                  num_steps_per_env=24,
                  max_seq_len=16,
-                 mlp_hidden_dims = [256, 128],
+                 mlp_hidden_dims = [128, 64],
                  init_noise_std=1.0,
                  noise_std_type: str = "scalar",
                  load_dagger=False,
@@ -324,12 +536,13 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                  load_actor_path=None,
                  enable_lora=False,
                  dropout=0.1,
+                 apply_rope=False,
                  **kwargs
                  ):
         nn.Module.__init__(self)
         assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
-        self.actor = MMGPT(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, num_heads, num_layers, dropout=dropout, name="actor", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, **kwargs)
-        self.actor_dagger = MMGPT(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, num_heads, num_layers, dropout=dropout, name="actor_dagger", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, **kwargs) if load_dagger else None
+        self.actor = MMGPT(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, num_heads, num_layers, dropout=dropout, name="actor", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["policy"], ref_term_dict=ref_term_dict["policy"], concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], **kwargs)
+        self.actor_dagger = MMGPT(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, num_heads, num_layers, dropout=dropout, name="actor_dagger", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["policy"], ref_term_dict=ref_term_dict["policy"], concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], **kwargs) if load_dagger else None
         # Action noise
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
@@ -347,7 +560,7 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
             if enable_lora:
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
 
-        self.critic = MMGPT(num_critic_obs, num_critic_ref_obs, 1, dim_model, num_heads, num_layers, dropout=dropout, name="critic", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, **kwargs) # 1 for value function
+        self.critic = MMGPT(num_critic_obs, num_critic_ref_obs, 1, dim_model, num_heads, num_layers, dropout=dropout, name="critic", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["critic"], ref_term_dict=ref_term_dict["critic"], concatenate_term_names=concatenate_term_names["critic"], concatenate_ref_term_names=concatenate_ref_term_names["critic"], **kwargs) # 1 for value function
         if load_actor_path:
             self.load_actor_weights(load_actor_path)
         print(f"Actor Transformer: {self.actor}")
@@ -363,4 +576,7 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
         self.critic.reset(dones)
         if self.actor_dagger is not None:
             self.actor_dagger.reset(dones)
+            
+    def get_hidden_states(self):
+        return None, None
     

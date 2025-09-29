@@ -6,5 +6,7 @@
 """Definitions for neural networks."""
 
 from .memory import Memory
+from .rope import RotaryEmbedding
+from .rope_transformer import RoPETransformer, RoPETransformerEncoder, RoPETransformerEncoderLayer
 
-__all__ = ["Memory"]
+__all__ = ["Memory", "RotaryEmbedding", "RoPETransformer", "RoPETransformerEncoder", "RoPETransformerEncoderLayer"]

@@ -240,7 +240,7 @@ class MMTransformer(nn.Module):
             name = "",
             ls_init_values = 1e-3,
             apply_pooling = False,
-            apply_mlp_residual = True,
+            apply_mlp_residual = False,
             **kwargs
     ):
         super().__init__()

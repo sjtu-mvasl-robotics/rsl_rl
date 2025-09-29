@@ -13,3 +13,21 @@ __pycache__
 
 test*
 CONTRIBUTORS.md
+
+# copilot test files
+*benchmark*
+debug*
+complete*
+final*
+*test*
+*.md
+quick*
+*analysis*
+*analyze*
+*.pkl
+*generate*
+*optimized*
+*complex*
+*.png
+*verify*
+*comparison*
