@@ -13,6 +13,8 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .actor_critic_mm_transformer import ActorCriticMMTransformer, ActorCriticMMTransformerV2, ActorCriticDebugMLP, SwiGLUEmbedding, group_by_concat_list
 from .actor_critic_mm_gpt import ActorCriticMMGPT
+from .actor_critic_mlp import ActorCriticMLP, MultiModalMLP
+from .actor_critic_mlp_v2 import ActorCriticMLPV2, MultiModalMLPV2
 from .student_teacher_transformer import StudentTeacherMMTransformer, StudentTeacherMMTransformerV2
 from .amp import AMPNet
 
@@ -28,6 +30,10 @@ __all__ = [
     "group_by_concat_list",
     "SwiGLUEmbedding",
     "ActorCriticDebugMLP",
+    "ActorCriticMLP",
+    "MultiModalMLP",
+    "ActorCriticMLPV2",
+    "MultiModalMLPV2",
     "StudentTeacherMMTransformer",
     "StudentTeacherMMTransformerV2",
     "AMPNet",

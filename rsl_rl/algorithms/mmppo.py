@@ -134,7 +134,9 @@ class MMPPO:
         teacher_coef_mode="kl", # "kl" or "norm"
         teacher_update_interval=1,
         teacher_lr=5e-4,
-        teacher_only_interval=0,
+        teacher_only_interval=0,  # Stage 1: Pure teacher output, student learns by imitation only
+        hybrid_training_intervals=0,  # Stage 2: Weighted mix of teacher and student output
+        hybrid_mix_coef=0.5,  # Coefficient for hybrid stage: output = hybrid_mix_coef * teacher + (1-hybrid_mix_coef) * student
         default_action=None,
         # RND parameters
         rnd_cfg: dict | None = None,
@@ -226,12 +228,23 @@ class MMPPO:
         self.teacher_loss_coef_decay_interval = teacher_loss_coef_decay_interval
         self.teacher_coef_mode = teacher_coef_mode
         self.teacher_only_interval = teacher_only_interval
+        self.hybrid_training_intervals = hybrid_training_intervals
+        self.hybrid_mix_coef = hybrid_mix_coef
         self.teacher_supervising_intervals = teacher_supervising_intervals
         self.teacher_updating_intervals = teacher_updating_intervals
         self.teacher_apply_interval = teacher_apply_interval
         
+        # Track current training stage
+        self.current_stage = 1  # 1: teacher-only, 2: hybrid, 3: student
+        
+        # Validation for teacher_only and hybrid intervals
         assert teacher_coef is not None or teacher_only_interval == 0, "teacher_only_interval should be 0 if teacher_coef is None"
         assert (teacher_coef is None and teacher_loss_coef is None) or (teacher_loss_coef is not None and teacher_coef is not None), "teacher_coef and teacher_loss_coef should be set together"
+        if teacher_only_interval > 0:
+            assert hybrid_training_intervals >= teacher_only_interval, "hybrid_training_intervals must be >= teacher_only_interval"
+        if hybrid_training_intervals > 0:
+            assert teacher_only_interval > 0, "teacher_only_interval must be > 0 when using hybrid_training_intervals"
+            assert 0.0 <= hybrid_mix_coef <= 1.0, "hybrid_mix_coef should be in range [0.0, 1.0]"
 
         # PPO components
         self.actor_critic = actor_critic
@@ -272,7 +285,8 @@ class MMPPO:
             self.lr_scheduler = None
 
         if self.teacher_coef is not None and self.teacher_loss_coef is not None:
-            assert self.teacher_coef_mode in ["kl", "norm", "original_kl"], "teacher_coef_mode should be either 'kl' or 'norm' or 'original_kl'"
+            assert self.teacher_coef_mode in ["kl", "norm", "original_kl", "mse", "huber"], \
+                "teacher_coef_mode should be one of: 'kl', 'norm', 'original_kl', 'mse', 'huber'"
             if self.teacher_coef_range is None:
                 self.teacher_coef_range = (self.teacher_coef, self.teacher_coef)
             else:
@@ -348,15 +362,42 @@ class MMPPO:
     def act(self, obs, ref_obs, critic_obs, ref_critic_obs):
         # if self.actor_critic.is_recurrent:
         #     self.transition.hidden_states = self.actor_critic.get_hidden_states()
-        # Compute the actions and values
-        self.transition.actions = self.actor_critic.act(obs, ref_observations=ref_obs).detach()
+        
+        # Stage 1: Teacher-Only (pure imitation)
+        # Stage 2: Hybrid (weighted mix of teacher and student)
+        # Stage 3: Student (normal PPO with teacher guidance)
+        
+        # Compute student actions - always store student actions for training
+        student_actions = self.actor_critic.act(obs, ref_observations=ref_obs).detach()
+        self.transition.actions = student_actions  # Always use student actions for training
+        
+        # Compute values and other metrics based on student
         self.transition.values = self.actor_critic.evaluate(critic_obs, ref_critic_observations=ref_critic_obs).detach()
-        self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.actions_log_prob = self.actor_critic.get_actions_log_prob(student_actions).detach()
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
+        
+        # Determine which actions to RETURN (for environment execution) based on current training stage
         if self.teacher_coef is not None:
-            self.transition.dagger_actions = self.actor_critic.act_dagger(obs, ref_observations=None).detach()
-            _ = self.actor_critic.get_actions_log_prob_dagger(self.transition.dagger_actions)
+            teacher_actions = self.actor_critic.act_dagger(obs, ref_observations=None).detach()
+            _ = self.actor_critic.get_actions_log_prob_dagger(teacher_actions)
+            self.transition.dagger_actions = teacher_actions
+            
+            # if self.current_stage == 1:
+            #     # Stage 1: Return pure teacher actions to environment
+            #     actions_to_execute = teacher_actions
+            # elif self.current_stage == 2:
+            #     # Stage 2: Return weighted mix to environment
+            #     actions_to_execute = (self.hybrid_mix_coef * teacher_actions + 
+            #                          (1 - self.hybrid_mix_coef) * student_actions)
+            # else:
+            #     # Stage 3: Return student actions to environment
+            #     actions_to_execute = student_actions
+            actions_to_execute = student_actions
+        else:
+            # No teacher, return student actions
+            actions_to_execute = student_actions
+        
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.reference_observations = ref_obs[0] if ref_obs is not None else None
@@ -369,7 +410,7 @@ class MMPPO:
             ref_amp_observation, ref_amp_mask = string_to_callable(self.amp_cfg["amp_ref_obs_extractor"])(env=self.amp_cfg["_env"])
             self.transition.amp_reference_observations = ref_amp_observation
             self.transition.amp_reference_observations_mask = ref_amp_mask
-        return self.transition.actions
+        return actions_to_execute
 
     def process_env_step(self, rewards, dones, infos):
         self.transition.rewards = rewards.clone()
@@ -403,6 +444,14 @@ class MMPPO:
         self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch)
 
     def update(self, epoch=0):
+        # Update current training stage based on epoch
+        if epoch < self.teacher_only_interval:
+            self.current_stage = 1  # Teacher-only stage
+        elif epoch < self.hybrid_training_intervals:
+            self.current_stage = 2  # Hybrid stage
+        else:
+            self.current_stage = 3  # Student stage
+            
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_imitation_loss = 0.0
@@ -549,26 +598,31 @@ class MMPPO:
                     param_group["lr"] = self.learning_rate
 
             # Surrogate loss
-            with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
-                surrogate = -torch.squeeze(advantages_batch) * ratio
-                surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                    ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-                )
-                surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-
-                # Value function loss
-                if self.use_clipped_value_loss:
-                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                        -self.clip_param, self.clip_param
+            # In teacher-only stage, skip PPO loss computation (student just imitates)
+            if epoch < self.teacher_only_interval:
+                # Teacher-only stage: no PPO update, pure imitation
+                surrogate_loss = torch.tensor(0.0, device=self.device)
+                value_loss = torch.tensor(0.0, device=self.device)
+            else:
+                # Normal PPO or Hybrid stage: compute surrogate and value loss
+                with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                    ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+                    surrogate = -torch.squeeze(advantages_batch) * ratio
+                    surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
+                        ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
                     )
-                    value_losses = (value_batch - returns_batch).pow(2)
-                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
-                else:
-                    value_loss = (returns_batch - value_batch).pow(2).mean()
+                    surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            
+                    # Value function loss
+                    if self.use_clipped_value_loss:
+                        value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                            -self.clip_param, self.clip_param
+                        )
+                        value_losses = (value_batch - returns_batch).pow(2)
+                        value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                        value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                    else:
+                        value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
@@ -613,8 +667,18 @@ class MMPPO:
 
             imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch)      
             print_gpu_memory_summary("Before optimizer.zero_grad")
-            # if self.teacher_coef is not None:
-            #     loss += imitation_loss * self.teacher_coef
+            
+            # In teacher-only stage, imitation loss is the main loss
+            if epoch < self.teacher_only_interval:
+                # Pure imitation: only use imitation loss
+                loss = imitation_loss
+            elif self.teacher_only_interval <= epoch < self.hybrid_training_intervals:
+                # Hybrid stage: combine PPO loss with stronger imitation loss
+                # Use a higher weight for imitation during hybrid stage
+                hybrid_imitation_weight = 2.0 * (self.teacher_loss_coef if self.teacher_loss_coef is not None else 0.1)
+                loss = loss + hybrid_imitation_weight * imitation_loss
+            # else: Stage 3 (student), imitation loss applied separately later
+            
             # Gradient step
             self.optimizer.zero_grad()
             if not self.auto_mix_precision:
@@ -696,7 +760,11 @@ class MMPPO:
                 mean_pred_pos_prob += pred_pos_prob.item()
                 mean_pred_neg_prob += pred_neg_prob.item()
 
-            if self.teacher_loss_coef is not None and epoch > self.teacher_updating_intervals and (epoch+1)%self.teacher_apply_interval == 0:
+            # Imitation loss applied separately only in Stage 3 (student stage)
+            if (self.teacher_loss_coef is not None and 
+                epoch >= self.hybrid_training_intervals and 
+                epoch > self.teacher_updating_intervals and 
+                (epoch+1) % self.teacher_apply_interval == 0):
                 backward_imitation_loss = imitation_loss * self.teacher_loss_coef
                 self.imitation_optimizer.zero_grad()
                 if not self.auto_mix_precision:
@@ -735,10 +803,11 @@ class MMPPO:
             if self.amp and ((epoch % self.amp_cfg["amp_update_interval"] == 0) or (epoch < self.amp_cfg["amp_pretrain_steps"])):
                 self.amp_optimizer.step()
 
-            if self.teacher_loss_coef is not None and epoch > self.teacher_supervising_intervals and (epoch+1)%self.teacher_apply_interval == 0:
-                # backward_imitation_loss = imitation_loss * self.teacher_loss_coef
-                # self.imitation_optimizer.zero_grad()
-                # backward_imitation_loss.backward()
+            # Imitation optimizer step only in Stage 3
+            if (self.teacher_loss_coef is not None and 
+                epoch >= self.hybrid_training_intervals and
+                epoch > self.teacher_supervising_intervals and 
+                (epoch+1) % self.teacher_apply_interval == 0):
                 nn.utils.clip_grad_norm_(self.actor_critic.actor_dagger.parameters(), self.max_grad_norm)
                 if not self.auto_mix_precision:
                     self.imitation_optimizer.step()
@@ -755,8 +824,11 @@ class MMPPO:
             mean_imitation_loss += imitation_loss.item()
             mean_entropy += entropy_batch.mean().item()
 
-            if (epoch+1) % self.teacher_update_interval == 0 and self.dagger_optimizer is not None and epoch > self.teacher_supervising_intervals:
-                # dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, epoch)
+            # DAgger update: start after hybrid stage
+            if ((epoch+1) % self.teacher_update_interval == 0 and 
+                self.dagger_optimizer is not None and 
+                epoch >= self.hybrid_training_intervals and
+                epoch > self.teacher_supervising_intervals):
                 dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch)
             else:
                 dagger_loss = 0.0
@@ -899,13 +971,24 @@ class MMPPO:
 
 
     def _imitation_loss(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch):
+        """
+        Compute imitation loss between student and teacher outputs.
+        
+        Modes:
+        - "kl": KL-divergence with entropy regularization (original)
+        - "original_kl": Standard KL divergence between Gaussian distributions
+        - "norm": L2 norm distance
+        - "mse": Mean Squared Error (simple and effective)
+        - "huber": Huber loss (robust to outliers)
+        """
         if dagger_actions_batch is not None:
             dagger_actions_batch = dagger_actions_batch.detach()
+            
             if self.teacher_coef_mode == "kl":
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
                     mu_batch = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
                 sigma_batch = self.actor_critic.action_std.detach()
-                imitation_loss = torch.sum(
+                imitation_loss = torch.mean(
                     (1 / actions_batch.shape[-1]) * (torch.sum((torch.square(mu_batch - dagger_actions_batch) / (2.0 * torch.square(sigma_batch) + 1e-5)), axis=-1) +  0.92 * torch.sum(torch.clamp_min(torch.log(sigma_batch), 0.0), axis=-1))
                 )
 
@@ -924,6 +1007,7 @@ class MMPPO:
                     axis=-1,
                 )
                 imitation_loss = imitation_loss.mean()
+                
             elif self.teacher_coef_mode == "norm":
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
                     predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
@@ -933,6 +1017,43 @@ class MMPPO:
                 imitation_loss = torch.norm(
                     (predicted_actions - dagger_actions_batch)
                 ).mean()
+            
+            elif self.teacher_coef_mode == "mse":
+                # Mean Squared Error: simple and effective
+                with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=None)
+                
+                # MSE per action dimension, then mean
+                diff = predicted_actions - dagger_actions_batch
+                imitation_loss = (diff ** 2).mean()
+            
+            elif self.teacher_coef_mode == "huber":
+                # Huber loss: robust to outliers, smooth transition
+                with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=None)
+                
+                # Huber loss with delta=1.0 (standard)
+                delta = 1.0
+                diff = predicted_actions - dagger_actions_batch
+                abs_diff = torch.abs(diff)
+                
+                # Huber: 0.5*x^2 if |x| < delta, else delta*(|x| - 0.5*delta)
+                huber = torch.where(
+                    abs_diff < delta,
+                    0.5 * diff ** 2,
+                    delta * (abs_diff - 0.5 * delta)
+                )
+                imitation_loss = huber.mean()
+            
+            else:
+                raise ValueError(f"Unknown teacher_coef_mode: {self.teacher_coef_mode}. "
+                               f"Choose from ['kl', 'original_kl', 'norm', 'mse', 'huber']")
                     
         else:
             imitation_loss = torch.tensor(0.0).to(self.device)   

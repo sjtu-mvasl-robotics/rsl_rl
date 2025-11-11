@@ -106,6 +106,8 @@ class MLPEmbedding(nn.Module):
         
     def forward(self, x):
         return self.mlp(x)
+    
+    
 class HistoryEncoder(nn.Module):
     """
     HistoryEncoder is a temporal encoder for history observations.
@@ -550,15 +552,42 @@ class MMTransformerV2(nn.Module):
         self.apply_pooling = apply_pooling
         obs_size = sum(term_dict.values())
         ref_obs_size = sum(ref_term_dict.values()) if ref_term_dict else 0
-        self.in_size = obs_size + ref_obs_size
-        self.mlp_residual = nn.Sequential(
-            nn.Linear(self.in_size, 768),
-            nn.GELU(),
-            nn.Linear(768, 384),
-            nn.GELU(),
-            nn.Linear(384, dim_out),
-        ) if apply_mlp_residual else None
-        self.gate_linear = nn.Linear(dim_model, dim_out) if apply_mlp_residual else None
+        
+        # New MLP residual design: separate primary and reference paths
+        if apply_mlp_residual:
+            # Primary MLP path (always active, processes obs)
+            self.mlp_primary = nn.Sequential(
+                nn.Linear(obs_size, 512),
+                nn.GELU(),
+                nn.Linear(512, 256),
+                nn.GELU(),
+                nn.Linear(256, dim_out),
+            )
+            
+            # Reference MLP path (only active when ref_obs is provided)
+            if ref_obs_size > 0:
+                self.mlp_ref = nn.Sequential(
+                    nn.Linear(ref_obs_size, 512),
+                    nn.GELU(),
+                    nn.Linear(512, 256),
+                    nn.GELU(),
+                    nn.Linear(256, dim_out),
+                )
+                
+                # Gated fusion for MLP outputs
+                self.mlp_gate = nn.Sequential(
+                    nn.Linear(dim_model + dim_out * 2, 256),  # transformer + primary + ref
+                    nn.ReLU(),
+                    nn.Linear(256, dim_out),
+                    nn.Sigmoid()
+                )
+            else:
+                self.mlp_ref = None
+                self.mlp_gate = None
+        else:
+            self.mlp_primary = None
+            self.mlp_ref = None
+            self.mlp_gate = None
         # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
 
     def forward(
@@ -667,21 +696,41 @@ class MMTransformerV2(nn.Module):
         # -------------------
         # Final fully connected layer
         # -------------------
-        y = self.fc(x)  # Shape: (B, output_dim)
+        transformer_out = self.fc(x)  # Shape: (B, output_dim)
         
-        if self.mlp_residual is not None:
-            obs_in = obs
-            if ref_obs is not None:
-                obs_in = torch.cat([obs, ref_obs_tensor], dim=1)
+        # New MLP residual: separate primary and reference paths with gated fusion
+        if self.mlp_primary is not None:
+            # Primary MLP path (always computed)
+            mlp_primary_out = self.mlp_primary(obs)  # (B, output_dim)
             
-            if obs_in.size(1) != self.in_size: # use zero padding
-                obs_in = F.pad(obs_in, (0, self.in_size - obs_in.size(1)), value=0.0)
+            # If no ref_obs or no mlp_ref, use simple addition
+            if ref_obs is None or self.mlp_ref is None:
+                y = transformer_out + mlp_primary_out
+            else:
+                # Reference MLP path (only when ref_obs is present)
+                ref_obs_tensor, ref_obs_mask = ref_obs
+                mlp_ref_out = self.mlp_ref(ref_obs_tensor)  # (B, output_dim)
                 
-            # x = x + self.mlp_residual(obs_in) * self.mlp_weight
-            # gate = F.sigmoid(self.gate_linear(x))
-            # y = gate * y + (1 - gate) * self.mlp_residual(obs_in)
-            y = y + self.mlp_residual(obs_in)
-        # x = self.out_ls(x)
+                # Apply mask to ref output
+                mlp_ref_out = mlp_ref_out * ref_obs_mask.float().unsqueeze(-1)
+                
+                # Gated fusion: learn how to combine transformer, primary MLP, and ref MLP
+                if self.mlp_gate is not None:
+                    # Gate input: transformer features + both MLP outputs
+                    gate_input = torch.cat([x, mlp_primary_out, mlp_ref_out], dim=-1)
+                    gate = self.mlp_gate(gate_input)  # (B, output_dim), values in [0, 1]
+                    
+                    # Gated combination:
+                    # gate=1: use transformer + ref_mlp (complex reasoning)
+                    # gate=0: use primary_mlp (simple direct mapping)
+                    y = gate * (transformer_out + mlp_ref_out) + (1 - gate) * mlp_primary_out
+                else:
+                    # Fallback: simple addition
+                    y = transformer_out + mlp_primary_out + mlp_ref_out
+        else:
+            # No MLP residual, use transformer output directly
+            y = transformer_out
+            
         return y
 
 class Transformer(nn.Module):
@@ -950,7 +999,7 @@ class ActorCriticMMTransformer(nn.Module):
         # load the weights
         # self.actor.load_state_dict(dagger_weights)
         self.actor.load_state_dict(actor_weights)
-        # self.critic.load_state_dict(critic_weights)
+        self.critic.load_state_dict(critic_weights)
         print(f"Loaded actor weights from {path} to actor and critic")
         
         # load std
@@ -1212,7 +1261,7 @@ class ActorCriticDebugMLP(nn.Module):
         # load the weights
         # self.actor.load_state_dict(dagger_weights)
         self.actor.load_state_dict(actor_weights)
-        # self.critic.load_state_dict(critic_weights)
+        self.critic.load_state_dict(critic_weights)
         print(f"Loaded actor weights from {path} to actor and critic")
         
         # load std
