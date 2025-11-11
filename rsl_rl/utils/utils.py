@@ -73,6 +73,77 @@ def split_and_pad_trajectories(tensor, dones):
     return padded_trajectories, trajectory_masks
 
 
+def split_and_pad_trajectories_front(tensor, dones):
+    """Splits trajectories at done indices. Then concatenates them and pads with zeros at the FRONT up to the length of the longest trajectory.
+    Returns masks corresponding to valid parts of the trajectories
+    Example:
+        Input: [ [a1, a2, a3, a4 | a5, a6],
+                 [b1, b2 | b3, b4, b5 | b6]
+                ]
+
+        Output:[ [a1, a2, a3, a4], | [  [True, True, True, True],
+                 [0, 0, a5, a6],   |    [False, False, True, True],
+                 [0, 0, b1, b2],   |    [False, False, True, True],
+                 [0, b3, b4, b5],  |    [False, True, True, True],
+                 [0, 0, 0, b6]     |    [False, False, False, True],
+                ]                  | ]
+
+    Assumes that the input has the following dimension order: [time, number of envs, additional dimensions]
+    """
+    dones = dones.clone()
+    dones[-1] = 1
+    # Permute the buffers to have order (num_envs, num_transitions_per_env, ...), for correct reshaping
+    flat_dones = dones.transpose(1, 0).reshape(-1, 1)
+
+    # Get length of trajectory by counting the number of successive not done elements
+    done_indices = torch.cat((flat_dones.new_tensor([-1], dtype=torch.int64), flat_dones.nonzero()[:, 0]))
+    trajectory_lengths = done_indices[1:] - done_indices[:-1]
+    trajectory_lengths_list = trajectory_lengths.tolist()
+    # Extract the individual trajectories
+    trajectories = torch.split(tensor.transpose(1, 0).flatten(0, 1), trajectory_lengths_list)
+    
+    # add at least one full length trajectory to ensure consistent behavior with original
+    trajectories = trajectories + (torch.zeros(tensor.shape[0], *tensor.shape[2:], device=tensor.device),)
+    
+    # Find the maximum trajectory length (same as original)
+    max_length = tensor.shape[0]
+    
+    # Use PyTorch's pad_sequence with batch_first=False and enforce_sorted=False
+    # But we need to reverse each trajectory, pad, then reverse back for front padding
+    reversed_trajectories = [torch.flip(traj, [0]) for traj in trajectories]
+    padded_reversed = torch.nn.utils.rnn.pad_sequence(reversed_trajectories, batch_first=False)
+    # Reverse back to get front-padded trajectories
+    padded_trajectories = torch.flip(padded_reversed, [0])
+    
+    # remove the added tensor (same as original)
+    padded_trajectories = padded_trajectories[:, :-1]
+    
+    # Create masks for valid parts (True where data exists, False where front-padded)
+    # For front padding, valid data is at the END of the padded sequence
+    trajectory_masks = torch.zeros_like(padded_trajectories[:, :, 0], dtype=torch.bool)
+    for i, length in enumerate(trajectory_lengths_list):
+        # Valid data is at the END of each trajectory (after front padding)
+        trajectory_masks[max_length - length:, i] = True
+    
+    return padded_trajectories, trajectory_masks
+
+
+def unpad_trajectories_front(trajectories, masks):
+    """Does the inverse operation of split_and_pad_trajectories_front()
+    Removes front padding and reconstructs the flattened valid sequence
+    
+    Note: This function is identical to unpad_trajectories() because both rely on mask-based extraction.
+    Whether data is front-padded or back-padded doesn't matter - the mask correctly identifies 
+    valid positions, and the extraction logic is the same.
+    """
+    # Identical logic to unpad_trajectories - mask-based extraction works the same way
+    return (
+        trajectories.transpose(1, 0)[masks.transpose(1, 0)]
+        .view(-1, trajectories.shape[0], trajectories.shape[-1])
+        .transpose(1, 0)
+    )
+
+
 def unpad_trajectories(trajectories, masks):
     """Does the inverse operation of  split_and_pad_trajectories()"""
     # Need to transpose before and after the masking to have proper reshaping

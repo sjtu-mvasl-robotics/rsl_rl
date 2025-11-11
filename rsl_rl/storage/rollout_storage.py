@@ -280,7 +280,7 @@ class RolloutStorage:
                 else:
                     rnd_state_batch = None
 
-                actions_batch = self.actions[:, start:stop]
+                actions_batch = self.actions[:, start:stop] # current actions shape: [T, B, action_dim]
                 old_mu_batch = self.mu[:, start:stop]
                 old_sigma_batch = self.sigma[:, start:stop]
                 returns_batch = self.returns[:, start:stop]

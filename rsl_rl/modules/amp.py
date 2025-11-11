@@ -44,7 +44,7 @@ class AMPNet(nn.Module):
             activation: str = "elu",
             out_activation: str = "tanh",
             device: str = "cpu",
-            label_smoothing: float = 0.0,
+            label_smoothing: float = 0.1,
             **kwargs
     ):
         super().__init__()
@@ -150,7 +150,7 @@ class AMPNet(nn.Module):
 
         return grad_penalty
 
-    def amp_reward(self, cur_state: torch.Tensor, next_state: torch.Tensor, epsilon: float = 1e-4, reward_shift: float = 0.48) -> torch.Tensor:
+    def amp_reward(self, cur_state: torch.Tensor, next_state: torch.Tensor, epsilon: float = 1e-4, reward_shift: float = 0.45) -> torch.Tensor:
         """
         Compute the AMP reward for the given current and next states.
 

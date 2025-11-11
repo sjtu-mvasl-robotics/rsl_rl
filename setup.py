@@ -6,7 +6,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="rsl_rl",
-    version="2.3.1.dev2",
+    version="2.3.1.dev3",
     packages=find_packages(),
     author="Yifei Yao",
     maintainer="Yifei Yao",

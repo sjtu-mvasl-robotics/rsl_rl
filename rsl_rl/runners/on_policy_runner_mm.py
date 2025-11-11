@@ -38,6 +38,8 @@ class OnPolicyRunnerMM:
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
+        print(self.env.get_observations())
+        
         obs, extras = self.env.get_observations()
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
             
@@ -191,7 +193,7 @@ class OnPolicyRunnerMM:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
-    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = True):
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
@@ -273,11 +275,12 @@ class OnPolicyRunnerMM:
                         critic_obs=critic_obs,
                         ref_critic_obs=critic_ref_obs_tuple,
                     )
-                    if self.amp_cfg:
-                        prev_obs = obs.clone()
-                        prev_obs = prev_obs.to(self.device)
-                        prev_obs = self.obs_normalizer(prev_obs)
-                        amp_prev_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(prev_obs, env=self.amp_cfg["_env"])
+                    if self.amp_cfg: # currently, actions are not applied, so they do not affect amp observations
+                        amp_prev_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(env=self.amp_cfg["_env"])
+                        # prev_obs = obs.clone()
+                        # prev_obs = prev_obs.to(self.device)
+                        # prev_obs = self.obs_normalizer(prev_obs)
+                        # amp_prev_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(prev_obs, env=self.amp_cfg["_env"])
 
                     obs, ref_obs_tuple, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # move to the right device
@@ -323,7 +326,7 @@ class OnPolicyRunnerMM:
                         # rewards = torch.clamp(rewards, min=0.0)
 
                         if self.amp_cfg:
-                            amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(obs, env=self.amp_cfg["_env"])
+                            amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])( env=self.amp_cfg["_env"])
                             amp_rewards = self.alg.amp.amp_reward(amp_prev_obs, amp_obs, epsilon=self.amp_cfg["epsilon"])
                             amp_score = self.alg.amp.amp_score(amp_prev_obs, amp_obs)
                             # amp_relative_score = amp_score - amp_prev_neg_score
@@ -381,13 +384,13 @@ class OnPolicyRunnerMM:
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
             ep_infos.clear()
-            if it == start_iter and not self.disable_logs:
-                # obtain all the diff files
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # if possible store them to wandb
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for path in git_file_paths:
-                        self.writer.save_file(path)
+            # if it == start_iter and not self.disable_logs:
+            #     # obtain all the diff files
+            #     git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+            #     # if possible store them to wandb
+            #     if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+            #         for path in git_file_paths:
+            #             self.writer.save_file(path)
 
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
@@ -421,17 +424,21 @@ class OnPolicyRunnerMM:
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
-        self.writer.add_scalar("Loss/value_function", locs["loss_dict"]["mean_value_loss"], locs["it"])
-        self.writer.add_scalar("Loss/surrogate", locs["loss_dict"]["mean_surrogate_loss"], locs["it"])
-        self.writer.add_scalar("Loss/imitation", locs["loss_dict"]["mean_imitation_loss"], locs["it"])
-        if locs["loss_dict"]["mean_dagger_loss"] > 0:
-            self.writer.add_scalar("Loss/dagger", locs["loss_dict"]["mean_dagger_loss"], locs["it"])
-        if self.alg.rnd:
-            self.writer.add_scalar("Loss/rnd", locs["loss_dict"]["mean_rnd_loss"], locs["it"])
-        if self.alg.symmetry:
-            self.writer.add_scalar("Loss/symmetry", locs["loss_dict"]["symmetry"], locs["it"])
+        # self.writer.add_scalar("Loss/value_function", locs["loss_dict"]["mean_value_loss"], locs["it"])
+        # self.writer.add_scalar("Loss/surrogate", locs["loss_dict"]["mean_surrogate_loss"], locs["it"])
+        # self.writer.add_scalar("Loss/imitation", locs["loss_dict"]["mean_imitation_loss"], locs["it"])
+        # if locs["loss_dict"]["mean_dagger_loss"] > 0:
+        #     self.writer.add_scalar("Loss/dagger", locs["loss_dict"]["mean_dagger_loss"], locs["it"])
+        # if self.alg.rnd:
+        #     self.writer.add_scalar("Loss/rnd", locs["loss_dict"]["mean_rnd_loss"], locs["it"])
+        # if self.alg.symmetry:
+        #     self.writer.add_scalar("Loss/symmetry", locs["loss_dict"]["symmetry"], locs["it"])
         if self.amp_cfg:
             self.writer.add_scalar("Loss/amp", locs["loss_dict"]["mean_amp_loss"], locs["it"])
+        for key, value in locs["loss_dict"].items():
+            if 'amp' in key:
+                continue
+            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
         
 
         
@@ -474,10 +481,15 @@ class OnPolicyRunnerMM:
                 f"""{str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Value function loss:':>{pad}} {locs['loss_dict']['mean_value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs['loss_dict']['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Imitation loss:':>{pad}} {locs['loss_dict']['mean_imitation_loss']:.4f}\n""")
-            
+                # f"""{'Value function loss:':>{pad}} {locs['loss_dict']['mean_value_loss']:.4f}\n"""
+                # f"""{'Surrogate loss:':>{pad}} {locs['loss_dict']['mean_surrogate_loss']:.4f}\n"""
+                # f"""{'Imitation loss:':>{pad}} {locs['loss_dict']['mean_imitation_loss']:.4f}\n"""
+                
+                )
+            for key, value in locs["loss_dict"].items():
+                if 'amp' in key:
+                    continue
+                log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
                 # f"""{'Dagger loss:':>{pad}} {locs['loss_dict']['mean_dagger_loss']:.4f}\n""" if locs['loss_dict']['mean_dagger_loss'] > 0 else ""
                 # f"""{'Rnd loss:':>{pad}} {locs['loss_dict']['mean_rnd_loss']:.4f}\n""" if self.alg.rnd else ""
                 # f"""{'Entropy:':>{pad}} {locs['loss_dict']['mean_entropy']:.4f}\n"""
@@ -485,14 +497,14 @@ class OnPolicyRunnerMM:
                 # f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n""" if self.alg.rnd else ""
                 # f"""{'Symmetry loss:':>{pad}} {locs['loss_dict']['symmetry']:.4f}\n""" if self.alg.symmetry else ""
 
-            if locs['loss_dict']['mean_dagger_loss'] > 0:
-                log_string += (f"""{'Dagger loss:':>{pad}} {locs['loss_dict']['mean_dagger_loss']:.4f}\n""")
-            if self.alg.rnd:
-                log_string += (f"""{'Rnd loss:':>{pad}} {locs['loss_dict']['mean_rnd_loss']:.4f}\n"""
-                               f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
-                               f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n""")
-            if self.alg.symmetry:
-                log_string += (f"""{'Symmetry loss:':>{pad}} {locs['loss_dict']['symmetry']:.4f}\n""")
+            # if locs['loss_dict']['mean_dagger_loss'] > 0:
+            #     log_string += (f"""{'Dagger loss:':>{pad}} {locs['loss_dict']['mean_dagger_loss']:.4f}\n""")
+            # if self.alg.rnd:
+            #     log_string += (f"""{'Rnd loss:':>{pad}} {locs['loss_dict']['mean_rnd_loss']:.4f}\n"""
+            #                    f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
+            #                    f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n""")
+            # if self.alg.symmetry:
+            #     log_string += (f"""{'Symmetry loss:':>{pad}} {locs['loss_dict']['symmetry']:.4f}\n""")
 
             if self.amp_cfg:
                 log_string += (f"""{'Mean amp loss:':>{pad}} {locs['loss_dict']['mean_amp_loss']:.4f}\n""")
@@ -524,13 +536,21 @@ class OnPolicyRunnerMM:
             #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
 
         log_string += ep_string
+        # log_string += (
+        #     f"""{'-' * width}\n"""
+        #     f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
+        #     f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
+        #     f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
+        #     f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
+        #                        locs['num_learning_iterations'] - locs['it']):.1f}s\n"""
+        # )
         log_string += (
             f"""{'-' * width}\n"""
             f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
             f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
-            f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
-            f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
-                               locs['num_learning_iterations'] - locs['it']):.1f}s\n"""
+            f"""{'Time elapsed:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
+            f"""{'ETA:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time / (locs['it'] - locs['start_iter'] + 1) * (
+                               locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])))}\n"""
         )
         print(log_string)
 
@@ -568,7 +588,7 @@ class OnPolicyRunnerMM:
             self.writer.save_model(path, self.current_learning_iteration)
 
     def load(self, path, load_optimizer=True):
-        loaded_dict = torch.load(path, map_location=self.device)
+        loaded_dict = torch.load(path, map_location=self.device, weights_only=True)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])

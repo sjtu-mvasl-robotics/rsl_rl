@@ -7,6 +7,7 @@
 # Created by Yifei Yao, 2024-12-21
 
 from __future__ import annotations
+from calendar import c
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,6 +92,20 @@ class SwiGLUEmbedding(nn.Module):
         # Element-wise multiplication, followed by the final projection
         return self.w2(gate * value)
     
+class MLPEmbedding(nn.Module):
+    """A simple MLP block for embedding a single observation group."""
+    def __init__(self, input_dim: int, d_model: int, expansion_factor: int = 2):
+        super().__init__()
+        hidden_dim = int(expansion_factor * d_model)
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, d_model)
+        )
+        
+    def forward(self, x):
+        return self.mlp(x)
 class HistoryEncoder(nn.Module):
     """
     HistoryEncoder is a temporal encoder for history observations.
@@ -104,9 +119,8 @@ class HistoryEncoder(nn.Module):
             nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
         )
         flattened_size = 64 * history_length
-        
-        self.projection = SwiGLUEmbedding(flattened_size, d_model, swiglu_expansion_factor) if use_swiglu else nn.Linear(flattened_size, d_model)
-
+        current_embedding = SwiGLUEmbedding if use_swiglu else MLPEmbedding
+        self.projection = current_embedding(flattened_size, d_model, int(flattened_size / d_model)+1)
     def forward(self, x_seq: torch.Tensor):
         # x_seq has shape (B, history_length, group_per_step_dim)
         x_conv_in = x_seq.permute(0, 2, 1)
@@ -780,6 +794,7 @@ class DebugMLP(nn.Module):
             dropout = 0.0,
             name = "",
             ls_init_values = 1e-3,
+            layer_dims = [512, 256, 128],
             **kwargs
     ):
         super().__init__()
@@ -788,7 +803,7 @@ class DebugMLP(nn.Module):
         self.ref_obs_size = ref_obs_size
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
-        self.layers_dim = [512, 256, 128]
+        self.layers_dim = layer_dims
         self.layers = nn.Sequential(
             nn.Linear(obs_size + ref_obs_size, self.layers_dim[0]),
             nn.ReLU(),
@@ -901,13 +916,29 @@ class ActorCriticMMTransformer(nn.Module):
         critic_weights = {k[len('critic.'):]: v for k, v in model_state_dict.items() if k.startswith('critic')}
         actor_state_dict = self.actor.state_dict()
         critic_state_dict = self.critic.state_dict()
+        new_actor_weights = {}
+        new_critic_weights = {}
         # perform weights checking
         for k, v in actor_weights.items():
             if k not in actor_state_dict:
-                raise KeyError(f"Key {k} not found in actor state_dict")
+                print(f"Warning: Key {k} not found in actor state_dict, removing...")
+                continue
             if actor_state_dict[k].shape != v.shape:
-                raise ValueError(f"Shape mismatch for key {k}: {actor_state_dict[k].shape} vs {v.shape}")
+                print(f"Warning: Shape mismatch for key {k}: {actor_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_actor_weights[k] = v
+                
+        for k, v in critic_weights.items():
+            if k not in critic_state_dict:
+                print(f"Warning: Key {k} not found in critic state_dict, removing...")
+                continue
+            if critic_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {critic_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_critic_weights[k] = v   
             
+        actor_weights = new_actor_weights
+        critic_weights = new_critic_weights
         # perform actor state dict fullfilling
         for k, v in actor_state_dict.items():
             if k not in actor_weights:
@@ -919,8 +950,20 @@ class ActorCriticMMTransformer(nn.Module):
         # load the weights
         # self.actor.load_state_dict(dagger_weights)
         self.actor.load_state_dict(actor_weights)
-        self.critic.load_state_dict(critic_weights)
+        # self.critic.load_state_dict(critic_weights)
         print(f"Loaded actor weights from {path} to actor and critic")
+        
+        # load std
+        if self.noise_std_type == "scalar":
+            assert "std" in model_state_dict.keys(), f"Key 'std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.std.data = model_state_dict["std"]
+        elif self.noise_std_type == "log":
+            assert "log_std" in model_state_dict.keys(), f"Key 'log_std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.log_std.data = model_state_dict["log_std"]
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        
+        print(f"Loaded actor noise std from {path}")
         
     def load_dagger_weights(self, path):
         state_dict = torch.load(path, map_location="cpu")
@@ -940,15 +983,16 @@ class ActorCriticMMTransformer(nn.Module):
         # load the weights
         # self.actor.load_state_dict(dagger_weights)
         self.actor_dagger.load_state_dict(dagger_weights)
-        self.actor.load_state_dict(dagger_weights)
+        # self.actor.load_state_dict(dagger_weights)
         if self.noise_std_type == "scalar":
             assert "std" in model_state_dict.keys(), f"Key 'std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
-            self.std.data = model_state_dict["std"]
+            # self.std.data = model_state_dict["std"]
             self.std_dagger = nn.Parameter(model_state_dict["std"])
         elif self.noise_std_type == "log":
             assert "log_std" in model_state_dict.keys(), f"Key 'log_std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
-            self.log_std.data = model_state_dict["log_std"]
+            # self.log_std.data = model_state_dict["log_std"]
             self.log_std_dagger = nn.Parameter(model_state_dict["log_std"])
+            self.log_std_dagger.requires_grad = False
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         
@@ -1085,16 +1129,32 @@ class ActorCriticDebugMLP(nn.Module):
             num_layers=4,
             num_heads=8,
             init_noise_std=1.0,
+            load_dagger=False,
+            load_dagger_path=None,
+            load_actor_path=None,
+            noise_std_type: str = "scalar",
             **kwargs
     ):
         super().__init__()
         self.actor = DebugMLP(num_actor_obs, num_actor_ref_obs, num_actions)
-        self.critic = DebugMLP(num_critic_obs, num_critic_ref_obs, 1)
-        print(f"Actor Transformer: {self.actor}")
-        print(f"Critic Transformer: {self.critic}")
+        self.critic = DebugMLP(num_critic_obs, num_critic_ref_obs, 1, layer_dims=[768, 512, 128]) # 1 for value function
+        print(f"Actor MLP: {self.actor}")
+        print(f"Critic MLP: {self.critic}")
+        self.noise_std_type = noise_std_type
         # Action noise
-        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+        if noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+        elif noise_std_type == "scalar":    
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         self.distribution = None
+        if load_dagger:
+            self.actor_dagger = DebugMLP(num_actor_obs, 0, num_actions)
+            print(f"Dagger Model: {self.actor_dagger}")
+            self.load_dagger_weights(load_dagger_path)
+        else:
+            self.actor_dagger = None
+        if load_actor_path:
+            self.load_actor_weights(load_actor_path)
         # disable args validation for speedup
         Normal.set_default_validate_args = False
         
@@ -1105,6 +1165,102 @@ class ActorCriticDebugMLP(nn.Module):
             torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
             for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
         ]
+    
+    
+    def load_actor_weights(self, path):
+        state_dict = torch.load(path, map_location="cpu")
+        # check for 'actor' in the state_dict keys
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the actor_dagger weights through layer name matching (starting with 'actor')
+        actor_weights = {k[len('actor.'):]: v for k, v in model_state_dict.items() if k.startswith('actor')}
+        critic_weights = {k[len('critic.'):]: v for k, v in model_state_dict.items() if k.startswith('critic')}
+        actor_state_dict = self.actor.state_dict()
+        critic_state_dict = self.critic.state_dict()
+        new_actor_weights = {}
+        new_critic_weights = {}
+        # perform weights checking
+        for k, v in actor_weights.items():
+            if k not in actor_state_dict:
+                print(f"Warning: Key {k} not found in actor state_dict, removing...")
+                continue
+            if actor_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {actor_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_actor_weights[k] = v
+                
+        for k, v in critic_weights.items():
+            if k not in critic_state_dict:
+                print(f"Warning: Key {k} not found in critic state_dict, removing...")
+                continue
+            if critic_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {critic_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_critic_weights[k] = v   
+            
+        actor_weights = new_actor_weights
+        critic_weights = new_critic_weights
+        # perform actor state dict fullfilling
+        for k, v in actor_state_dict.items():
+            if k not in actor_weights:
+                actor_weights[k] = v
+                
+        for k, v in critic_state_dict.items():
+            if k not in critic_weights:
+                critic_weights[k] = v
+        # load the weights
+        # self.actor.load_state_dict(dagger_weights)
+        self.actor.load_state_dict(actor_weights)
+        # self.critic.load_state_dict(critic_weights)
+        print(f"Loaded actor weights from {path} to actor and critic")
+        
+        # load std
+        if self.noise_std_type == "scalar":
+            assert "std" in model_state_dict.keys(), f"Key 'std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.std.data = model_state_dict["std"]
+        elif self.noise_std_type == "log":
+            assert "log_std" in model_state_dict.keys(), f"Key 'log_std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.log_std.data = model_state_dict["log_std"]
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        print(f"Loaded actor noise std from {path}")
+        
+    def load_dagger_weights(self, path):
+        state_dict = torch.load(path, map_location="cpu")
+        # check for 'actor' in the state_dict keys
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the actor_dagger weights through layer name matching (starting with 'actor')
+        dagger_weights = {k[len('actor.'):]: v for k, v in model_state_dict.items() if k.startswith('actor')}
+        dagger_state_dict = self.actor_dagger.state_dict()
+        # perform weights checking
+        for k, v in dagger_weights.items():
+            if k not in dagger_state_dict:
+                raise KeyError(f"Key {k} not found in actor_dagger state_dict")
+            if dagger_state_dict[k].shape != v.shape:
+                raise ValueError(f"Shape mismatch for key {k}: {dagger_state_dict[k].shape} vs {v.shape}")
+        # load the weights
+        # self.actor.load_state_dict(dagger_weights)
+        self.actor_dagger.load_state_dict(dagger_weights)
+        if self.noise_std_type == "scalar":
+            assert "std" in model_state_dict.keys(), f"Key 'std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.std.data = model_state_dict["std"]
+            self.std_dagger = nn.Parameter(model_state_dict["std"])
+            self.std_dagger.requires_grad = False
+        elif self.noise_std_type == "log":
+            assert "log_std" in model_state_dict.keys(), f"Key 'log_std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.log_std.data = model_state_dict["log_std"]
+            self.log_std_dagger = nn.Parameter(model_state_dict["log_std"])
+            self.log_std_dagger.requires_grad = False
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        
+        self.distribution_dagger = None
+            
+        print(f"Loaded dagger weights from {path} to actor_dagger")
+        
 
     def reset(self, dones=None):
         pass
@@ -1119,6 +1275,18 @@ class ActorCriticDebugMLP(nn.Module):
     @property
     def action_std(self):
         return self.distribution.stddev
+    
+    @property
+    def action_mean_dagger(self):
+        return self.distribution_dagger.mean
+    
+    @property
+    def action_std_dagger(self):
+        return self.distribution_dagger.stddev
+    
+    @property
+    def entropy_dagger(self):
+        return self.distribution_dagger.entropy().sum(dim=-1)
 
     @property
     def entropy(self):
@@ -1126,7 +1294,11 @@ class ActorCriticDebugMLP(nn.Module):
 
     def update_distribution(self, observations, ref_observations=None, **kwargs):
         mean = self.actor(observations, ref_observations, **kwargs)
-        self.distribution = Normal(mean, 0.0 * mean + self.std)
+        if self.noise_std_type == "scalar":
+            std = self.std.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std).expand_as(mean)
+        self.distribution = Normal(mean, std)
 
     def act(self, observations, ref_observations=None, **kwargs):
         self.update_distribution(observations, ref_observations, **kwargs)
@@ -1136,12 +1308,37 @@ class ActorCriticDebugMLP(nn.Module):
     # def act_inference(self, observations, ref_observations=None, **kwargs):
     #     return self.actor(observations, ref_observations, **kwargs)
 
-    def get_actions_log_prob(self, actions):
-        return self.distribution.log_prob(actions).sum(dim=-1)
-
     def act_inference(self, observations, ref_observations=None, **kwargs):
         actions_mean = self.actor(observations, ref_observations, **kwargs)
         return actions_mean
+    
+    
+    def update_distribution_dagger(self, observations, ref_observations=None, **kwargs):
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        mean = self.actor_dagger(observations, ref_observations, **kwargs)
+        if self.noise_std_type == "scalar":
+            std = self.std_dagger.expand_as(mean)
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std_dagger).expand_as(mean)
+        self.distribution_dagger = Normal(mean, std)
+   
+    def act_dagger(self, observations, ref_observations=None, **kwargs):
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        self.update_distribution_dagger(observations, ref_observations, **kwargs)
+        sample = self.distribution_dagger.sample()
+        return sample
+    
+    def act_dagger_inference(self, observations, ref_observations=None, **kwargs):
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        actions_mean = self.actor_dagger(observations, ref_observations, **kwargs)
+        return actions_mean
+
+    def get_actions_log_prob(self, actions):
+        return self.distribution.log_prob(actions).sum(dim=-1)
+    
+    def get_actions_log_prob_dagger(self, actions):
+        return self.distribution_dagger.log_prob(actions).sum(dim=-1)
+
 
     def evaluate(self, critic_observations, ref_critic_observations=None, **kwargs):
         value = self.critic(critic_observations, ref_critic_observations, **kwargs)
@@ -1173,7 +1370,7 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
         nn.Module.__init__(self)
         assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
         self.actor = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor", dropout=dropout, concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], history_length=history_length, **kwargs)
-        self.actor_dagger = MMTransformerV2(num_actions, dim_model, term_dict["policy"], ref_term_dict["policy"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], history_length=history_length, **kwargs) if load_dagger else None
+        self.actor_dagger = MMTransformerV2(num_actions, dim_model, term_dict["policy"], None, max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="actor_dagger", dropout=dropout, concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=None, history_length=history_length, **kwargs) if load_dagger else None
         # Action noise
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":

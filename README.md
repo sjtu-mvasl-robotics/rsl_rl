@@ -2,7 +2,20 @@
 
 Re-implemented some components for better imitation learning. For details please refer to [GBC](https://github.com/sjtu-mvasl-robotics/GBC.git)
 
+
 **!!! Important !!!**:
+
+* **MAJOR UPDATE on 2025-10-08**: 
+
+  The current version is `2.3.1.dev3`.
+
+From now on, the original amp trajectory calculation method is deprecated. The old version of `GBC` is also deprecated (you must update GBC too). And for better time efficiency, the old version `MMTransformer` is now only used for massive motion imitation. For regular IL tasks with AMP or with larger number of envs, please use `MMGPT` instead (this version is much faster and more memory efficient).
+
+This code is a pre release. For technological details, please refer to our yet-to-be-published paper at CORL 2026.
+
+Now we also support RL training with multiple modalities (we have kept room for vision, text, and other input that you can think of). However, adding new modalities will not be released in the main branch. For simple versions, please refer to the `experimental` branch. For more complex versions, please contact me directly at [yifei](mailto:yao.yifei.ro@gmail.com).
+
+As I am graduating from SJTU soon, this repo might not be maintained for long. Please use it with caution. And with the graduation comming soon, I won't syncheronize this repo with the original `rsl_rl` repo anymore (maybe I will do it after I find a PhD position).
 
 ~~This version (`2.x.x-devx`) is not compatible with `legged_gym` since the interface (original interface) has been severely modified by ETHZ and NVIDIA. To install the version for `legged_gym`, please use the `1.0.2` branch~~. 
 

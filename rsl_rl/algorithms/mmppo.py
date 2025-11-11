@@ -7,13 +7,16 @@
 # Created by Yifei Yao, 10/12/2024
 
 from __future__ import annotations
+from weakref import ref
 
+from numpy import std
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import itertools
 
+from torch.utils import weak
 from torch.xpu import memory
 
 from rsl_rl.modules import ActorCriticMMTransformer, AMPNet, ActorCriticMMTransformerV2, ActorCriticMMGPT
@@ -108,7 +111,7 @@ class MMPPO:
         min_lr_restriction_epoch=25000,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
-        schedule="fixed",
+        schedule="fixed", # "fixed", "adaptive", "linear", "cosine"
         desired_kl=0.01,
         device="cpu",
         normalize_advantage_per_mini_batch=False,
@@ -203,6 +206,7 @@ class MMPPO:
 
         self.desired_kl = desired_kl
         self.schedule = schedule
+        
         self.learning_rate = learning_rate
         self.max_lr = max_lr
         self.min_lr = min_lr
@@ -233,16 +237,18 @@ class MMPPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         self.storage = None  # initialized later
+        is_log_std = self.actor_critic.noise_std_type == "log"
         self.optimizer = optim.AdamW(
             itertools.chain(
                 self.actor_critic.actor.parameters(),
-                self.actor_critic.critic.parameters()
+                self.actor_critic.critic.parameters(),
+                [self.actor_critic.std] if not is_log_std else [self.actor_critic.log_std],
             ),
             lr=learning_rate) # Avoid optimizing dagger parameters if self.teacher_coef is None
         self.imitation_optimizer = optim.AdamW(
             itertools.chain(
                 self.actor_critic.actor.parameters(),
-                self.actor_critic.critic.parameters()
+                [self.actor_critic.std_dagger] if not is_log_std else [self.actor_critic.log_std_dagger],
             ),
             lr=learning_rate) if self.teacher_coef is not None else None
         # self.optimizer = optim.AdamW(
@@ -251,6 +257,19 @@ class MMPPO:
         # )
         self.teacher_update_interval = teacher_update_interval
         self.transition = RolloutStorageMM.Transition()
+        
+        if self.schedule == "linear":
+            self.lr_scheduler = optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lambda epoch: 1 - epoch / num_learning_epochs
+            )
+        elif self.schedule == "cosine":
+            self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=num_learning_epochs,# * num_mini_batches, # total number of updates
+            )
+        else:
+            self.lr_scheduler = None
 
         if self.teacher_coef is not None and self.teacher_loss_coef is not None:
             assert self.teacher_coef_mode in ["kl", "norm", "original_kl"], "teacher_coef_mode should be either 'kl' or 'norm' or 'original_kl'"
@@ -336,7 +355,7 @@ class MMPPO:
         self.transition.action_mean = self.actor_critic.action_mean.detach()
         self.transition.action_sigma = self.actor_critic.action_std.detach()
         if self.teacher_coef is not None:
-            self.transition.dagger_actions = self.actor_critic.act_dagger(obs, ref_observations=ref_obs).detach()
+            self.transition.dagger_actions = self.actor_critic.act_dagger(obs, ref_observations=None).detach()
             _ = self.actor_critic.get_actions_log_prob_dagger(self.transition.dagger_actions)
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
@@ -345,6 +364,11 @@ class MMPPO:
         self.transition.critic_observations = critic_obs 
         self.transition.critic_reference_observations = ref_critic_obs[0] if ref_critic_obs is not None else None
         self.transition.critic_reference_observations_mask = ref_critic_obs[1] if ref_critic_obs is not None else None
+        if self.amp_cfg is not None and ref_critic_obs[0] is not None:
+            self.transition.amp_observations = string_to_callable(self.amp_cfg["amp_obs_extractor"])(env=self.amp_cfg["_env"])
+            ref_amp_observation, ref_amp_mask = string_to_callable(self.amp_cfg["amp_ref_obs_extractor"])(env=self.amp_cfg["_env"])
+            self.transition.amp_reference_observations = ref_amp_observation
+            self.transition.amp_reference_observations_mask = ref_amp_mask
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
@@ -404,12 +428,14 @@ class MMPPO:
             mean_pred_neg_prob = 0.0
 
         if self.actor_critic.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-        # else:
-        # assert self.actor_critic.is_recurrent == False, "MM-PPO does not support recurrent actor-critic networks."
+            # generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.buffer_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        else:
+            assert self.actor_critic.is_recurrent == False, "MM-PPO does not support recurrent actor-critic networks."
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         assert self.storage is not None, "Storage is not initialized. Please call init_storage before update."
         print_gpu_memory_summary("before mini_batch_generator")
-        generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        
         for (
             obs_batch,
             ref_obs_batch,
@@ -433,11 +459,10 @@ class MMPPO:
             ref_obs_cur_state,
             ref_obs_cur_mask,
         ) in generator:
-           
 
             num_aug = 1
 
-            original_batch_size = obs_batch.shape[0]
+            original_batch_size = obs_batch.shape[-2]
 
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -449,7 +474,7 @@ class MMPPO:
                     obs=obs_batch, ref_obs=ref_obs_batch, actions=actions_batch, env=self.symmetry["_env"], obs_type="policy"
                 )
 
-                num_aug = int(obs_batch.shape[0] / original_batch_size)
+                num_aug = int(obs_batch.shape[-2] / original_batch_size)
 
                 old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
                 target_values_batch = target_values_batch.repeat(num_aug, 1)
@@ -457,7 +482,7 @@ class MMPPO:
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
             with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, mask=masks_batch, memory=hid_states_batch)
+                self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=hid_states_batch)
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
                 value_batch = self.actor_critic.evaluate(
                     critic_obs_batch, ref_critic_observations=critic_ref_obs_batch,
@@ -472,7 +497,7 @@ class MMPPO:
             # This loss is calculated only when critic_ref_obs_batch is not None, otherwise 0.0
             # By default, we assume that ref_action_batch = critic_ref_obs_batch[0][:, ref_action_idx: num_actions + ref_action_idx] where ref_action_idx = 0
             # Loss: \sum_i [\sqrt(2 * \pi * \sigma_i^2) + (mu_i - ref_action_i)^2 / (2 * \sigma_i^2)]
-            
+            # print("Inside update, current schedule is:", self.schedule)
             print_gpu_memory_summary("After forward pass")
             if self.max_lr_restriction_epoch != 0 and epoch > self.max_lr_restriction_epoch:
                 self.max_lr = self.max_lr_after_certain_epoch
@@ -508,9 +533,20 @@ class MMPPO:
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
-
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
+                        
+            elif self.schedule == "linear" or self.schedule == "cosine":
+                if self.is_multi_gpu:
+                    lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                    torch.distributed.broadcast(lr_tensor, src=0)
+                    self.learning_rate = lr_tensor.item()
+                self.lr_scheduler.step()
+                self.learning_rate = self.lr_scheduler.get_last_lr()[0]
+                # print(f"Updated learning rate to {self.learning_rate} at epoch {epoch}.")
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
 
             # Surrogate loss
             with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
@@ -545,7 +581,7 @@ class MMPPO:
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
                     with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                        mean_actions_batch = self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch, mask=masks_batch)
+                        mean_actions_batch = self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch)
 
                         action_mean_orig = mean_actions_batch[:original_batch_size]
                         _, _, actions_mean_symm_batch = data_augmentation_func(
@@ -622,7 +658,7 @@ class MMPPO:
                         hook = layer.register_forward_pre_hook(DebugHook(f"critic.decoder.layer.{i}"))
                         critic_hooks.append(hook)
                     # Re-run forward pass to trigger hooks: act & evaluate
-                    self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, mask=masks_batch, memory=hid_states_batch)
+                    self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=hid_states_batch)
                     _ = self.actor_critic.evaluate(
                         critic_obs_batch, ref_critic_observations=critic_ref_obs_batch,
                         masks=masks_batch, memory=hid_states_batch
@@ -811,7 +847,15 @@ class MMPPO:
         """Collect gradients from all GPUs and average them."""
         actor_grads = [param.grad.view(-1) for param in self.actor_critic.actor.parameters() if param.grad is not None]
         critic_grads = [param.grad.view(-1) for param in self.actor_critic.critic.parameters() if param.grad is not None]
-        grads = actor_grads + critic_grads
+        std_grads = []
+        is_log_std = hasattr(self.actor_critic, "log_std")
+        if not is_log_std:
+            std_param = self.actor_critic.std
+        else:
+            std_param = self.actor_critic.log_std
+        if std_param.grad is not None:
+            std_grads.append(std_param.grad.view(-1))
+        grads = actor_grads + critic_grads + std_grads
         if self.rnd:
             grads += [param.grad.view(-1) for param in self.rnd.predictor.parameters() if param.grad is not None]
         if self.amp:
@@ -819,10 +863,11 @@ class MMPPO:
         all_grads = torch.cat(grads)
         torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
         all_grads /= self.gpu_world_size
-
+        is_log_std = hasattr(self.actor_critic, "log_std")
         all_params = itertools.chain(
             self.actor_critic.actor.parameters(),
             self.actor_critic.critic.parameters(),
+            [self.actor_critic.std] if not is_log_std else [self.actor_critic.log_std],
             self.rnd.predictor.parameters() if self.rnd else [],
             self.amp.parameters() if self.amp else []
         )
@@ -868,7 +913,7 @@ class MMPPO:
                 mu_batch = self.actor_critic.action_mean
                 sigma_batch = self.actor_critic.action_std
                 with torch.no_grad():
-                    self.actor_critic.act_dagger(obs_batch, ref_obs_batch)
+                    self.actor_critic.act_dagger(obs_batch, None)
                     dagger_mu_batch = self.actor_critic.action_mean_dagger.detach()
                     dagger_sigma_batch = self.actor_critic.action_std_dagger.detach()
                 imitation_loss = torch.sum(
@@ -884,7 +929,7 @@ class MMPPO:
                     predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
                 with torch.no_grad():
                     with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=None)
                 imitation_loss = torch.norm(
                     (predicted_actions - dagger_actions_batch)
                 ).mean()
@@ -903,7 +948,7 @@ class MMPPO:
     #     return imitation_loss
     
     def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch): # for this function, we haven't figured out how to use autocast. Maybe a seperate scaler is needed.
-        output = self.actor_critic.act_dagger_inference(obs_batch, ref_observations=ref_obs_batch)
+        output = self.actor_critic.act_dagger_inference(obs_batch, ref_observations=None)
         with torch.no_grad():
             gt = self.teacher_coef * output + (1 - self.teacher_coef) * self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch)
         gt = gt.detach()

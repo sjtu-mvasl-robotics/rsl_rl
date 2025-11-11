@@ -11,6 +11,7 @@ from .utils import (
     store_code_state,
     string_to_callable,
     unpad_trajectories,
+    split_and_pad_trajectories_front
 )
 
 from .network_utils import build_backbone
@@ -18,6 +19,7 @@ from .network_utils import build_backbone
 __all__ = [
     "resolve_nn_activation",
     "split_and_pad_trajectories",
+    "split_and_pad_trajectories_front",
     "store_code_state",
     "string_to_callable",
     "unpad_trajectories",
