@@ -6,8 +6,9 @@
 from __future__ import annotations
 import warnings
 
-from torch.onnx.symbolic_opset9 import zero
-from rsl_rl.modules import ActorCritic, ActorCriticMMTransformer, SwiGLUEmbedding, group_by_concat_list
+from torch.distributed.checkpoint import state_dict
+from rsl_rl.modules import ActorCritic, ActorCriticMMTransformer, SwiGLUEmbedding, group_by_concat_list, HistoryEmbedding
+from rsl_rl.modules.actor_critic_mlp_v2 import FusedMultiModalMLP
 from rsl_rl.networks import Memory, RoPETransformer
 from rsl_rl.utils import resolve_nn_activation, unpad_trajectories
 import torch
@@ -17,6 +18,9 @@ from torch.nn.attention import SDPBackend
 from torch.distributions import Normal
 import math
 from typing import Optional, Tuple, List, Union, Dict
+from torch.func import functional_call, vmap
+
+
 
 def generate_block_causal_mask(T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """
@@ -77,7 +81,7 @@ class SequenceCompressor(nn.Module):
     
 
 class MLPEmbedding(nn.Module):
-    def __init__(self, input_dim, dim_model, expansion_factor: int = 2):
+    def __init__(self, input_dim, dim_model, expansion_factor: int = 2, steps: int = 1):
         super().__init__()
         self.input_dim = input_dim
         self.dim_model = dim_model
@@ -170,7 +174,7 @@ class ObservationSeqEmbedding(nn.Module):
         return embedding_flat.reshape(T, B, -1)
     
 class ObservationSeqEmbeddingV2(nn.Module):
-    def __init__(self, d_model: int, term_dict: Dict[str, int], concatenate_term_names: Optional[List[List[str]]] = None, SwiGLU = False, **kwargs):
+    def __init__(self, d_model: int, term_dict: Dict[str, int], concatenate_term_names: Optional[List[List[str]]] = None, SwiGLU = False, nheads = 4, term_steps: Optional[Dict[str, int]] = None,  **kwargs):
         super().__init__()
         
         self.term_names = list(term_dict.keys())
@@ -181,10 +185,29 @@ class ObservationSeqEmbeddingV2(nn.Module):
         self.num_groups = len(self.group_term_names)
         self.d_model = d_model
         embedding_mlp = SwiGLUEmbedding if SwiGLU else MLPEmbedding
+        if term_steps is None or len(term_steps) == 0:
+            term_steps = {name: 1 for name in self.term_names}
+        
+        # create group term steps
+        self.group_term_steps = []
+        for group_names in self.group_term_names:
+            steps = [term_steps[name] for name in group_names]
+            assert all(s == steps[0] for s in steps), "Expected all terms in a group to have the same number of steps, but got {steps} for group {group_names}."
+            self.group_term_steps.append(steps[0])
+        embedding_mlps = [embedding_mlp if steps == 1 else HistoryEmbedding for steps in self.group_term_steps]
         
         self.embeddings = nn.ModuleList([
-            embedding_mlp(sum(dims), d_model, 1+int(sum(dims)/d_model)) for dims in self.group_term_dims
+            # embedding_mlp(sum(dims), d_model, 1+int(sum(dims)/d_model)) for dims in self.group_term_dims
+            embedding_mlps[i](sum(self.group_term_dims[i]), d_model, 1+int(sum(self.group_term_dims[i])/d_model), self.group_term_steps[i]) for i in range(self.num_groups)
         ])
+        self.pre_norm = nn.LayerNorm(d_model)
+        # self.attn_pool = nn.MultiheadAttention(d_model, nheads, batch_first=True, dropout=0.0)
+        # self.pool_q = nn.Parameter(torch.randn(1, 1, d_model))
+        self.gating_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, 1)
+        ) # score
         
         self.norm = nn.LayerNorm(d_model)
         
@@ -207,10 +230,104 @@ class ObservationSeqEmbeddingV2(nn.Module):
             
             token_i = self.embeddings[i](group_obs_flat) # [T * B, d_model]
             token_list.append(token_i)
-        structural_token_seq = torch.stack(token_list, dim=1)
-        pooled_embedding_flat = torch.mean(structural_token_seq, dim=1)
-        normalized_embedding_flat = self.norm(pooled_embedding_flat)
+        structural_token_seq = torch.stack(token_list, dim=1) # [T * B, num_groups, d_model]
+        structural_token_seq = self.pre_norm(structural_token_seq)
+        # query = self.pool_q.expand(T * B, -1, -1)  # [T*B, 1, d_model]
+        # pooled_embedding_flat, _ = self.attn_pool(
+        #     query,
+        #     structural_token_seq,
+        #     structural_token_seq,
+        # )  # [T*B, 1, d_model]
+        
+        # # residual
+        # pooled_embedding_flat = self.norm(pooled_embedding_flat + query)
+        scores = self.gating_mlp(structural_token_seq) # [T*B, num_groups, 1]
+        weights = F.softmax(scores, dim=1) # [T*B, num_groups, 1]
+        pooled_embedding_flat = torch.sum(weights * structural_token_seq, dim=1, keepdim=True) # [T*B, 1, d_model]
+        normalized_embedding_flat = self.norm(pooled_embedding_flat.squeeze(1))  # [T*B, d_model]
         return normalized_embedding_flat.reshape(T, B, self.d_model)
+    
+    
+class ObservationSeqEmbeddingV3(nn.Module): # Simple MLP concatenation version
+    def __init__(self, d_model: int, term_dict: Dict[str, int], concatenate_term_names: Optional[List[List[str]]] = None, SwiGLU = False, nheads = 4, term_steps: Optional[Dict[str, int]] = None,  **kwargs):
+        super().__init__()
+        
+        self.term_names = list(term_dict.keys())
+        self.term_dims = list(term_dict.values())
+        
+        self.group_term_names, self.group_term_dims, self.group_term_idx = group_by_concat_list(term_dict, concatenate_term_names)
+        
+        self.num_groups = len(self.group_term_names)
+        self.d_model = d_model
+        self.high_expansion = 2
+        self.expanded_feature_dim = d_model
+        # embedding_mlp = SwiGLUEmbedding if SwiGLU else MLPEmbedding
+        if term_steps is None or len(term_steps) == 0:
+            term_steps = {name: 1 for name in self.term_names}
+        
+        # create group term steps
+        self.group_term_steps = []
+        for group_names in self.group_term_names:
+            steps = [term_steps[name] for name in group_names]
+            assert all(s == steps[0] for s in steps), "Expected all terms in a group to have the same number of steps, but got {steps} for group {group_names}."
+            self.group_term_steps.append(steps[0])
+        embedding_mlps = [nn.Identity() if steps == 1 else HistoryEmbedding for steps in self.group_term_steps]
+        
+        self.embeddings = nn.ModuleList([
+            # embedding_mlp(sum(dims), d_model, 1+int(sum(dims)/d_model)) for dims in self.group_term_dims
+            embedding_mlps[i](sum(self.group_term_dims[i]), self.expanded_feature_dim, 1+int(sum(self.group_term_dims[i])/self.expanded_feature_dim), self.group_term_steps[i])  if not isinstance(embedding_mlps[i], nn.Identity) else nn.Identity() for i in range(self.num_groups)
+        ])
+        # compute in features
+        in_features = sum([sum(self.group_term_dims[i]) if isinstance(self.embeddings[i], nn.Identity) else self.expanded_feature_dim for i in range(self.num_groups)])
+        # self.pre_norm = nn.LayerNorm(d_model)
+        # self.attn_pool = nn.MultiheadAttention(d_model, nheads, batch_first=True, dropout=0.0)
+        # self.pool_q = nn.Parameter(torch.randn(1, 1, d_model))
+        self.out_mlp = nn.Sequential(
+            nn.Linear(in_features, d_model * 2),
+            nn.ELU(),
+            nn.Linear(d_model * 2, d_model)
+        )
+        self.norm = nn.LayerNorm(d_model)
+        
+        start = 0
+        self.term_slices = []
+        for dim in self.term_dims:
+            self.term_slices.append(slice(start, start + dim))
+            start += dim
+
+    def forward(self, obs_seq: torch.Tensor):
+        # [T, B, obs_dim]
+        T, B, _ = obs_seq.shape
+        
+        # [T * B, obs_dim]
+        obs_flat = obs_seq.reshape(T * B, -1)
+        
+        token_list = []
+        for i, group_term_idx in enumerate(self.group_term_idx):
+            group_obs_flat = torch.cat([obs_flat[:, self.term_slices[j]] for j in group_term_idx], dim=-1)
+            
+            token_i = self.embeddings[i](group_obs_flat) # [T * B, d_model]
+            token_list.append(token_i)
+        # structural_token_seq = torch.stack(token_list, dim=1) # [T * B, num_groups, d_model]
+        structural_token_seq = torch.concat(token_list, dim=-1) # should be [T*B, d_in]
+        structural_token_seq = structural_token_seq.reshape(T * B, -1) # [T * B, num_groups * d_model]
+        structural_token_seq = self.out_mlp(structural_token_seq) # [T * B, d_model]
+        structural_token_seq = self.norm(structural_token_seq)
+        # structural_token_seq = self.pre_norm(structural_token_seq)
+        # query = self.pool_q.expand(T * B, -1, -1)  # [T*B, 1, d_model]
+        # pooled_embedding_flat, _ = self.attn_pool(
+        #     query,
+        #     structural_token_seq,
+        #     structural_token_seq,
+        # )  # [T*B, 1, d_model]
+        
+        # # residual
+        # pooled_embedding_flat = self.norm(pooled_embedding_flat + query)
+        # scores = self.gating_mlp(structural_token_seq) # [T*B, num_groups, 1]
+        # weights = F.softmax(scores, dim=1) # [T*B, num_groups, 1]
+        # pooled_embedding_flat = torch.sum(weights * structural_token_seq, dim=1, keepdim=True) # [T*B, 1, d_model]
+        # normalized_embedding_flat = self.norm(pooled_embedding_flat.squeeze(1))  # [T*B, d_model]
+        return structural_token_seq.reshape(T, B, self.d_model)
     
 
 class MMGPT(nn.Module):
@@ -227,6 +344,7 @@ class MMGPT(nn.Module):
         name = "",
         term_dict = None,
         ref_term_dict = None,
+        ref_term_steps: Optional[Dict[str, int]] = None, # hint: only ref terms support step-wise history encoding for now. We don't provide future information in obs terms.
         concatenate_term_names: Optional[List[List[str]]] = None,
         concatenate_ref_term_names: Optional[List[List[str]]] = None,
         num_steps_per_env = 24, # default, remember to parse this!
@@ -235,9 +353,18 @@ class MMGPT(nn.Module):
         apply_rope = False, # default: APE; set True to use RoPE
         apply_res = True,
         ref_first = True,
+        # HINT: The following parameters matters **SIGNIFICANTLY** to the performance for allowing temporal prediction features!
+        pred_obs_term_names: Optional[List[str]] = None,
+        pred_obs_term_weights: Optional[List[float]] = None,
+        apply_mlp_residual = False,     
+        # some not pretty fix
+        default_joint_pos: Optional[torch.Tensor] = None,
         **kwargs
     ):
-        
+        if dim_model > 128:
+            ffn_ratio = 2
+        else:
+            ffn_ratio = 4
         super().__init__()
         self.name = name
         self.obs_dim = obs_size
@@ -246,15 +373,119 @@ class MMGPT(nn.Module):
         self.apply_rope = apply_rope
         self.apply_res = apply_res
         self.ref_first = ref_first
+        self.default_joint_pos = default_joint_pos
         if kwargs:
             print(
                 f"MMGPT {self.name}.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
             )
         self.stride = math.ceil(num_steps_per_env / max_seq_len) if num_steps_per_env > max_seq_len else 1
-        self.obs_embedding = ObservationSeqEmbeddingV2(dim_model, term_dict, concatenate_term_names)
-        self.ref_obs_embedding = ObservationSeqEmbeddingV2(dim_model, ref_term_dict, concatenate_ref_term_names) if ref_obs_size > 0 else None
+        # self.obs_embedding = ObservationSeqEmbeddingV2(dim_model, term_dict, concatenate_term_names, nheads=num_heads)
+        # self.ref_obs_embedding = ObservationSeqEmbeddingV2(dim_model, ref_term_dict, concatenate_ref_term_names,term_steps=ref_term_steps, nheads=num_heads) if ref_obs_size > 0 else None
+        self.obs_embedding = ObservationSeqEmbeddingV3(dim_model, term_dict, concatenate_term_names, nheads=num_heads)
+        self.ref_obs_embedding = ObservationSeqEmbeddingV3(dim_model, ref_term_dict, concatenate_ref_term_names,term_steps=ref_term_steps, nheads=num_heads) if ref_obs_size > 0 else None
         self.obs_norm = nn.LayerNorm(dim_model)
         self.ref_obs_norm = nn.LayerNorm(dim_model) if ref_obs_size > 0 else None
+        
+        # dreamer reward head. Reward is R(s, a, s'), which computes by using obs[t], action[t], obs[t+1]. For reward calculation, we focus mainly on obs, ref obs should be added to the dreamer reward.
+        self.dreamer_reward_head = nn.Sequential(
+            nn.Linear(dim_model * 2 + dim_out, dim_model),
+            nn.SiLU(),
+            nn.Linear(dim_model, 1)
+        )
+        if ref_obs_size > 0:
+            self.dreamer_ref_reward_head = nn.Sequential(
+                nn.Linear(dim_model * 2 + dim_out, dim_model),
+                nn.SiLU(),
+                nn.Linear(dim_model, 1)
+            )
+        else:
+            self.dreamer_ref_reward_head = None
+        
+        # action indice
+        action_name = 'actions'
+        if action_name in term_dict:
+            start = 0
+            for term_name, term_dim in term_dict.items():
+                if term_name == action_name:
+                    self.action_slice = (start, start + term_dim)
+                    break
+                start += term_dim
+        else:
+            raise ValueError("For MMGPT to work normally, please set `last_action` term in observation terms, and name it as `actions`.")        
+        self.pred_obs_term_names = pred_obs_term_names
+        self.pred_obs_term_weights = pred_obs_term_weights
+        if self.pred_obs_term_names is not None and len(self.pred_obs_term_names) > 0:
+            assert self.pred_obs_term_weights is not None and len(self.pred_obs_term_weights) == len(self.pred_obs_term_names), "pred_obs_term_weights should be provided with the same length as pred_obs_term_names."
+
+            self.obs_indices = []
+            self.obs_dims = []
+            self.obs_term_names = []
+            start = 0
+            self.action_film = nn.Linear(dim_out, 2 * dim_model)  # for FiLM modulation of obs prediction
+            
+            # Initialize FiLM layer: Gamma=1, Beta=0
+            # This ensures that initially, the latent features are passed through without modification (Gamma=1)
+            # and the action bias is zero (Beta=0). This allows gradients to flow from Aux Loss to Backbone.
+            nn.init.normal_(self.action_film.weight, mean=0.0, std=0.01)
+            nn.init.constant_(self.action_film.bias[:dim_model], 0.5)
+            nn.init.constant_(self.action_film.bias[dim_model:], 0.5)
+            
+            for term_name, term_dim in term_dict.items():
+                if term_name in self.pred_obs_term_names:
+                    self.obs_indices.append((start, start + term_dim))
+                    self.obs_dims.append(term_dim)
+                    self.obs_term_names.append(term_name)
+                start += term_dim
+            if len(self.obs_indices) != len(self.pred_obs_term_names):
+                raise ValueError("Some pred_obs_term_names are not found in term_dict. Expected names: {}, but got: {}.".format(list(term_dict.keys()), self.pred_obs_term_names))
+            
+            self.aux_heads = nn.ModuleList()
+            for dim in self.obs_dims:
+                self.aux_heads.append(
+                    nn.Linear(dim_model, dim)
+                )
+                
+            if ref_term_dict is not None: # extract target_actions
+                if 'target_actions' not in ref_term_dict:
+                    raise ValueError("If you want to predict observation terms, please provide 'target_actions' term in ref observation terms for MMGPT.")
+                start = 0
+                for i, (term_name, term_dim) in enumerate(ref_term_dict.items()):
+                    if term_name == 'target_actions':
+                        self.target_action_slice = (start, start + term_dim)
+                        break
+                    start += term_dim
+            
+            else:
+                self.target_action_slice = None
+        else:
+            self.action_film = None
+            self.aux_heads = None
+            self.obs_indices = None
+            self.obs_dims = None
+            self.obs_term_names = None
+            self.target_action_slice = None
+                
+        self.apply_mlp_residual = apply_mlp_residual
+        if apply_mlp_residual:
+            self.mlp_bypass = FusedMultiModalMLP(
+                term_dict={name: term_dict},
+                ref_term_dict={name: ref_term_dict} if ref_obs_size > 0 else None,
+                output_size=dim_out,
+                hidden_dims=mlp_hidden_dims,
+                history_length=1,
+                activation="elu",
+                encoder_latent_dim=dim_model,
+                encoder_compress_threshold=32,
+                use_layer_norm=True,
+                fusion_mode="gated",
+            )
+            self.mlp_gate = nn.Sequential(
+                nn.Linear(dim_out * 2, dim_out),
+                nn.Sigmoid()
+            )
+        else:
+            self.mlp_bypass = None
+            self.mlp_gate = None
 
         # self.compressor = SequenceCompressor(dim_model, self.stride) if self.stride > 1 else None
         self.kernel_size = self.stride
@@ -289,16 +520,42 @@ class MMGPT(nn.Module):
                 use_sdpa=True,
             )
         self.fc = nn.Sequential(
-            nn.Linear(dim_model, dim_model * ffn_ratio),
-            nn.ELU(),
-            nn.Linear(dim_model * ffn_ratio, dim_out)
+            nn.LayerNorm(dim_model),
+            nn.Linear(dim_model, dim_model * 2),
+            nn.SiLU(),
+            nn.Linear(dim_model * 2, dim_model * 2),
+            nn.SiLU(),
+            nn.Linear(dim_model * 2, dim_out)
         )
+        nn.init.uniform_(self.fc[-1].weight, -0.003, 0.003)
+        nn.init.constant_(self.fc[-1].bias, 0.0)
 
         self.inference_buffer_obs = None # for storing inference-time past key values
         self.inference_buffer_ref_obs = None
         self.inference_buffer_ref_obs_mask = None
         self.current_timesteps = None  # Track current timesteps for each environment [B,]
         self.num_envs_cache = 0
+        
+        self.aux_loss = 0.0
+        self.aux_loss_fn = nn.MSELoss()
+        self.dreamer_loss = 0.0
+        self.dreamer_reward = 0.0
+        
+    @property
+    def device(self):
+        return next(self.parameters()).device
+    
+    @property
+    def dream_loss(self):
+        return self.dreamer_loss if self.dreamer_loss is not None and self.dreamer_loss > 0.0 else torch.tensor(0.0, device=self.device)
+    
+    @property
+    def dream_reward(self):
+        return self.dreamer_reward if self.dreamer_reward is not None and self.dreamer_reward > 0.0 else torch.tensor(0.0, device=self.device)
+
+    @property
+    def auxiliary_loss(self):
+        return self.aux_loss
         
     @staticmethod
     def unpad(padded_sequence, masks):
@@ -375,6 +632,9 @@ class MMGPT(nn.Module):
                 memory: Optional[Tuple[torch.Tensor, torch.Tensor | None]] = None, # memory token for both modalities
                 unpad_output: bool = True,
                 upsample: bool = True,
+                compute_aux_loss: bool = False,
+                compute_dreamer_loss: bool = False,
+                compute_dreamer_reward: bool = False,
                 ):
         """
         Forward pass for the multi-modality transformer in batch mode.
@@ -396,8 +656,18 @@ class MMGPT(nn.Module):
             if masks is not None:
                 masks = masks[-self.num_steps_per_env:, :]
             if ref_obs is not None:
-                ref_obs = (ref_obs[0][-self.num_steps_per_env:, :, :], ref_obs[1][-self.num_steps_per_env:, :])
-            T_in = self.num_steps_per_env     
+                ref_obs = (ref_obs[0][-self.num_steps_per_env:, :, :], ref_obs[1][-self.num_steps_per_env:, :])   
+            T_in = self.num_steps_per_env
+        
+        if ref_obs is not None:
+            ref_mlp_obs = (ref_obs[0][-1], ref_obs[1][-1])
+        else:
+            ref_mlp_obs = None
+        
+        if self.apply_mlp_residual:
+            mlp_output = self.mlp_bypass(obs[-1], ref_mlp_obs) # [B, dim_out]    
+        else:
+            mlp_output = None 
         obs_emb = self.obs_embedding(obs) # [T_in, B, D]
         res_obs_emb = obs_emb
         # Compress OBS
@@ -491,19 +761,106 @@ class MMGPT(nn.Module):
             upsampled_out = obs_out_seq # [T_in, B, D]
             
 
-        if self.apply_res:
-            # Add residual connection    
-            upsampled_out += res_obs_emb * masks.unsqueeze(-1).float()
-            if has_ref:
-                upsampled_out += res_ref_obs_emb * ref_obs_mask.unsqueeze(-1).float()
+        # if self.apply_res:
+        #     # Add residual connection    
+        #     upsampled_out = upsampled_out + res_obs_emb * masks.unsqueeze(-1).float()
+        #     if has_ref:
+        #         upsampled_out = upsampled_out + res_ref_obs_emb * ref_obs_mask.unsqueeze(-1).float()
         
-        upsampled_out = self.fc(upsampled_out) # [T_in, B, dim_out]
+        # Cache hidden state before projection (for DAgger training)
+        self.last_hidden_state = upsampled_out[-1, :, :] if not unpad_output else upsampled_out  # [B, D] or [T_in, B, D]
+        
+        if compute_aux_loss and self.aux_heads is not None:
+            self.aux_loss = 0.0
+            obs_actions = obs[:, :, self.action_slice[0]:self.action_slice[1]]  # [T_in, B, action_dim]
+            obs_actions = obs_actions[1:] # shift 1 step to ensure matching with input
+            gamma, beta = self.action_film(obs_actions).chunk(2, dim=-1)  # [T_in-1, B, D] each
+            for obs_term_slice, aux_head, weight in zip(self.obs_indices, self.aux_heads, self.pred_obs_term_weights):
+                target = obs[:, :, obs_term_slice[0]:obs_term_slice[1]] # [T_in, B, dim]
+                pred_in = upsampled_out[:-1]  # [T_in-1, B, D]
+                # FiLM modulation
+                pred_in = gamma * pred_in + beta  # [T_in-1, B, D]
+                pred = aux_head(pred_in) # [T_in - 1, B, dim]
+                # temporal shifting: note that target (obs) is the last timestep, and pred is current timestep. Thus, the computation should be between pred[:-1] and target[1:]
+                target_shifted = target[1:, :, :]
+                pred_shifted = pred
+                # compute mask: only consider valid positions in both target and pred, the mask is aligned with target_shifted
+                valid_mask = masks[1:] # shape: [T_in-1, B]
+                target_valid = target_shifted[valid_mask]
+                pred_valid = pred_shifted[valid_mask]
+                aux_loss_i = self.aux_loss_fn(pred_valid, target_valid)
+                self.aux_loss += weight * aux_loss_i            
+                
+        else:
+            self.aux_loss = 0.0
+        
+        pred_actions = self.fc(upsampled_out.detach()) # [T_in, B, dim_out]
+        
+        if compute_dreamer_reward:
+            # dreamer reward computation
+            cur_obs_latent = res_obs_emb[:-1, :, :]  # [T_in-1, B, dim_model]
+            next_obs_latent = res_obs_emb[1:, :, :]  # [T_in-1, B, dim_model]
+            cur_actions = pred_actions[:-1, :, :]  # [T_in-1, B, dim_out]
+            dreamer_input = torch.cat([cur_obs_latent, cur_actions, next_obs_latent], dim=-1)  # [T_in-1, B, dim_model*2 + dim_out]
+            dreamer_rewards = self.dreamer_reward_head(dreamer_input).squeeze(-1)  # [T_in-1, B]
+            # mask
+            valid_mask = masks[1:]  # [T_in-1, B]
+            valid_dreamer_rewards = dreamer_rewards * valid_mask.float()  # zero out invalid positions
+            self.dreamer_reward = valid_dreamer_rewards.sum() / (valid_mask.sum() + 1e-8)  # average reward over valid positions
+
+            if has_ref and self.dreamer_ref_reward_head is not None:
+                ref_obs_tensor, ref_obs_mask = ref_obs
+                ref_obs_latent = res_ref_obs_emb  # [T_in, B, dim_model]              
+                cur_ref_obs_latent = ref_obs_latent[:-1, :, :]  # [T_in-1, B, dim_model]
+                next_ref_obs_latent = ref_obs_latent[1:, :, :]  # [T_in-1, B, dim_model]
+                dreamer_ref_input = torch.cat([cur_ref_obs_latent, cur_actions, next_ref_obs_latent], dim=-1)  # [T_in-1, B, dim_model]
+                dreamer_ref_rewards = self.dreamer_ref_reward_head(dreamer_ref_input).squeeze(-1)  # [T_in-1, B]
+                dreamer_ref_rewards = dreamer_ref_rewards * ref_obs_mask[1:].float()  # zero out invalid positions in ref_obs
+                self.dreamer_reward += (dreamer_ref_rewards * valid_mask.float()).sum() / (valid_mask.sum() + 1e-8)  # accumulate reward over valid positions
+                
+                
+        
+        if compute_dreamer_loss and self.target_action_slice is not None:
+            self.dreamer_loss = 0.0
+            # extract target actions from ref_obs
+            cur_latent = upsampled_out[-1, :, :]  # [B, dim_out]
+            cur_action = pred_actions[-1, :, :]
+            # no parameter update for aux head
+            joint_pred_aux_idx = self.obs_term_names.index('joint_pos')
+            film_params = {k: v.detach() for k, v in self.action_film.named_parameters()}
+            film_buffers = {k: v.detach() for k, v in self.action_film.named_buffers()}
+            cur_gamma, cur_beta = functional_call(self.action_film, (film_params, film_buffers), (cur_action,)).chunk(2, dim=-1)  # [B, D] each
+            cur_latent = cur_gamma * cur_latent + cur_beta  # [B, D]
+            cur_aux_head = self.aux_heads[joint_pred_aux_idx]
+            params = {k: v.detach() for k, v in cur_aux_head.named_parameters()}
+            buffers = {k: v.detach() for k, v in cur_aux_head.named_buffers()}
+            pred_joint_pos = functional_call(cur_aux_head, (params, buffers), (cur_latent,))  # [B, joint_dim]
+            pred_joint_pos += self.default_joint_pos.to(device)  # de-normalize
+            target_joint_pos = ref_obs[0][-1, :, self.target_action_slice[0]:self.target_action_slice[1]]  # [B, action_dim]
+            target_mask = ref_obs[1][-1, :]  # [B,]
+            pred_joint_pos_valid = pred_joint_pos * target_mask.unsqueeze(-1) # [B, joint_dim]
+            target_joint_pos_valid = target_joint_pos * target_mask.unsqueeze(-1) # [B, joint_dim]
+
+            self.dreamer_loss = self.aux_loss_fn(pred_joint_pos_valid, target_joint_pos_valid)
+                  
+            
+        else:
+            self.dreamer_loss = 0.0
         
 
         if unpad_output:
-            return self.unpad(upsampled_out, masks).view(self.num_steps_per_env, -1, upsampled_out.shape[-1]) # [valid_length, dim_out] -> [num_steps_per_env, num_envs, dim_out]
+            res = self.unpad(pred_actions, masks).view(self.num_steps_per_env, -1, pred_actions.shape[-1])[-1, :, :] # [valid_length, dim_out] -> [num_steps_per_env, num_envs (B), dim_out] -> [B, dim_out]
         else: # return output last timestep
-            return upsampled_out[-1, :, :] # [B, dim_out]
+            res = pred_actions[-1, :, :] # [B, dim_out]
+            
+        # Fusion with MLP bypass
+        if self.apply_mlp_residual:
+            gate_input = torch.cat([res, mlp_output], dim=-1) # [B, dim_out * 2]
+            gate = self.mlp_gate(gate_input) # [B, dim_out]
+            final_output = gate * res + (1 - gate) * mlp_output # [B, dim_out]
+        else:
+            final_output = res
+        return final_output  # [B, dim_out]
     
     def _forward_inference(self, 
                 obs: torch.Tensor,
@@ -579,9 +936,107 @@ class MMGPT(nn.Module):
         """
         is_batch_mode = masks is not None
         if is_batch_mode:
-            return self._forward_batch(obs, ref_obs, masks, memory=memory, unpad_output=unpad_output)
+            return self._forward_batch(obs, ref_obs, masks, memory=memory, unpad_output=unpad_output, compute_aux_loss=True, compute_dreamer_loss=True, compute_dreamer_reward=True) # compute aux loss only in batch mode
         else:
             return self._forward_inference(obs, ref_obs)
+        
+        
+# MMGPT related Critic Network
+# Since MMGPT is so hard to train, we provide a simple MLP critic, in order to stabilize the advantage estimation.
+class MMGPTCritic(nn.Module):
+    def __init__(
+        self,
+        obs_size, # actually, it should be named by obs_dim, but I maintained the original name for consistency
+        ref_obs_size,
+        dim_out,
+        dim_model = 64,
+        num_heads = 2,
+        num_layers = 2,
+        ffn_ratio = 4,
+        dropout = 0.0,
+        name = "",
+        term_dict = None,
+        ref_term_dict = None,
+        ref_term_steps: Optional[Dict[str, int]] = None, # hint: only ref terms support step-wise history encoding for now. We don't provide future information in obs terms.
+        concatenate_term_names: Optional[List[List[str]]] = None,
+        concatenate_ref_term_names: Optional[List[List[str]]] = None,
+        num_steps_per_env = 24, # default, remember to parse this!
+        max_seq_len = 24, 
+        mlp_hidden_dims = [],
+        apply_rope = False, # default: APE; set True to use RoPE
+        apply_res = True,
+        ref_first = True,
+        **kwargs
+    ): # hint: we keep the same signature as MMGPT.
+        super().__init__()
+        self.name = name
+        self.obs_dim = obs_size
+        self.ref_obs_dim = ref_obs_size
+        self.num_steps_per_env = num_steps_per_env
+        if kwargs:
+            print(
+                f"MMGPTCritic {self.name}.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
+            )
+        
+        self.obs_embedding = ObservationSeqEmbeddingV3(dim_model, term_dict, concatenate_term_names, nheads=num_heads)
+        self.ref_obs_embedding = ObservationSeqEmbeddingV3(dim_model, ref_term_dict, concatenate_ref_term_names,term_steps=ref_term_steps, nheads=num_heads) if ref_obs_size > 0 else None # we maintain the same embedding layers, this does not change.
+        self.fc = nn.Sequential(
+            nn.Linear(dim_model * (1 + (1 if ref_obs_size > 0 else 0)), dim_model * 2), # expansion required
+            nn.SiLU(),
+            nn.Linear(dim_model * 2, dim_model),
+            nn.SiLU(),
+            nn.Linear(dim_model, dim_out)
+        )
+    
+    
+    def forward(self, 
+                obs: torch.Tensor, 
+                ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+                masks: Optional[torch.Tensor] = None,
+                memory: Optional[Tuple[torch.Tensor, torch.Tensor | None]] = None, # memory 
+                unpad_output: bool = False,
+                **kwargs):
+        """
+        Forward pass for the mm transformer critic.
+
+        Args:
+            obs (torch.Tensor): Observation tensor of shape (T, B, dim_in).
+            ref_obs (Optional[Tuple[torch.Tensor, torch.Tensor]]): 
+                A tuple containing:
+                - ref_obs_tensor (torch.Tensor): Reference observations of shape (T,B, dim_in).
+                - ref_obs_mask (torch.Tensor): Mask tensor of shape (T, B) indicating the presence of ref_obs.
+            masks (torch.Tensor): Mask tensor of shape (T, B) indicating valid observations among the trajectory.
+            **kwargs: Only added to avoid errors when unexpected arguments are passed.
+        Returns:
+            torch.Tensor: Output tensor after transformer and fully connected layer.
+        """
+        # NOTE: we always work in batch mode for the critic
+        # 1. Unpad obs
+        if len(obs.shape) == 3:
+            obs_unpad = obs[-1]
+        else:
+            obs_unpad = obs
+        obs_emb = self.obs_embedding(obs_unpad.unsqueeze(1)) # [valid_length, 1, D]
+        obs_emb = obs_emb.squeeze(1) # [valid_length, D]
+        if ref_obs is not None and self.ref_obs_dim > 0:
+            ref_obs_tensor, ref_obs_mask = ref_obs
+            if len(ref_obs_tensor.shape) == 3:
+                ref_obs_unpad = ref_obs_tensor[-1]
+            else:
+                ref_obs_unpad = ref_obs_tensor
+            ref_obs_emb = self.ref_obs_embedding(ref_obs_unpad.unsqueeze(1)) # [B, 1, D]
+            ref_obs_emb = ref_obs_emb.squeeze(1) # [B, D]
+            combined_emb = torch.cat([obs_emb, ref_obs_emb], dim=-1) # [B, 2*D]
+        else:
+            combined_emb = obs_emb # [B, D]
+        output = self.fc(combined_emb) # [B, dim_out]
+        return output
+    
+    def reset(self, dones: Optional[torch.Tensor] = None):
+        # nothing to reset for the critic
+        pass
+            
+        
 
 
 # M3GPT (Memory-enhanced Motion-mimicking GPT)
@@ -1051,8 +1506,11 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                  num_actions,
                  term_dict,
                  ref_term_dict,
+                 ref_term_steps: Optional[Dict[str, int]] = None,
                  concatenate_term_names: Optional[List[List[str]]] = None,
                  concatenate_ref_term_names: Optional[List[List[str]]] = None,
+                 pred_obs_term_names: Optional[List[str]] = None,
+                 pred_obs_term_weights: Optional[List[float]] = None,
                  dim_model=64,
                  num_heads=2,
                  num_layers=2,
@@ -1064,15 +1522,48 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                  load_dagger=False,
                  load_dagger_path=None,
                  load_actor_path=None,
+                 load_critic_path=None,
+                 load_std_path=None,
                  enable_lora=False,
                  dropout=0.1,
                  apply_rope=False,
+                 default_joint_pos: Optional[torch.Tensor] = None,
+                 use_mlp_dagger: bool = False,
+                 dagger_history_length: int = 8,
+                 critic_history_length: int = 8,
                  **kwargs
                  ):
         nn.Module.__init__(self)
+        if ref_term_steps is None:
+            ref_term_steps = {"policy": None, "critic": None}
         assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
-        self.actor = MMGPT(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, num_heads, num_layers, dropout=dropout, name="actor", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["policy"], ref_term_dict=ref_term_dict["policy"], concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], **kwargs)
-        self.actor_dagger = MMGPT(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, num_heads, num_layers, dropout=dropout, name="actor_dagger", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["policy"], ref_term_dict=ref_term_dict["policy"], concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], **kwargs) if load_dagger else None
+        self.actor = MMGPT(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, num_heads, num_layers, dropout=dropout, name="actor", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["policy"], ref_term_dict=ref_term_dict["policy"], concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], ref_term_steps=ref_term_steps["policy"], pred_obs_term_names=pred_obs_term_names, pred_obs_term_weights=pred_obs_term_weights, default_joint_pos=default_joint_pos, **kwargs)
+        
+        policy_term_dict = {"policy": term_dict.get("policy", {})}
+        policy_ref_term_dict = {"policy": ref_term_dict.get("policy", {})} if ref_term_dict else None
+        self.use_mlp_dagger = use_mlp_dagger
+        if not use_mlp_dagger:
+            self.actor_dagger = MMGPT(num_actor_obs, num_actor_ref_obs, num_actions, dim_model, num_heads, num_layers, dropout=dropout, name="actor_dagger", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["policy"], ref_term_dict=ref_term_dict["policy"], concatenate_term_names=concatenate_term_names["policy"], concatenate_ref_term_names=concatenate_ref_term_names["policy"], ref_term_steps=ref_term_steps["policy"], pred_obs_term_names=pred_obs_term_names, pred_obs_term_weights=pred_obs_term_weights, default_joint_pos=default_joint_pos, **kwargs) if load_dagger else None
+            self.dagger_obs_lambda = lambda obs: obs  # use full sequence
+            self.dagger_ref_obs_lambda = (lambda ref_obs: ref_obs) if num_actor_ref_obs > 0 else None
+        else:
+            self.actor_dagger = FusedMultiModalMLP(
+                term_dict=policy_term_dict,
+                ref_term_dict=policy_ref_term_dict,
+                output_size=num_actions,
+                hidden_dims=[512, 256, 128],
+                activation="elu",
+                history_length=dagger_history_length,
+                encoder_latent_dim=128,
+                encoder_compress_threshold=32,
+                use_layer_norm=False,
+                fusion_mode='gated',
+                name="actor_dagger",
+                reorgnize_obs=True,
+            ) if load_dagger else None
+            self.dagger_obs_lambda = lambda obs: obs[-dagger_history_length:, :, :]  # take last num_dagger_history_length steps
+            self.dagger_ref_obs_lambda = (lambda ref_obs: (ref_obs[0][-dagger_history_length:], ref_obs[1][-dagger_history_length:])) if num_actor_ref_obs > 0 else None
+        
         # Action noise
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
@@ -1089,17 +1580,75 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
             lora_dropout = kwargs.get('lora_dropout', 0.05)
             if enable_lora:
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+                
+                
 
-        self.critic = MMGPT(num_critic_obs, num_critic_ref_obs, 1, dim_model, num_heads, num_layers, dropout=dropout, name="critic", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["critic"], ref_term_dict=ref_term_dict["critic"], concatenate_term_names=concatenate_term_names["critic"], concatenate_ref_term_names=concatenate_ref_term_names["critic"], **kwargs) # 1 for value function
+
+        # self.critic = MMGPT(num_critic_obs, num_critic_ref_obs, 1, dim_model, num_heads, num_layers, dropout=dropout, name="critic", num_steps_per_env=num_steps_per_env, max_seq_len=max_seq_len, mlp_hidden_dims=mlp_hidden_dims, apply_rope=apply_rope, term_dict=term_dict["critic"], ref_term_dict=ref_term_dict["critic"], concatenate_term_names=concatenate_term_names["critic"], concatenate_ref_term_names=concatenate_ref_term_names["critic"], ref_term_steps=ref_term_steps["critic"], **kwargs) # 1 for value function
+        
+        critic_term_dict = {"critic": term_dict.get("critic", term_dict.get("policy", {}))}
+        critic_ref_term_dict = {"critic": ref_term_dict.get("critic", ref_term_dict.get("policy", {}))} if ref_term_dict else None
+        
+        self.critic_history_length = critic_history_length
+        
+        self.critic = FusedMultiModalMLP(
+            term_dict=critic_term_dict,
+            ref_term_dict=critic_ref_term_dict,
+            output_size=1,  # Value function outputs single value
+            hidden_dims=[512, 256, 128],
+            activation="elu",
+            history_length=self.critic_history_length,
+            encoder_latent_dim=dim_model,
+            encoder_compress_threshold=32,
+            use_layer_norm=False,
+            fusion_mode='gated',
+            name="critic",
+            reorgnize_obs=True,
+        )
+        
+        self.critic_obs_lambda = lambda obs: obs[-self.critic_history_length:, :, :]  # take last num_critic_history_length steps
+        self.critic_ref_obs_lambda = (lambda ref_obs: (ref_obs[0][-self.critic_history_length:], ref_obs[1][-self.critic_history_length:])) if num_critic_ref_obs > 0 else None
+        
         if load_actor_path:
             self.load_actor_weights(load_actor_path)
+        if load_critic_path:
+            self.load_critic_weights(load_critic_path)
+            
         print(f"Actor Transformer: {self.actor}")
-        print(f"Critic Transformer: {self.critic}")
+        print(f"Critic Model: {self.critic}")
         print(f"Dagger Model: {self.actor_dagger}")
+        
+        # disable args validation for speedup
+        if load_std_path:
+            self.load_std_weights(load_std_path)
+        
         
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
+        
+    def load_std_weights(self, path):
+        state_dict = torch.load(path, map_location='cpu')
+        model_state_dict = state_dict['model_state_dict']
+        if self.noise_std_type == "scalar":
+            self.std.data = model_state_dict['std']
+        elif self.noise_std_type == "log":
+            self.log_std.data = model_state_dict['log_std']
+        print(f"Loaded std weights from {path}")
+        
+        
+    @property
+    def actor_aux_loss(self):
+        return self.actor.aux_loss
+    
+
+    @property
+    def actor_dreamer_loss(self):
+        return self.actor.dream_loss
+    
+    @property
+    def actor_dreamer_reward(self):
+        return self.actor.dreamer_reward
 
     def update_distribution(self, observations, ref_observations=None, masks=None, memory=None, **kwargs):
         mean = self.actor(observations, ref_observations, masks, memory, **kwargs)
@@ -1118,7 +1667,11 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
 
     def update_distribution_dagger(self, observations, ref_observations=None, masks=None, memory=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
-        mean = self.actor_dagger(observations, ref_observations, masks, memory, **kwargs)
+        if masks is not None:
+            observations = self.dagger_obs_lambda(observations)
+            if self.dagger_ref_obs_lambda is not None and ref_observations is not None:
+                ref_observations = self.dagger_ref_obs_lambda(ref_observations)
+        mean = self.actor_dagger(observations, ref_observations, masks=masks, memory=memory, **kwargs)
         if self.noise_std_type == "scalar":
             std = self.std_dagger.expand_as(mean)
         elif self.noise_std_type == "log":
@@ -1133,7 +1686,11 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
 
     def act_dagger_inference(self, observations, ref_observations=None, masks=None, memory=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"
-        actions_mean = self.actor_dagger(observations, ref_observations, masks, memory, **kwargs)
+        if masks is not None:
+            observations = self.dagger_obs_lambda(observations)
+            if self.dagger_ref_obs_lambda is not None and ref_observations is not None:
+                ref_observations = self.dagger_ref_obs_lambda(ref_observations)
+        actions_mean = self.actor_dagger(observations, ref_observations, masks=masks, memory=memory, **kwargs)
         return actions_mean
 
     def get_actions_log_prob(self, actions):
@@ -1141,13 +1698,44 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
     
     def get_actions_log_prob_dagger(self, actions):
         return self.distribution_dagger.log_prob(actions).sum(dim=-1)
+    
+    def get_hidden_alignment_loss(self):
+        """
+        Compute alignment loss between student (actor) and teacher (actor_dagger) 
+        hidden representations (before the final projection layer).
+        
+        This enables ASAP-style training in hidden space rather than action space.
+        
+        Returns:
+            torch.Tensor: L2 distance between hidden states, shape []
+        """
+        if self.actor_dagger is None:
+            raise RuntimeError("actor_dagger is not initialized. Cannot compute hidden alignment loss.")
+        
+        if not hasattr(self.actor, 'last_hidden_state') or not hasattr(self.actor_dagger, 'last_hidden_state'):
+            raise RuntimeError(
+                "Hidden states not cached. Make sure to call forward pass on both actor and actor_dagger "
+                "before computing alignment loss."
+            )
+        
+        student_hidden = self.actor.last_hidden_state  # [B, dim_model]
+        teacher_hidden = self.actor_dagger.last_hidden_state  # [B, dim_model]
+        
+        # L2 distance (ASAP style)
+        loss = (student_hidden - teacher_hidden.detach()).norm(p=2, dim=1).mean()
+        
+        return loss
 
     def act_inference(self, observations, ref_observations=None, masks=None, memory=None, **kwargs):
         actions_mean = self.actor(observations, ref_observations, masks, memory, **kwargs)
         return actions_mean
 
     def evaluate(self, critic_observations, ref_critic_observations=None, masks=None, memory=None, **kwargs):
-        value = self.critic(critic_observations, ref_critic_observations, masks, memory, **kwargs)
+        if masks is not None:
+            critic_observations = self.critic_obs_lambda(critic_observations)
+            if self.critic_ref_obs_lambda is not None and ref_critic_observations is not None:
+                ref_critic_observations = self.critic_ref_obs_lambda(ref_critic_observations)
+        value = self.critic(critic_observations, ref_critic_observations, masks=masks, memory=memory, **kwargs)
         return value
         
     def reset(self, dones=None):
@@ -1158,4 +1746,3 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
             
     def get_hidden_states(self):
         return None, None
-    

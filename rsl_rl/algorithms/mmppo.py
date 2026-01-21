@@ -9,7 +9,8 @@
 from __future__ import annotations
 from weakref import ref
 
-from numpy import std
+from cv2 import mean
+from numpy import fix, std
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -116,6 +117,7 @@ class MMPPO:
         device="cpu",
         normalize_advantage_per_mini_batch=False,
         ref_action_idx=0,
+        fix_sigma: bool = False,
         # dagger
         # dagger parameters
         teacher_coef=None, # disable dagger if None
@@ -137,7 +139,12 @@ class MMPPO:
         teacher_only_interval=0,  # Stage 1: Pure teacher output, student learns by imitation only
         hybrid_training_intervals=0,  # Stage 2: Weighted mix of teacher and student output
         hybrid_mix_coef=0.5,  # Coefficient for hybrid stage: output = hybrid_mix_coef * teacher + (1-hybrid_mix_coef) * student
+        teacher_value_loss_coef=0.5,  # Value loss coefficient during teacher-only stage (0.0 to disable critic training, typically 0.5)
         default_action=None,
+        # ASAP-style hidden space training
+        use_hidden_alignment=False,  # Use hidden space alignment instead of action space (recommended for Transformer/MMGPT)
+        # ASAP-style bidirectional alignment parameters (for MLPv3)
+        priv_reg_coef_schedule=None,  # [min_coef, max_coef, warmup_end_epoch, ramp_end_epoch], e.g., [0.0, 0.1, 2000, 5000]
         # RND parameters
         rnd_cfg: dict | None = None,
         # Symmetry parameters
@@ -147,11 +154,16 @@ class MMPPO:
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         auto_mix_precision: bool = False, # do not mix this with amp_cfg (that amp stands for Adversarial Motion Prior)
+        load_std_state_dict_path: str | None = None,
 
 
         **kwargs # reserved for future use
-    ):
+    ):  
+        if fix_sigma:
+            print("[MMPPO] Fixing action std (sigma) during training.")
         self.device = device
+        self.actor_critic = actor_critic  # Set early for detection logic
+        
         self.is_multi_gpu = multi_gpu_cfg is not None
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
@@ -159,6 +171,27 @@ class MMPPO:
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
+        
+        # Hidden alignment flag
+        self.use_hidden_alignment = use_hidden_alignment
+        self.use_latent_alignment_mlpv3 = False  # For MLPv3's privilege-history alignment
+        
+        # ASAP-style bidirectional alignment parameters
+        if priv_reg_coef_schedule is None:
+            # Default schedule: [min_coef, max_coef, warmup_end_epoch, ramp_end_epoch]
+            self.priv_reg_coef_schedule = [0.0, 0.1, 2000, 5000]
+        else:
+            assert len(priv_reg_coef_schedule) == 4, "priv_reg_coef_schedule should be [min, max, warmup_end, ramp_end]"
+            self.priv_reg_coef_schedule = priv_reg_coef_schedule
+        
+        # Detect actor_critic type and alignment strategy
+        if hasattr(self.actor_critic, 'supports_latent_alignment') and self.actor_critic.supports_latent_alignment:
+            # MLPv3 with privilege-history alignment
+            self.use_latent_alignment_mlpv3 = True
+            print("[MMPPO] Detected ActorCriticMLPV3 with latent alignment support (ASAP-style privilege-history)")
+        elif use_hidden_alignment:
+            # Transformer/MMGPT with hidden space alignment
+            print("[MMPPO] Using hidden space alignment (ASAP-style) for Transformer/MMGPT DAgger training")
         
         # RND components
         if rnd_cfg is not None:
@@ -230,6 +263,7 @@ class MMPPO:
         self.teacher_only_interval = teacher_only_interval
         self.hybrid_training_intervals = hybrid_training_intervals
         self.hybrid_mix_coef = hybrid_mix_coef
+        self.teacher_value_loss_coef = teacher_value_loss_coef
         self.teacher_supervising_intervals = teacher_supervising_intervals
         self.teacher_updating_intervals = teacher_updating_intervals
         self.teacher_apply_interval = teacher_apply_interval
@@ -242,12 +276,13 @@ class MMPPO:
         assert (teacher_coef is None and teacher_loss_coef is None) or (teacher_loss_coef is not None and teacher_coef is not None), "teacher_coef and teacher_loss_coef should be set together"
         if teacher_only_interval > 0:
             assert hybrid_training_intervals >= teacher_only_interval, "hybrid_training_intervals must be >= teacher_only_interval"
+            assert 0.0 <= teacher_value_loss_coef <= value_loss_coef, f"teacher_value_loss_coef ({teacher_value_loss_coef}) should be in range [0.0, {value_loss_coef}]"
         if hybrid_training_intervals > 0:
             assert teacher_only_interval > 0, "teacher_only_interval must be > 0 when using hybrid_training_intervals"
             assert 0.0 <= hybrid_mix_coef <= 1.0, "hybrid_mix_coef should be in range [0.0, 1.0]"
 
         # PPO components
-        self.actor_critic = actor_critic
+        # Note: actor_critic already set early in __init__ for detection logic
         self.actor_critic.to(self.device)
         self.storage = None  # initialized later
         is_log_std = self.actor_critic.noise_std_type == "log"
@@ -255,15 +290,48 @@ class MMPPO:
             itertools.chain(
                 self.actor_critic.actor.parameters(),
                 self.actor_critic.critic.parameters(),
-                [self.actor_critic.std] if not is_log_std else [self.actor_critic.log_std],
+                [] if fix_sigma else ([self.actor_critic.std] if not is_log_std else [self.actor_critic.log_std]),
             ),
             lr=learning_rate) # Avoid optimizing dagger parameters if self.teacher_coef is None
-        self.imitation_optimizer = optim.AdamW(
-            itertools.chain(
-                self.actor_critic.actor.parameters(),
-                [self.actor_critic.std_dagger] if not is_log_std else [self.actor_critic.log_std_dagger],
-            ),
-            lr=learning_rate) if self.teacher_coef is not None else None
+        
+        if load_std_state_dict_path is not None: # force replace optimizer's term for actor_critic.std or actor_critic.std with the one inside the state dict
+            state_dict = torch.load(load_std_state_dict_path, map_location=self.device)
+            optimizer_state_dict = state_dict.get("optimizer_state_dict", None)
+            if optimizer_state_dict is not None:
+                if is_log_std and "log_std" in optimizer_state_dict["param_groups"][0]["params"]:
+                    std_param_id = optimizer_state_dict["param_groups"][0]["params"]["log_std"]
+                elif not is_log_std and "std" in optimizer_state_dict["param_groups"][0]["params"]:
+                    std_param_id = optimizer_state_dict["param_groups"][0]["params"]["std"]
+                else:
+                    std_param_id = None
+                if std_param_id is not None:
+                    # Find the corresponding parameter in self.optimizer
+                    for param_group in self.optimizer.param_groups:
+                        for i, param in enumerate(param_group["params"]):
+                            if id(param) == std_param_id:
+                                # Replace the state
+                                param_group["params"][i] = self.actor_critic.log_std if is_log_std else self.actor_critic.std
+                                print(f"[MMPPO] Loaded std parameter state from {load_std_state_dict_path} into optimizer.")
+                                break
+        
+        # Imitation optimizer: only for models with std_dagger (Transformer/MMGPT)
+        if self.teacher_coef is not None:
+            if hasattr(self.actor_critic, 'std_dagger') or hasattr(self.actor_critic, 'log_std_dagger'):
+                # Transformer/MMGPT: has separate std_dagger
+                self.imitation_optimizer = optim.AdamW(
+                    itertools.chain(
+                        self.actor_critic.actor.parameters(),
+                        [] if fix_sigma else ([self.actor_critic.std_dagger] if not is_log_std else [self.actor_critic.log_std_dagger]),
+                    ),
+                    lr=learning_rate)
+            else:
+                # MLPv3: uses shared std
+                self.imitation_optimizer = optim.AdamW(
+                    self.actor_critic.actor.parameters(),
+                    lr=learning_rate)
+        else:
+            self.imitation_optimizer = None
+            
         # self.optimizer = optim.AdamW(
         #     self.actor_critic.parameters(),
         #     lr=learning_rate
@@ -284,35 +352,72 @@ class MMPPO:
         else:
             self.lr_scheduler = None
 
-        if self.teacher_coef is not None and self.teacher_loss_coef is not None:
-            assert self.teacher_coef_mode in ["kl", "norm", "original_kl", "mse", "huber"], \
-                "teacher_coef_mode should be one of: 'kl', 'norm', 'original_kl', 'mse', 'huber'"
-            if self.teacher_coef_range is None:
-                self.teacher_coef_range = (self.teacher_coef, self.teacher_coef)
-            else:
-                assert len(self.teacher_coef_range) == 2, "teacher_coef_range should be a tuple of (min, max)"
-                assert self.teacher_coef_range[0] <= self.teacher_coef_range[1], "teacher_coef_range should be a tuple of (min, max)"
+        # DAgger / Teacher-Student training setup
+        # For MLPv3 latent alignment: only needs dagger_training flag
+        # For Transformer/MMGPT: needs teacher_coef and teacher_loss_coef
+        if self.use_latent_alignment_mlpv3 or (self.teacher_coef is not None and self.teacher_loss_coef is not None):
+            # Validate teacher coefficient parameters (not needed for MLPv3)
+            if not self.use_latent_alignment_mlpv3:
+                assert self.teacher_coef_mode in ["kl", "norm", "original_kl", "mse", "huber"], \
+                    "teacher_coef_mode should be one of: 'kl', 'norm', 'original_kl', 'mse', 'huber'"
+                if self.teacher_coef_range is None:
+                    self.teacher_coef_range = (self.teacher_coef, self.teacher_coef)
+                else:
+                    assert len(self.teacher_coef_range) == 2, "teacher_coef_range should be a tuple of (min, max)"
+                    assert self.teacher_coef_range[0] <= self.teacher_coef_range[1], "teacher_coef_range should be a tuple of (min, max)"
+                
+                if self.teacher_loss_coef_range is None:
+                    self.teacher_loss_coef_range = (self.teacher_loss_coef, self.teacher_loss_coef)
+                else:
+                    assert len(self.teacher_loss_coef_range) == 2, "teacher_loss_coef_range should be a tuple of (min, max)"
+                    assert self.teacher_loss_coef_range[0] <= self.teacher_loss_coef_range[1], "teacher_loss_coef_range should be a tuple of (min, max)"
+                
+                if self.teacher_coef_decay is None:
+                    self.teacher_coef_decay = 0.0
+                else:
+                    assert 0.0 <= self.teacher_coef_decay <= 1.0, "teacher_coef_decay should be in range [0.0, 1.0]"
+                    assert self.teacher_coef_decay_interval > 0, "teacher_coef_decay_interval should be greater than 0"
+                
+                if self.teacher_loss_coef_decay is None:
+                    self.teacher_loss_coef_decay = 0.0
+                else:
+                    assert 0.0 <= self.teacher_loss_coef_decay <= 1.0, "teacher_loss_coef_decay should be in range [0.0, 1.0]"
+                    assert self.teacher_loss_coef_decay_interval > 0, "teacher_loss_coef_decay_interval should be greater than 0"    
             
-            if self.teacher_loss_coef_range is None:
-                self.teacher_loss_coef_range = (self.teacher_loss_coef, self.teacher_loss_coef)
+            # Validate DAgger setup based on actor_critic type
+            if self.use_latent_alignment_mlpv3:
+                # MLPv3: Requires history_encoder and privilege_encoder (no actor_dagger)
+                if not (hasattr(self.actor_critic.actor, 'history_encoder') and 
+                        self.actor_critic.actor.history_encoder is not None):
+                    raise RuntimeError(
+                        "Cannot run DAgger mode with MLPv3: history_encoder not found. "
+                        "Make sure to initialize ActorCriticMLPV3 with history_length > 1 and proper obs keys."
+                    )
+                if not (hasattr(self.actor_critic.actor, 'privilege_encoder') and 
+                        self.actor_critic.actor.privilege_encoder is not None):
+                    raise RuntimeError(
+                        "Cannot run DAgger mode with MLPv3: privilege_encoder not found. "
+                        "Make sure to initialize ActorCriticMLPV3 with privilege_obs_keys specified."
+                    )
             else:
-                assert len(self.teacher_loss_coef_range) == 2, "teacher_loss_coef_range should be a tuple of (min, max)"
-                assert self.teacher_loss_coef_range[0] <= self.teacher_loss_coef_range[1], "teacher_loss_coef_range should be a tuple of (min, max)"
+                # Transformer/MMGPT: Requires actor_dagger
+                if not (hasattr(self.actor_critic, "actor_dagger") and self.actor_critic.actor_dagger is not None):
+                    raise RuntimeError(
+                        "Cannot run Dagger mode without dagger actor. "
+                        "Check your actor_critic initialization (load_dagger=True required for Transformer/MMGPT)."
+                    )
             
-            if self.teacher_coef_decay is None:
-                self.teacher_coef_decay = 0.0
+            # Create DAgger optimizer based on actor_critic type
+            if self.use_latent_alignment_mlpv3:
+                # MLPv3: Only optimize history_encoder (student learns from privilege_encoder)
+                self.dagger_optimizer = optim.AdamW(
+                    self.actor_critic.actor.history_encoder.parameters(),
+                    lr=teacher_lr
+                )
+                print(f"[MMPPO] Created DAgger optimizer for MLPv3 history_encoder (lr={teacher_lr})")
             else:
-                assert 0.0 <= self.teacher_coef_decay <= 1.0, "teacher_coef_decay should be in range [0.0, 1.0]"
-                assert self.teacher_coef_decay_interval > 0, "teacher_coef_decay_interval should be greater than 0"
-            
-            if self.teacher_loss_coef_decay is None:
-                self.teacher_loss_coef_decay = 0.0
-            else:
-                assert 0.0 <= self.teacher_loss_coef_decay <= 1.0, "teacher_loss_coef_decay should be in range [0.0, 1.0]"
-                assert self.teacher_loss_coef_decay_interval > 0, "teacher_loss_coef_decay_interval should be greater than 0"    
-            
-            assert hasattr(self.actor_critic, "actor_dagger") and self.actor_critic.actor_dagger is not None, "cannot run Dagger mode without dagger actor, check your actor_critic initialization first"
-            self.dagger_optimizer = optim.AdamW(self.actor_critic.actor_dagger.parameters(), lr=teacher_lr)
+                # Transformer/MMGPT: Optimize entire actor_dagger network
+                self.dagger_optimizer = optim.AdamW(self.actor_critic.actor_dagger.parameters(), lr=teacher_lr)
         else:
             self.dagger_optimizer = None
             
@@ -379,21 +484,21 @@ class MMPPO:
         
         # Determine which actions to RETURN (for environment execution) based on current training stage
         if self.teacher_coef is not None:
-            teacher_actions = self.actor_critic.act_dagger(obs, ref_observations=None).detach()
+            teacher_actions = self.actor_critic.act_dagger(obs, ref_observations=ref_obs).detach()
             _ = self.actor_critic.get_actions_log_prob_dagger(teacher_actions)
             self.transition.dagger_actions = teacher_actions
             
-            # if self.current_stage == 1:
-            #     # Stage 1: Return pure teacher actions to environment
-            #     actions_to_execute = teacher_actions
-            # elif self.current_stage == 2:
-            #     # Stage 2: Return weighted mix to environment
-            #     actions_to_execute = (self.hybrid_mix_coef * teacher_actions + 
-            #                          (1 - self.hybrid_mix_coef) * student_actions)
-            # else:
-            #     # Stage 3: Return student actions to environment
-            #     actions_to_execute = student_actions
-            actions_to_execute = student_actions
+            if self.current_stage == 1:
+                # Stage 1: Return pure teacher actions to environment
+                actions_to_execute = teacher_actions
+            elif self.current_stage == 2:
+                # Stage 2: Return weighted mix to environment
+                actions_to_execute = (self.hybrid_mix_coef * teacher_actions + 
+                                     (1 - self.hybrid_mix_coef) * student_actions)
+            else:
+                # Stage 3: Return student actions to environment
+                actions_to_execute = student_actions
+            # actions_to_execute = student_actions
         else:
             # No teacher, return student actions
             actions_to_execute = student_actions
@@ -438,10 +543,39 @@ class MMPPO:
         self.transition.clear()
         self.actor_critic.reset(dones)
 
-    def compute_returns(self, last_critic_obs):
+    def compute_returns(self, last_critic_obs, last_critic_ref_obs=None):
         assert self.storage is not None, "Storage is not initialized. Please call init_storage before compute_returns."
-        last_values = self.actor_critic.evaluate(last_critic_obs).detach()
+        last_values = self.actor_critic.evaluate(last_critic_obs, last_critic_ref_obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch)
+
+    def get_priv_reg_coef(self, epoch):
+        """
+        ASAP-style dynamic privilege regularization coefficient schedule.
+        
+        Args:
+            epoch: Current training epoch/iteration
+            
+        Returns:
+            float: Privilege regularization coefficient
+            
+        Schedule format: [min_coef, max_coef, warmup_end_epoch, ramp_end_epoch]
+        - epoch < warmup_end: coef = min_coef (no constraint, free exploration)
+        - warmup_end <= epoch < ramp_end: linear increase from min to max
+        - epoch >= ramp_end: coef = max_coef (light constraint)
+        """
+        schedule = self.priv_reg_coef_schedule
+        min_coef, max_coef, warmup_end, ramp_end = schedule
+        
+        if epoch < warmup_end:
+            # Early stage: no constraint
+            return min_coef
+        elif epoch < ramp_end:
+            # Middle stage: linearly increase
+            progress = (epoch - warmup_end) / (ramp_end - warmup_end)
+            return min_coef + progress * (max_coef - min_coef)
+        else:
+            # Late stage: fixed light constraint
+            return max_coef
 
     def update(self, epoch=0):
         # Update current training stage based on epoch
@@ -452,11 +586,17 @@ class MMPPO:
         else:
             self.current_stage = 3  # Student stage
             
+        is_mmgpt = isinstance(self.actor_critic, ActorCriticMMGPT)
+            
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_imitation_loss = 0.0
         mean_dagger_loss = 0.0
         mean_entropy = 0.0
+        mean_priv_reg_loss = 0.0  # ASAP-style privilege regularization loss
+        if is_mmgpt:
+            mean_aux_loss = 0.0
+            mean_dreamer_loss = 0.0
 
         if self.rnd:
             mean_rnd_loss = 0.0
@@ -476,6 +616,8 @@ class MMPPO:
             mean_pred_pos_prob = 0.0
             mean_pred_neg_prob = 0.0
 
+
+        
         if self.actor_critic.is_recurrent:
             # generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
             generator = self.storage.buffer_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -531,6 +673,7 @@ class MMPPO:
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
             with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                
                 self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=hid_states_batch)
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
                 value_batch = self.actor_critic.evaluate(
@@ -598,11 +741,22 @@ class MMPPO:
                     param_group["lr"] = self.learning_rate
 
             # Surrogate loss
-            # In teacher-only stage, skip PPO loss computation (student just imitates)
+            # In teacher-only stage, we still train critic but skip actor's PPO update
             if epoch < self.teacher_only_interval:
-                # Teacher-only stage: no PPO update, pure imitation
+                # Teacher-only stage: no policy gradient (surrogate loss), but train critic
                 surrogate_loss = torch.tensor(0.0, device=self.device)
-                value_loss = torch.tensor(0.0, device=self.device)
+                
+                # Train critic to predict returns from teacher-guided trajectories
+                # This prepares critic for smooth transition to hybrid/student stages
+                if self.use_clipped_value_loss:
+                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                        -self.clip_param, self.clip_param
+                    )
+                    value_losses = (value_batch - returns_batch).pow(2)
+                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                else:
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
             else:
                 # Normal PPO or Hybrid stage: compute surrogate and value loss
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
@@ -624,7 +778,49 @@ class MMPPO:
                     else:
                         value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            # Determine effective value_loss_coef based on stage
+            if epoch < self.teacher_only_interval:
+                # Teacher stage: use reduced coefficient to avoid dominating imitation loss
+                effective_value_loss_coef = self.teacher_value_loss_coef
+                loss = surrogate_loss + effective_value_loss_coef * value_loss
+            else:
+                # Hybrid/Student stage: use normal coefficient
+                effective_value_loss_coef = self.value_loss_coef
+                loss = surrogate_loss + effective_value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+                
+            if is_mmgpt:
+                aux_loss = self.actor_critic.actor_aux_loss
+                loss = loss + aux_loss
+                mean_aux_loss += aux_loss.item()
+                dreamer_loss = self.actor_critic.actor_dreamer_loss
+                loss = loss + dreamer_loss
+                mean_dreamer_loss += dreamer_loss.item()
+
+            # Direction 1: Privilege encoder regularization (ASAP-style bidirectional alignment)
+            # Constrains privilege encoder to stay close to history encoder (prevents over-reliance on privileged info)
+            # This is computed in the PPO phase, every mini-batch
+            if self.use_latent_alignment_mlpv3 and hasattr(self.actor_critic.actor, 'last_priv_encoding'):
+                priv_reg_coef = self.get_priv_reg_coef(epoch)
+                
+                if priv_reg_coef > 0:  # Only compute if coefficient is non-zero
+                    with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                        # Forward with privilege encoder (needs gradient for regularization)
+                        _ = self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, 
+                                                use_privilege=True, masks=masks_batch, memory=hid_states_batch)
+                        priv_latent = self.actor_critic.actor.last_priv_encoding
+                        
+                        # Forward with history encoder (detached, serves as target)
+                        with torch.no_grad():
+                            _ = self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch,
+                                                    use_privilege=False, masks=masks_batch, memory=hid_states_batch)
+                            hist_latent = self.actor_critic.actor.last_hist_encoding
+                        
+                        # Compute L2 alignment loss
+                        priv_reg_loss = (priv_latent - hist_latent.detach()).norm(p=2, dim=1).mean()
+                        
+                        # Add to total loss with dynamic weight
+                        loss = loss + priv_reg_coef * priv_reg_loss
+                        mean_priv_reg_loss += priv_reg_loss.item()
 
             if self.symmetry:
                 if not self.symmetry["use_data_augmentation"]:
@@ -665,13 +861,14 @@ class MMPPO:
 
                     
 
-            imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch)      
+            imitation_loss = self._imitation_loss(actions_batch=actions_batch, obs_batch=obs_batch, ref_obs_batch=ref_obs_batch, dagger_actions_batch=dagger_actions_batch, masks_batch=masks_batch, memory=hid_states_batch)      
             print_gpu_memory_summary("Before optimizer.zero_grad")
             
-            # In teacher-only stage, imitation loss is the main loss
+            # Add imitation loss to the total loss based on training stage
             if epoch < self.teacher_only_interval:
-                # Pure imitation: only use imitation loss
-                loss = imitation_loss
+                # Teacher-only stage: imitation loss is primary, but keep value_loss from earlier computation
+                # loss already contains: surrogate_loss(=0) + effective_value_loss_coef * value_loss - entropy
+                loss = loss + imitation_loss
             elif self.teacher_only_interval <= epoch < self.hybrid_training_intervals:
                 # Hybrid stage: combine PPO loss with stronger imitation loss
                 # Use a higher weight for imitation during hybrid stage
@@ -824,12 +1021,22 @@ class MMPPO:
             mean_imitation_loss += imitation_loss.item()
             mean_entropy += entropy_batch.mean().item()
 
-            # DAgger update: start after hybrid stage
+            # DAgger update (Direction 2): History encoder → Privilege encoder
+            # teacher_update_interval controls the frequency (ASAP uses 20)
             if ((epoch+1) % self.teacher_update_interval == 0 and 
                 self.dagger_optimizer is not None and 
                 epoch >= self.hybrid_training_intervals and
                 epoch > self.teacher_supervising_intervals):
-                dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch)
+                # Choose alignment method based on actor_critic type
+                if self.use_latent_alignment_mlpv3:
+                    # MLPv3: privilege-history latent alignment (ASAP-style)
+                    dagger_loss = self.update_dagger_latent_mlpv3(obs_batch, ref_obs_batch, masks_batch)
+                elif self.use_hidden_alignment:
+                    # Transformer/MMGPT: hidden space alignment (ASAP-style)
+                    dagger_loss = self.update_dagger_hidden(obs_batch, ref_obs_batch, masks_batch)
+                else:
+                    # Legacy: action space alignment
+                    dagger_loss = self.update_dagger(actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch, masks_batch, hid_states_batch)
             else:
                 dagger_loss = 0.0
             mean_dagger_loss += dagger_loss
@@ -840,6 +1047,9 @@ class MMPPO:
         mean_imitation_loss /= num_updates
         mean_dagger_loss /= num_updates
         mean_entropy /= num_updates
+        mean_priv_reg_loss /= num_updates  # ASAP-style privilege regularization
+        if is_mmgpt:
+            mean_aux_loss /= num_updates
         if self.amp:
             mean_amp_loss /= num_updates
             mean_gradient_penalty /= num_updates
@@ -856,9 +1066,9 @@ class MMPPO:
                 self.teacher_coef_range[0],
                 self.teacher_coef - (1 - self.teacher_coef_decay) * (self.teacher_coef_range[1] - self.teacher_coef_range[0]),)
         if self.teacher_loss_coef is not None and (epoch+1) % self.teacher_loss_coef_decay_interval == 0:
-            self.teacher_loss_coef = min(
-                self.teacher_loss_coef_range[1],
-                self.teacher_loss_coef + (1 - self.teacher_loss_coef_decay) * (self.teacher_loss_coef_range[1] - self.teacher_loss_coef_range[0]),)
+            self.teacher_loss_coef = max(
+                self.teacher_loss_coef_range[0],
+                self.teacher_loss_coef * self.teacher_loss_coef_decay)
         print_gpu_memory_summary("End of epoch")
         self.storage.clear()
 
@@ -868,7 +1078,11 @@ class MMPPO:
             "mean_imitation_loss": mean_imitation_loss,
             "mean_dagger_loss": mean_dagger_loss,	
             "mean_entropy": mean_entropy,
+            "mean_priv_reg_loss": mean_priv_reg_loss,  # ASAP-style privilege regularization
         }
+        if is_mmgpt:
+            loss_dict["mean_aux_loss"] = mean_aux_loss
+            loss_dict["mean_dreamer_loss"] = mean_dreamer_loss
         if self.rnd:
             loss_dict["mean_rnd_loss"] = mean_rnd_loss
         if self.symmetry:
@@ -970,7 +1184,7 @@ class MMPPO:
 
 
 
-    def _imitation_loss(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch):
+    def _imitation_loss(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch, masks_batch, memory=None):
         """
         Compute imitation loss between student and teacher outputs.
         
@@ -986,7 +1200,7 @@ class MMPPO:
             
             if self.teacher_coef_mode == "kl":
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                    mu_batch = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                    mu_batch = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
                 sigma_batch = self.actor_critic.action_std.detach()
                 imitation_loss = torch.mean(
                     (1 / actions_batch.shape[-1]) * (torch.sum((torch.square(mu_batch - dagger_actions_batch) / (2.0 * torch.square(sigma_batch) + 1e-5)), axis=-1) +  0.92 * torch.sum(torch.clamp_min(torch.log(sigma_batch), 0.0), axis=-1))
@@ -996,7 +1210,7 @@ class MMPPO:
                 mu_batch = self.actor_critic.action_mean
                 sigma_batch = self.actor_critic.action_std
                 with torch.no_grad():
-                    self.actor_critic.act_dagger(obs_batch, None)
+                    self.actor_critic.act_dagger(obs_batch, ref_obs_batch, masks=masks_batch, memory=memory)
                     dagger_mu_batch = self.actor_critic.action_mean_dagger.detach()
                     dagger_sigma_batch = self.actor_critic.action_std_dagger.detach()
                 imitation_loss = torch.sum(
@@ -1010,21 +1224,21 @@ class MMPPO:
                 
             elif self.teacher_coef_mode == "norm":
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
                 with torch.no_grad():
                     with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=None)
+                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
                 imitation_loss = torch.norm(
-                    (predicted_actions - dagger_actions_batch)
+                    (predicted_actions - dagger_actions_batch), p=2, dim=-1
                 ).mean()
             
             elif self.teacher_coef_mode == "mse":
                 # Mean Squared Error: simple and effective
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
                 with torch.no_grad():
                     with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=None)
+                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
                 
                 # MSE per action dimension, then mean
                 diff = predicted_actions - dagger_actions_batch
@@ -1033,10 +1247,10 @@ class MMPPO:
             elif self.teacher_coef_mode == "huber":
                 # Huber loss: robust to outliers, smooth transition
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch)
+                    predicted_actions = self.actor_critic.act_inference(observations=obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
                 with torch.no_grad():
                     with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=None)
+                        dagger_actions_batch = self.actor_critic.act_dagger_inference(observations=obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
                 
                 # Huber loss with delta=1.0 (standard)
                 delta = 1.0
@@ -1068,10 +1282,14 @@ class MMPPO:
     #     ) * ref_action_mask) / (ref_action_mask.sum() + 1e-5)
     #     return imitation_loss
     
-    def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch): # for this function, we haven't figured out how to use autocast. Maybe a seperate scaler is needed.
-        output = self.actor_critic.act_dagger_inference(obs_batch, ref_observations=None)
+    def update_dagger(self, actions_batch, obs_batch, ref_obs_batch, dagger_actions_batch, masks_batch=None, memory=None): # for this function, we haven't figured out how to use autocast. Maybe a seperate scaler is needed.
+        """
+        Update dagger network using action space alignment (legacy method).
+        Consider using update_dagger_hidden for better convergence.
+        """
+        output = self.actor_critic.act_dagger_inference(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
         with torch.no_grad():
-            gt = self.teacher_coef * output + (1 - self.teacher_coef) * self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch)
+            gt = self.teacher_coef * output + (1 - self.teacher_coef) * self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=memory)
         gt = gt.detach()
         loss = SmoothL2Loss()(output, gt)
         self.dagger_optimizer.zero_grad()
@@ -1081,4 +1299,108 @@ class MMPPO:
         nn.utils.clip_grad_norm_(self.actor_critic.actor_dagger.parameters(), self.max_grad_norm)
         self.dagger_optimizer.step()
         return loss.item()
+    
+    def update_dagger_hidden(self, obs_batch, ref_obs_batch, masks_batch=None):
+        """
+        Update dagger network using hidden space alignment (ASAP-style).
+        
+        This method trains the actor_dagger (teacher) to produce similar hidden representations
+        as the actor (student), enabling more stable convergence than action space alignment.
+        
+        Args:
+            obs_batch: Observation batch
+            ref_obs_batch: Reference observation batch
+            masks_batch: Optional masks for recurrent models
+        
+        Returns:
+            float: Hidden alignment loss value
+        """
+        if not hasattr(self.actor_critic, 'get_hidden_alignment_loss'):
+            raise RuntimeError(
+                "actor_critic does not support hidden alignment loss. "
+                "Make sure your model (MMGPT/MMTransformer) has get_hidden_alignment_loss() method."
+            )
+        
+        # Forward pass through both networks to cache hidden states
+        # Student (actor): this will cache student hidden state
+        _ = self.actor_critic.act_inference(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch)
+        
+        # Teacher (actor_dagger): this will cache teacher hidden state
+        _ = self.actor_critic.act_dagger_inference(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch)
+        
+        # Compute hidden alignment loss: ||student_hidden - teacher_hidden||_2
+        hidden_loss = self.actor_critic.get_hidden_alignment_loss()
+        
+        # Backward and optimize (only update actor_dagger)
+        self.dagger_optimizer.zero_grad()
+        hidden_loss.backward()
+        
+        if self.is_multi_gpu:
+            self.reduce_parameters_dagger()
+        
+        nn.utils.clip_grad_norm_(self.actor_critic.actor_dagger.parameters(), self.max_grad_norm)
+        self.dagger_optimizer.step()
+        
+        return hidden_loss.item()
+    
+    def update_dagger_latent_mlpv3(self, obs_batch, ref_obs_batch=None, masks_batch=None):
+        """
+        Update MLPv3's history_encoder using privilege-history latent alignment (ASAP-style).
+        
+        This method trains the history_encoder (student) to produce similar latent representations
+        as the privilege_encoder (teacher), enabling ASAP-style privileged training.
+        
+        Key difference from update_dagger_hidden():
+        - MLPv3: Aligns privilege_encoder and history_encoder within the SAME actor network
+        - Transformer: Aligns student actor and teacher actor_dagger (two separate networks)
+        
+        Training flow:
+        1. Forward with use_privilege=True -> privilege_encoder produces teacher signal
+        2. Forward with use_privilege=False -> history_encoder produces student signal
+        3. Compute L2 distance between their latent representations
+        4. Backprop and update ONLY history_encoder parameters
+        
+        Args:
+            obs_batch: Observation batch
+            ref_obs_batch: Reference observation batch (unused for MLPv3)
+            masks_batch: Optional masks (unused for MLPv3)
+        
+        Returns:
+            float: Latent alignment loss value
+        """
+        if not hasattr(self.actor_critic, 'get_latent_alignment_loss'):
+            raise RuntimeError(
+                "actor_critic does not support latent alignment loss. "
+                "Make sure your model (ActorCriticMLPV3) has get_latent_alignment_loss() method."
+            )
+        
+        # Forward with privilege encoder (teacher signal)
+        # This caches last_priv_encoding in the actor
+        _ = self.actor_critic.act(obs_batch, use_privilege=True)
+        
+        # Forward with history encoder (student)
+        # This caches last_hist_encoding in the actor
+        _ = self.actor_critic.act(obs_batch, use_privilege=False)
+        
+        # Compute latent alignment loss: ||hist_encoding - priv_encoding||_2
+        latent_loss = self.actor_critic.get_latent_alignment_loss()
+        
+        # Backward and optimize (only update history_encoder)
+        self.dagger_optimizer.zero_grad()
+        latent_loss.backward()
+        
+        if self.is_multi_gpu:
+            # For MLPv3, we need to reduce gradients of history_encoder
+            # Note: May need custom reduction if history_encoder is not in actor_dagger
+            pass  # TODO: Implement if using multi-GPU with MLPv3
+        
+        # Clip gradients of history_encoder only
+        nn.utils.clip_grad_norm_(
+            self.actor_critic.actor.history_encoder.parameters(),
+            self.max_grad_norm
+        )
+        self.dagger_optimizer.step()
+        
+        return latent_loss.item()
+        
         

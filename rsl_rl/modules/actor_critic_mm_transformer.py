@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 from calendar import c
+from sympy import fu
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ import time
 from peft import get_peft_model, LoraConfig, TaskType
 from peft.tuners.lora import Linear as LoRALinear
 from rsl_rl.utils import resolve_nn_activation
+from rsl_rl.modules.actor_critic_mlp_v2 import MultiModalMLPV2, FusedMultiModalMLP
 
 def group_by_concat_list(orig_dict: dict, concat_list: list | None = None):
     key_to_idx = {k: i for i, k in enumerate(orig_dict)}
@@ -73,7 +75,7 @@ class RMSNorm(nn.Module):
     
 class SwiGLUEmbedding(nn.Module):
     """A SwiGLU block for embedding a single observation group."""
-    def __init__(self, input_dim: int, d_model: int, expansion_factor: int = 2):
+    def __init__(self, input_dim: int, d_model: int, expansion_factor: int = 2, steps: int = 1):
         super().__init__()
         hidden_dim = int(expansion_factor * d_model)
         
@@ -94,7 +96,7 @@ class SwiGLUEmbedding(nn.Module):
     
 class MLPEmbedding(nn.Module):
     """A simple MLP block for embedding a single observation group."""
-    def __init__(self, input_dim: int, d_model: int, expansion_factor: int = 2):
+    def __init__(self, input_dim: int, d_model: int, expansion_factor: int = 2, steps: int = 1):
         super().__init__()
         hidden_dim = int(expansion_factor * d_model)
         
@@ -133,6 +135,63 @@ class HistoryEncoder(nn.Module):
         token = self.projection(conv_out_flat)
         
         return token
+    
+class HistoryEncoderSimple(nn.Module):
+    '''
+    A history encoder with fewer parameters for smaller models.
+    '''
+    def __init__(self, history_length: int, group_per_step_dim: int, d_model: int):
+        '''
+        This version computes history status from (B, history_length, group_per_step_dim) to (B, d_model) with a simpler architecture.
+        We define hidden_dim = 64, and computes kernel size and stride based on history_length:
+        kernel_size = max(2, history_length // 4)
+        stride = max(1, history_length // 8)
+        computation steps:
+        1. Linear (B, history_length, group_per_step_dim) -> (B, history_length, 64)
+        2. Permute to (B, hidden_dim, history_length)
+        3. Conv1d, out_channels=32, kernel_size=kernel_size, stride=stride -> (B, 32, L_out)
+        4. ReLU
+        5. Conv1d, out_channels=16, kernel_size=kernel_size, stride=stride -> (B, 16, L_out2)
+        6. ReLU
+        7. Flatten to (B, 16 * L_out2)
+        8. Linear to (B, d_model)
+        '''
+        super().__init__()
+        kernel_size = max(2, history_length // 4)
+        stride = max(1, history_length // 8)
+        self.conv_net = nn.Sequential(
+            nn.Conv1d(in_channels=group_per_step_dim, out_channels=32, kernel_size=kernel_size, stride=stride),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=64, kernel_size=kernel_size, stride=stride),
+            nn.ReLU(),
+        )
+        self.projection = nn.Linear(64 * self._compute_conv_output_length(history_length, kernel_size, stride, 2), d_model)
+    
+    def _compute_conv_output_length(self, input_length: int, kernel_size: int, stride: int, num_convs: int) -> int:
+        length = input_length
+        for _ in range(num_convs):
+            length = (length - kernel_size) // stride + 1
+        return length
+    
+    def forward(self, x_seq: torch.Tensor):
+        # x_seq has shape (B, history_length, group_per_step_dim)
+        x_conv_in = x_seq.permute(0, 2, 1)  # (B, group_per_step_dim, history_length)
+        conv_out = self.conv_net(x_conv_in)    # (B, 64, L_out2)
+        conv_out_flat = torch.flatten(conv_out, 1)  # (B, 64 * L_out2)
+        token = self.projection(conv_out_flat)      # (B, d_model)
+        return token
+    
+class HistoryEmbedding(nn.Module):
+    '''
+    HistoryEncoder Wrapper for form consistency as MLP Embedding ans SwiGLU Embedding
+    '''
+    def __init__(self, input_dim: int, d_model: int, expansion_factor: int = 2, steps: int = 1):
+        super().__init__()
+        self.encoder = HistoryEncoderSimple(history_length=steps, group_per_step_dim=input_dim//steps, d_model=d_model)
+        self.steps = steps
+    def forward(self, x):
+        x = x.reshape(-1, self.steps, x.size(-1)//self.steps)
+        return self.encoder(x)
 
 ############################################################################################################
 #
@@ -405,6 +464,9 @@ class MMTransformer(nn.Module):
         # -------------------
         # Final fully connected layer
         # -------------------
+        # Cache hidden state before projection (for DAgger training)
+        self.last_hidden_state = x  # [B, dim_model]
+        
         x = self.fc(x)  # Shape: (B, output_dim)
         if self.mlp_residual is not None:
             obs_in = obs
@@ -521,10 +583,12 @@ class MMTransformerV2(nn.Module):
             ls_init_values = 1e-3,
             apply_pooling = False,
             apply_mlp_residual = True, # Warning: Do not set this to True if you are using a ref & without ref switching environment!
+            mlp_weight = 0.5,
             **kwargs
     ):
         super().__init__()
         self.name = name
+        self.mlp_weight = mlp_weight
         if kwargs:
             print(f"Transformer.__init__ got unexpected arguments, which will be ignored: {kwargs.keys()}")
         self.obs_embedding = ObservationEmbeddingV2(dim_model, term_dict, concatenate_term_names=concatenate_term_names, history_length=history_length)
@@ -544,11 +608,10 @@ class MMTransformerV2(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers, norm=nn.LayerNorm(dim_model))
         self.fc = nn.Sequential(
-            # nn.Linear(dim_model, dim_model * 2),
-            # nn.GELU(),
-            # nn.Linear(dim_model * 2, dim_out),
             nn.Linear(dim_model, dim_out),
         )
+       
+        
         self.apply_pooling = apply_pooling
         obs_size = sum(term_dict.values())
         ref_obs_size = sum(ref_term_dict.values()) if ref_term_dict else 0
@@ -556,38 +619,65 @@ class MMTransformerV2(nn.Module):
         # New MLP residual design: separate primary and reference paths
         if apply_mlp_residual:
             # Primary MLP path (always active, processes obs)
-            self.mlp_primary = nn.Sequential(
-                nn.Linear(obs_size, 512),
-                nn.GELU(),
-                nn.Linear(512, 256),
-                nn.GELU(),
-                nn.Linear(256, dim_out),
-            )
+            # self.mlp_primary = nn.Sequential(
+            #     nn.Linear(obs_size, 512),
+            #     nn.GELU(),
+            #     nn.Linear(512, 256),
+            #     nn.GELU(),
+            #     nn.Linear(256, dim_out),
+            # )
+            # self.mlp_primary = MultiModalMLPV2(
+            #     term_dict={name: term_dict},
+            #     output_size=dim_out,
+            #     hidden_dims=[512, 256, 128],
+            #     history_length=history_length,
+            # )
             
-            # Reference MLP path (only active when ref_obs is provided)
-            if ref_obs_size > 0:
-                self.mlp_ref = nn.Sequential(
-                    nn.Linear(ref_obs_size, 512),
-                    nn.GELU(),
-                    nn.Linear(512, 256),
-                    nn.GELU(),
-                    nn.Linear(256, dim_out),
-                )
+            # # Reference MLP path (only active when ref_obs is provided)
+            # if ref_obs_size > 0:
+            #     self.mlp_ref = MultiModalMLPV2(
+            #         term_dict={name: ref_term_dict},
+            #         output_size=dim_out,
+            #         hidden_dims=[512, 256, 128],
+            #         history_length=history_length,
+            #     )
                 
-                # Gated fusion for MLP outputs
-                self.mlp_gate = nn.Sequential(
-                    nn.Linear(dim_model + dim_out * 2, 256),  # transformer + primary + ref
-                    nn.ReLU(),
-                    nn.Linear(256, dim_out),
-                    nn.Sigmoid()
-                )
-            else:
-                self.mlp_ref = None
-                self.mlp_gate = None
+            #     # Gated fusion for MLP outputs
+            #     self.mlp_gate = nn.Sequential(
+            #         nn.Linear(dim_out * 3, dim_out),
+            #         nn.Sigmoid()
+            #     )
+            # else:
+            #     self.mlp_ref = None
+            #     self.mlp_gate = None
+            
+            self.mlp_bypass = FusedMultiModalMLP(
+                term_dict={'name': term_dict},
+                ref_term_dict={'ref_name': ref_term_dict} if ref_term_dict else None,
+                output_size=dim_model,
+                hidden_dims=[512, 256],
+                history_length=history_length,
+                activation='elu',
+                encoder_latent_dim=dim_model,
+                encoder_compress_threshold=32,
+                fusion_mode='gated',
+                use_layer_norm=False,
+                fuse_activation=True,
+            )
+            self.mlp_gate = self.mlp_gate = nn.Sequential(
+                nn.Linear(dim_model * 2, dim_model * 4),
+                nn.GELU(),
+                nn.Linear(dim_model * 4, dim_model), 
+                nn.Sigmoid()
+            )
+            nn.init.constant_(self.mlp_gate[-2].bias, -2.0)  # -3.0 in bias -> sigmoid ~ 0.5 initial gating towards transformer path
+            
         else:
-            self.mlp_primary = None
-            self.mlp_ref = None
+            self.mlp_bypass = None
             self.mlp_gate = None
+            # self.mlp_primary = None
+            # self.mlp_ref = None
+            # self.mlp_gate = None
         # self.out_ls = LayerScale(dim_out, init_values=ls_init_values)
 
     def forward(
@@ -613,8 +703,7 @@ class MMTransformerV2(nn.Module):
         embeddings = []
         padding_masks = []
 
-        assert (self.ref_obs_embedding is not None) or (ref_obs is None), "Cannot run multi-modality mode with ref_obs_size=0"
-
+        assert (self.ref_obs_embedding is not None) or (ref_obs is None), "Cannot run multi-modality mode with ref_obs_size=0"        
         # -------------------
         # Process obs embeddings
         # -------------------
@@ -696,41 +785,18 @@ class MMTransformerV2(nn.Module):
         # -------------------
         # Final fully connected layer
         # -------------------
-        transformer_out = self.fc(x)  # Shape: (B, output_dim)
+        # y = self.fc(x)  # Shape: (B, output_dim)
         
         # New MLP residual: separate primary and reference paths with gated fusion
-        if self.mlp_primary is not None:
-            # Primary MLP path (always computed)
-            mlp_primary_out = self.mlp_primary(obs)  # (B, output_dim)
-            
-            # If no ref_obs or no mlp_ref, use simple addition
-            if ref_obs is None or self.mlp_ref is None:
-                y = transformer_out + mlp_primary_out
-            else:
-                # Reference MLP path (only when ref_obs is present)
-                ref_obs_tensor, ref_obs_mask = ref_obs
-                mlp_ref_out = self.mlp_ref(ref_obs_tensor)  # (B, output_dim)
-                
-                # Apply mask to ref output
-                mlp_ref_out = mlp_ref_out * ref_obs_mask.float().unsqueeze(-1)
-                
-                # Gated fusion: learn how to combine transformer, primary MLP, and ref MLP
-                if self.mlp_gate is not None:
-                    # Gate input: transformer features + both MLP outputs
-                    gate_input = torch.cat([x, mlp_primary_out, mlp_ref_out], dim=-1)
-                    gate = self.mlp_gate(gate_input)  # (B, output_dim), values in [0, 1]
-                    
-                    # Gated combination:
-                    # gate=1: use transformer + ref_mlp (complex reasoning)
-                    # gate=0: use primary_mlp (simple direct mapping)
-                    y = gate * (transformer_out + mlp_ref_out) + (1 - gate) * mlp_primary_out
-                else:
-                    # Fallback: simple addition
-                    y = transformer_out + mlp_primary_out + mlp_ref_out
+        if self.mlp_bypass is not None:
+            x_mlp = self.mlp_bypass(obs, ref_obs)
+            gate_input = torch.cat([x, x_mlp], dim=-1)
+            gate = self.mlp_gate(gate_input)
+            x_fused = (1 - gate) * x_mlp  + gate * x
         else:
-            # No MLP residual, use transformer output directly
-            y = transformer_out
+            x_fused = x
             
+        y = self.fc(x_fused)
         return y
 
 class Transformer(nn.Module):
@@ -999,6 +1065,67 @@ class ActorCriticMMTransformer(nn.Module):
         # load the weights
         # self.actor.load_state_dict(dagger_weights)
         self.actor.load_state_dict(actor_weights)
+        # self.critic.load_state_dict(critic_weights)
+        print(f"Loaded actor weights from {path} to actor and critic")
+        
+        # load std
+        if self.noise_std_type == "scalar":
+            assert "std" in model_state_dict.keys(), f"Key 'std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.std.data = model_state_dict["std"]
+        elif self.noise_std_type == "log":
+            assert "log_std" in model_state_dict.keys(), f"Key 'log_std' not found in state_dict keys: {model_state_dict.keys()}, check if your noise_std_type is correct"
+            self.log_std.data = model_state_dict["log_std"]
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        
+        print(f"Loaded actor noise std from {path}")
+        
+        
+    def load_critic_weights(self, path):
+        state_dict = torch.load(path, map_location="cpu")
+        # check for 'actor' in the state_dict keys
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the actor_dagger weights through layer name matching (starting with 'actor')
+        # actor_weights = {k[len('actor.'):]: v for k, v in model_state_dict.items() if k.startswith('actor')}
+        critic_weights = {k[len('critic.'):]: v for k, v in model_state_dict.items() if k.startswith('critic')}
+        # actor_state_dict = self.actor.state_dict()
+        critic_state_dict = self.critic.state_dict()
+        new_actor_weights = {}
+        new_critic_weights = {}
+        # perform weights checking
+        # for k, v in actor_weights.items():
+        #     if k not in actor_state_dict:
+        #         print(f"Warning: Key {k} not found in actor state_dict, removing...")
+        #         continue
+        #     if actor_state_dict[k].shape != v.shape:
+        #         print(f"Warning: Shape mismatch for key {k}: {actor_state_dict[k].shape} vs {v.shape}, removing...")
+        #         continue
+        #     new_actor_weights[k] = v
+                
+        for k, v in critic_weights.items():
+            if k not in critic_state_dict:
+                print(f"Warning: Key {k} not found in critic state_dict, removing...")
+                continue
+            if critic_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {critic_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_critic_weights[k] = v   
+            
+        # actor_weights = new_actor_weights
+        critic_weights = new_critic_weights
+        # perform actor state dict fullfilling
+        # for k, v in actor_state_dict.items():
+        #     if k not in actor_weights:
+        #         actor_weights[k] = v
+                
+        for k, v in critic_state_dict.items():
+            if k not in critic_weights:
+                critic_weights[k] = v
+        # load the weights
+        # self.actor.load_state_dict(dagger_weights)
+        # self.actor.load_state_dict(actor_weights)
         self.critic.load_state_dict(critic_weights)
         print(f"Loaded actor weights from {path} to actor and critic")
         
@@ -1155,6 +1282,33 @@ class ActorCriticMMTransformer(nn.Module):
     
     def get_actions_log_prob_dagger(self, actions):
         return self.distribution_dagger.log_prob(actions).sum(dim=-1)
+    
+    def get_hidden_alignment_loss(self):
+        """
+        Compute alignment loss between student (actor) and teacher (actor_dagger) 
+        hidden representations (before the final projection layer).
+        
+        This enables ASAP-style training in hidden space rather than action space.
+        
+        Returns:
+            torch.Tensor: L2 distance between hidden states, shape []
+        """
+        if self.actor_dagger is None:
+            raise RuntimeError("actor_dagger is not initialized. Cannot compute hidden alignment loss.")
+        
+        if not hasattr(self.actor, 'last_hidden_state') or not hasattr(self.actor_dagger, 'last_hidden_state'):
+            raise RuntimeError(
+                "Hidden states not cached. Make sure to call forward pass on both actor and actor_dagger "
+                "before computing alignment loss."
+            )
+        
+        student_hidden = self.actor.last_hidden_state  # [B, dim_model]
+        teacher_hidden = self.actor_dagger.last_hidden_state  # [B, dim_model]
+        
+        # L2 distance (ASAP style)
+        loss = (student_hidden - teacher_hidden.detach()).norm(p=2, dim=1).mean()
+        
+        return loss
 
     def act_inference(self, observations, ref_observations=None, **kwargs):
         actions_mean = self.actor(observations, ref_observations, **kwargs)
@@ -1261,7 +1415,7 @@ class ActorCriticDebugMLP(nn.Module):
         # load the weights
         # self.actor.load_state_dict(dagger_weights)
         self.actor.load_state_dict(actor_weights)
-        self.critic.load_state_dict(critic_weights)
+        # self.critic.load_state_dict(critic_weights)
         print(f"Loaded actor weights from {path} to actor and critic")
         
         # load std
@@ -1437,7 +1591,24 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
             if enable_lora:
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             
-        self.critic = MMTransformerV2(1, dim_model, term_dict["critic"], ref_term_dict["critic"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", dropout=dropout, concatenate_term_names=concatenate_term_names["critic"], concatenate_ref_term_names=concatenate_ref_term_names["critic"], history_length=history_length, **kwargs) # 1 for value function
+        # self.critic = MMTransformerV2(1, dim_model, term_dict["critic"], ref_term_dict["critic"], max_len=max_len, num_heads=num_heads, num_layers=num_layers, name="critic", dropout=dropout, concatenate_term_names=concatenate_term_names["critic"], concatenate_ref_term_names=concatenate_ref_term_names["critic"], history_length=history_length, **kwargs) # 1 for value function
+        
+        critic_term_dict = {"critic": term_dict.get("critic", term_dict.get("policy", {}))}
+        critic_ref_term_dict = {"critic": ref_term_dict.get("critic", ref_term_dict.get("policy", {}))} if ref_term_dict else None
+        
+        self.critic = FusedMultiModalMLP(
+            term_dict=critic_term_dict,
+            ref_term_dict=critic_ref_term_dict,
+            output_size=1,  # Value function outputs single value
+            hidden_dims=[512, 256, 128],
+            activation="elu",
+            history_length=history_length,
+            encoder_latent_dim=dim_model,
+            encoder_compress_threshold=32,
+            use_layer_norm=False,
+            fusion_mode='gated',
+            name="critic"
+        )
         if load_actor_path:
             self.load_actor_weights(load_actor_path)
         print(f"Actor Transformer: {self.actor}")

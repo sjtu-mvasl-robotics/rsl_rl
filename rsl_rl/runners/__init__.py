@@ -7,5 +7,6 @@
 
 from .on_policy_runner import OnPolicyRunner
 from .on_policy_runner_mm import OnPolicyRunnerMM
+from .on_policy_runner_mimic import OnPolicyRunnerMimic
 
-__all__ = ["OnPolicyRunner", "OnPolicyRunnerMM"]
+__all__ = ["OnPolicyRunner", "OnPolicyRunnerMM", "OnPolicyRunnerMimic"]

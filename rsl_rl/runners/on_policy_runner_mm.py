@@ -88,10 +88,19 @@ class OnPolicyRunnerMM:
 
         actor_critic_name = self.policy_cfg.pop("class_name")
         actor_critic_class = eval(actor_critic_name)  # ActorCritic
-        if actor_critic_name == "ActorCriticMMTransformerV2" or actor_critic_name == "ActorCriticMMGPT" or actor_critic_name == "ActorCriticMLPV2":
+        if actor_critic_name in ["ActorCriticMMTransformerV2", "ActorCriticMMGPT", "ActorCriticMLPV2"]:
             def get_term_dict(dict_names, dict_dims):
                 ret = dict(
                     (key, dict((name, dim[0]) for name, dim in zip(dict_names[key], dict_dims[key]) if dim[0] > 0))
+                    for key in dict_names.keys()
+                )
+                if "critic" not in ret:
+                    ret["critic"] = ret["policy"]
+                return ret
+            
+            def get_term_steps(dict_names, dict_dims, dict_cfgs):
+                ret = dict(
+                    (key, dict((name, cfg.steps // cfg.sample_rate) for name, dim, cfg in zip(dict_names[key], dict_dims[key], dict_cfgs[key]) if dim[0] > 0))
                     for key in dict_names.keys()
                 )
                 if "critic" not in ret:
@@ -115,6 +124,13 @@ class OnPolicyRunnerMM:
                 self.env.unwrapped.ref_observation_manager.active_terms,
                 self.env.unwrapped.ref_observation_manager.group_ref_obs_term_dim,
             )
+            if actor_critic_name == "ActorCriticMMGPT":
+                actor_critic_dim["ref_term_steps"] = get_term_steps(
+                    self.env.unwrapped.ref_observation_manager.active_terms,
+                    self.env.unwrapped.ref_observation_manager.group_ref_obs_term_dim,
+                    self.env.unwrapped.ref_observation_manager.group_ref_obs_term_cfgs,
+                )
+                actor_critic_dim["default_joint_pos"] = self.env.unwrapped.scene['robot'].data.default_joint_pos[0] # shape: (num_joints,)
         elif actor_critic_name == "StudentTeacherMMTransformer":
             actor_critic_dim = {
                 "num_teacher_obs": num_critic_obs,
@@ -159,6 +175,24 @@ class OnPolicyRunnerMM:
             self.ref_obs_normalizer = EmpiricalNormalization(shape=[num_ref_obs], until=1.0e8).to(self.device) if num_ref_obs > 0 else None
             self.critic_obs_normalizer = EmpiricalNormalization(shape=[num_critic_obs], until=1.0e8).to(self.device)
             self.critic_ref_obs_normalizer = EmpiricalNormalization(shape=[num_critic_ref_obs], until=1.0e8).to(self.device) if num_critic_ref_obs > 0 else None
+            
+            # Load normalizer from dagger path if available
+            if "load_dagger_path" in self.policy_cfg and self.policy_cfg["load_dagger_path"] is not None:
+                dagger_path = self.policy_cfg["load_dagger_path"]
+                print(f"Loading observation normalizer from dagger path: {dagger_path}")
+                try:
+                    loaded_dict = torch.load(dagger_path, map_location=self.device)
+                    if "obs_norm_state_dict" in loaded_dict:
+                        self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                        print("Loaded obs_norm_state_dict from dagger checkpoint.")
+                    if "critic_obs_norm_state_dict" in loaded_dict:
+                        self.critic_obs_normalizer.load_state_dict(loaded_dict["critic_obs_norm_state_dict"])
+                    if self.ref_obs_normalizer is not None and "ref_obs_norm_state_dict" in loaded_dict:
+                        self.ref_obs_normalizer.load_state_dict(loaded_dict["ref_obs_norm_state_dict"])
+                    if self.critic_ref_obs_normalizer is not None and "critic_ref_obs_norm_state_dict" in loaded_dict:
+                        self.critic_ref_obs_normalizer.load_state_dict(loaded_dict["critic_ref_obs_norm_state_dict"])
+                except Exception as e:
+                    print(f"Failed to load normalizer from dagger path: {e}")
         else:
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.ref_obs_normalizer = torch.nn.Identity().to(self.device) if num_ref_obs > 0 else None
@@ -331,7 +365,7 @@ class OnPolicyRunnerMM:
                             amp_score = self.alg.amp.amp_score(amp_prev_obs, amp_obs)
                             # amp_relative_score = amp_score - amp_prev_neg_score
                             # amp_rewards += amp_relative_score * 5
-                            rewards += amp_rewards * self.amp_cfg["amp_reward_scale"]
+                            rewards += amp_rewards * self.amp_cfg["amp_reward_scale"] * (self.amp_cfg['amp_pretrain_steps'] <= it) # only add amp reward after pretrain steps
                             cur_amp_reward_sum += amp_rewards * self.amp_cfg["amp_reward_scale"]
                             cur_amp_score_sum += amp_score
                             cur_amp_score_avg = cur_amp_score_sum / (cur_episode_length + 1)
@@ -370,7 +404,7 @@ class OnPolicyRunnerMM:
                 # Learning step
                 start = stop
                 if self.training_type == "rl":
-                    self.alg.compute_returns(critic_obs)
+                    self.alg.compute_returns(critic_obs, critic_ref_obs_tuple)
 
             loss_dict = self.alg.update(epoch=it)
             if self.amp_cfg is not None:
@@ -656,6 +690,181 @@ class OnPolicyRunnerMM:
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.critic_obs_normalizer.eval()
+
+    def collect_dataset(self, num_episodes: int, save_path: str = None, max_steps_per_episode: int = None):
+        """
+        采集当前 policy 的执行轨迹数据集
+        
+        Args:
+            num_episodes: 采集的 episode 数量
+            save_path: 保存路径（如果为 None 则不保存，只返回数据）
+            max_steps_per_episode: 每个 episode 最大步数（None 则使用环境默认）
+        
+        Returns:
+            dataset: {
+                'observations': List[np.ndarray],
+                'ref_observations': List[Tuple[np.ndarray, np.ndarray]],
+                'actions': List[np.ndarray],
+                'rewards': List[np.ndarray],
+                'dones': List[np.ndarray],
+                'episode_lengths': List[int],
+                'episode_rewards': List[float],
+            }
+        """
+        import numpy as np
+        import pickle
+        from pathlib import Path
+        from tqdm import tqdm
+        
+        self.eval_mode()
+        policy = self.get_inference_policy(device=self.device)
+        
+        # 重置环境
+        self.env.reset()
+        obs, extras = self.env.get_observations()
+        ref_obs_tuple, ref_extras = self.env.get_reference_observations()
+        
+        obs = obs.to(self.device)
+        if ref_obs_tuple is not None:
+            ref_obs_tuple = tuple(ref_obs.to(self.device) for ref_obs in ref_obs_tuple)
+        
+        # 数据存储
+        dataset = {
+            'observations': [],
+            'ref_observations': [],
+            'actions': [],
+            'rewards': [],
+            'dones': [],
+            'episode_lengths': [],
+            'episode_rewards': [],
+        }
+        
+        # 当前 episode 的缓存
+        current_obs = []
+        current_ref_obs = []
+        current_actions = []
+        current_rewards = []
+        current_dones = []
+        
+        num_envs = self.env.num_envs
+        episode_counts = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        episode_steps = torch.zeros(num_envs, dtype=torch.long, device=self.device)
+        episode_rewards_sum = torch.zeros(num_envs, dtype=torch.float, device=self.device)
+        
+        max_steps = max_steps_per_episode if max_steps_per_episode else self.env.max_episode_length
+        
+        print(f"开始采集 {num_episodes} 个 episodes 的数据...")
+        print(f"并行环境数: {num_envs}")
+        print(f"每个 episode 最大步数: {max_steps}")
+        
+        pbar = tqdm(total=num_episodes, desc="采集进度", disable=self.disable_logs)
+        
+        with torch.no_grad():
+            step_count = 0
+            while episode_counts.sum() < num_episodes:
+                # 获取 action
+                actions = policy(obs, ref_obs_tuple)
+                
+                # 存储当前状态
+                current_obs.append(obs.cpu().numpy())
+                if ref_obs_tuple is not None:
+                    current_ref_obs.append((ref_obs_tuple[0].cpu().numpy(), ref_obs_tuple[1].cpu().numpy()))
+                else:
+                    current_ref_obs.append(None)
+                current_actions.append(actions.cpu().numpy())
+                
+                # 执行 action
+                obs, ref_obs_tuple, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                
+                # 移动到正确的设备
+                obs = obs.to(self.device)
+                if ref_obs_tuple is not None:
+                    ref_obs_tuple = tuple(ref_obs.to(self.device) for ref_obs in ref_obs_tuple)
+                rewards = rewards.to(self.device)
+                dones = dones.to(self.device)
+                
+                # 更新 obs 归一化统计（如果使用）
+                if self.empirical_normalization:
+                    obs = self.obs_normalizer(obs)
+                    if ref_obs_tuple is not None and self.ref_obs_normalizer is not None:
+                        ref_obs_tuple = (self.ref_obs_normalizer(ref_obs_tuple[0]), ref_obs_tuple[1])
+                
+                current_rewards.append(rewards.cpu().numpy())
+                current_dones.append(dones.cpu().numpy())
+                
+                episode_steps += 1
+                episode_rewards_sum += rewards
+                
+                # 检查哪些环境 episode 结束
+                done_indices = (dones > 0).nonzero(as_tuple=False).squeeze(-1)
+                
+                if len(done_indices) > 0:
+                    for env_idx in done_indices:
+                        env_idx = env_idx.item()
+                        
+                        # 只保存还没达到目标数量的 episode
+                        if episode_counts[env_idx] < num_episodes // num_envs + 1:
+                            # 提取该环境的完整轨迹
+                            ep_len = episode_steps[env_idx].item()
+                            
+                            obs_traj = np.stack([step[env_idx] for step in current_obs[-ep_len:]], axis=0)
+                            actions_traj = np.stack([step[env_idx] for step in current_actions[-ep_len:]], axis=0)
+                            rewards_traj = np.stack([step[env_idx] for step in current_rewards[-ep_len:]], axis=0)
+                            dones_traj = np.stack([step[env_idx] for step in current_dones[-ep_len:]], axis=0)
+                            
+                            if current_ref_obs[-1] is not None:
+                                ref_obs_traj = (
+                                    np.stack([step[0][env_idx] for step in current_ref_obs[-ep_len:]], axis=0),
+                                    np.stack([step[1][env_idx] for step in current_ref_obs[-ep_len:]], axis=0)
+                                )
+                            else:
+                                ref_obs_traj = None
+                            
+                            dataset['observations'].append(obs_traj)
+                            dataset['ref_observations'].append(ref_obs_traj)
+                            dataset['actions'].append(actions_traj)
+                            dataset['rewards'].append(rewards_traj)
+                            dataset['dones'].append(dones_traj)
+                            dataset['episode_lengths'].append(ep_len)
+                            dataset['episode_rewards'].append(episode_rewards_sum[env_idx].item())
+                            
+                            episode_counts[env_idx] += 1
+                            pbar.update(1)
+                        
+                        # 重置该环境的计数
+                        episode_steps[env_idx] = 0
+                        episode_rewards_sum[env_idx] = 0
+                
+                step_count += 1
+                
+                # 防止无限循环
+                if step_count > num_episodes * max_steps * 2:
+                    print("警告: 达到最大步数限制，提前结束采集")
+                    break
+        
+        pbar.close()
+        
+        # 统计信息
+        actual_episodes = len(dataset['observations'])
+        print(f"\n采集完成!")
+        print(f"实际采集 episodes: {actual_episodes}")
+        print(f"平均 episode 长度: {np.mean(dataset['episode_lengths']):.2f} ± {np.std(dataset['episode_lengths']):.2f}")
+        print(f"平均 episode reward: {np.mean(dataset['episode_rewards']):.2f} ± {np.std(dataset['episode_rewards']):.2f}")
+        print(f"Episode 长度范围: [{np.min(dataset['episode_lengths'])}, {np.max(dataset['episode_lengths'])}]")
+        
+        # 保存数据
+        if save_path is not None:
+            save_dir = Path(save_path).parent
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            with open(save_path, 'wb') as f:
+                pickle.dump(dataset, f)
+            
+            import os
+            print(f"\n数据集已保存到: {save_path}")
+            print(f"文件大小: {os.path.getsize(save_path) / 1024 / 1024:.2f} MB")
+        
+        return dataset
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)

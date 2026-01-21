@@ -7,12 +7,23 @@
 # Created by Yifei Yao (with AI assistance), 2025
 
 from __future__ import annotations
+from regex import B
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 from typing import Optional, Tuple
 
+class NoPooling(nn.Module):
+    """No pooling layer - identity"""
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        '''x.shape: (B, C, T)'''
+        B = x.shape[0]
+        x = x.reshape(B, -1, 1) # (B, C*T, 1)
+        return x
 
 class TemporalFeatureEncoder(nn.Module):
     """
@@ -35,7 +46,9 @@ class TemporalFeatureEncoder(nn.Module):
         history_length: int,
         latent_dim: int = 32,
         compress_threshold: int = 32,
-        activation: str = "elu"
+        activation: str = "elu",
+        reorgnize_obs: bool = False,
+        no_pooling: bool = True,
     ):
         """
         Args:
@@ -53,6 +66,7 @@ class TemporalFeatureEncoder(nn.Module):
         self.history_length = history_length
         self.latent_dim = latent_dim
         self.compress_threshold = compress_threshold
+        self.reorgnize_obs = reorgnize_obs
         
         # Build projection list (only register nn.Linear when needed)
         self.projection_indices = []  # Which terms need projection
@@ -63,9 +77,9 @@ class TemporalFeatureEncoder(nn.Module):
         total_per_step_dim = 0
         
         for i, term_dim in enumerate(term_dims):
-            if history_length > 1 and term_dim % history_length == 0:
+            if history_length > 1 and (term_dim % history_length == 0 or reorgnize_obs):
                 # This term has history
-                per_step_dim = term_dim // history_length
+                per_step_dim = term_dim // history_length if not reorgnize_obs else term_dim
                 self.has_history.append(True)
                 
                 # Only create projection if needed
@@ -89,7 +103,7 @@ class TemporalFeatureEncoder(nn.Module):
             self.projections = nn.ModuleList()
         
         # Store output dimension (total per-step dim after compression)
-        self.output_dim = total_per_step_dim
+        self.output_dim = total_per_step_dim if not no_pooling else total_per_step_dim * self.history_length
         
         # Conv1D for temporal compression
         # Input: (B, total_per_step_dim, T)
@@ -103,8 +117,14 @@ class TemporalFeatureEncoder(nn.Module):
                 out_channels=total_per_step_dim,  # Keep same channel size
                 kernel_size=3,
                 padding=1
-            )
-            self.pool = nn.AdaptiveAvgPool1d(1)
+            ) # compress ratio: kernel 3, padding 1 -> T stays the same
+            # self.pool = nn.AdaptiveAvgPool1d(1)
+            if no_pooling:
+                self.pool = NoPooling()
+            else:
+                self.pool = nn.AdaptiveAvgPool1d(1)
+                
+            
             # Activation function
             activations = {
                 "elu": nn.ELU(),
@@ -137,14 +157,14 @@ class TemporalFeatureEncoder(nn.Module):
         proj_idx = 0
         
         for i, term_dim in enumerate(self.term_dims):
-            term_obs = obs[:, start:start+term_dim]  # (B, term_dim)
+            term_obs = obs[..., start:start+term_dim]  # (B, term_dim)
             start += term_dim
             
             if not self.has_history[i]:
                 continue  # Skip non-history terms
             
             # Reshape: (B, term_dim) -> (B, T, per_step_dim)
-            per_step_dim = term_dim // self.history_length
+            per_step_dim = term_dim // self.history_length if not self.reorgnize_obs else term_dim
             feature = term_obs.view(B, self.history_length, per_step_dim)  # (B, T, d)
             
             # Compress if needed
@@ -195,7 +215,9 @@ class MultiModalMLPV2(nn.Module):
         encoder_latent_dim: int = 128,
         encoder_compress_threshold: int = 32,
         use_layer_norm: bool = False,
-        name: str = ""
+        reorgnize_obs: bool = False,
+        name: str = "",
+        no_pooling: bool = True,
     ):
         """
         Args:
@@ -226,7 +248,7 @@ class MultiModalMLPV2(nn.Module):
         # Separate history terms from non-history terms
         self.non_history_dims = []
         for i, term_dim in enumerate(self.term_dims):
-            if history_length <= 1 or term_dim % history_length != 0:
+            if history_length <= 1 or (term_dim % history_length != 0 and not reorgnize_obs):
                 self.non_history_dims.append((i, term_dim))
         
         total_non_history = sum(dim for _, dim in self.non_history_dims)
@@ -239,7 +261,9 @@ class MultiModalMLPV2(nn.Module):
                 history_length=history_length,
                 latent_dim=encoder_latent_dim,
                 compress_threshold=encoder_compress_threshold,
-                activation=activation
+                activation=activation,
+                reorgnize_obs=reorgnize_obs,
+                no_pooling=no_pooling,
             )
             total_encoded_dim = self.temporal_encoder.output_dim + total_non_history
         else:
@@ -343,11 +367,16 @@ class FusedMultiModalMLP(nn.Module):
         encoder_compress_threshold: int,
         use_layer_norm: bool,
         fusion_mode: str,
-        name: str = "fused_mlp"
+        name: str = "fused_mlp",
+        fuse_activation: bool = False,
+        reorgnize_obs: bool = False,
     ):
         super().__init__()
+        self.reorgnize_obs = reorgnize_obs
+        self.history_length = history_length
         
         self.fusion_mode = fusion_mode
+        self.fuse_activation = fuse_activation
         self.has_ref = ref_term_dict is not None and bool(list(ref_term_dict.values())[0])
         
         # Main network
@@ -360,8 +389,11 @@ class FusedMultiModalMLP(nn.Module):
             encoder_latent_dim=encoder_latent_dim,
             encoder_compress_threshold=encoder_compress_threshold,
             use_layer_norm=use_layer_norm,
-            name=f"{name}_main"
+            name=f"{name}_main",
+            reorgnize_obs=reorgnize_obs
         )
+        
+        self.activation = self._get_activation(activation)
         
         # Reference network (if available)
         if self.has_ref:
@@ -374,7 +406,8 @@ class FusedMultiModalMLP(nn.Module):
                 encoder_latent_dim=encoder_latent_dim,
                 encoder_compress_threshold=encoder_compress_threshold,
                 use_layer_norm=use_layer_norm,
-                name=f"{name}_ref"
+                name=f"{name}_ref",
+                reorgnize_obs=reorgnize_obs
             )
             
             # Fusion layers
@@ -387,11 +420,64 @@ class FusedMultiModalMLP(nn.Module):
                 self.fusion_proj = nn.Linear(output_size * 2, output_size)
         else:
             self.ref_net = None
+            
+        self.obs_buffer = None
+        self.ref_obs_buffer = None
+            
+    def reset(self, dones: Optional[torch.Tensor] = None):
+        """Reset any recurrent states if needed (not used here)"""
+        if self.obs_buffer is not None:
+            if dones is not None:
+                mask = (dones == 1)
+                self.obs_buffer[:, mask, :] = 0.0
+                if self.ref_obs_buffer is not None:
+                    self.ref_obs_buffer[:, mask, :] = 0.0
+            else:
+                self.obs_buffer.zero_()
+                if self.ref_obs_buffer is not None:
+                    self.ref_obs_buffer.zero_()
+                
+    def _update_buffer(self, new_obs: torch.Tensor):
+        if self.obs_buffer is None:
+            B = new_obs.shape[0]
+            self.obs_buffer = torch.zeros((self.history_length, B, new_obs.shape[1]),
+                                          device=new_obs.device,
+                                          dtype=new_obs.dtype)
+
+            
+        self.obs_buffer = torch.roll(self.obs_buffer, shifts=-1, dims=0)
+        self.obs_buffer[-1, :, :] = new_obs
+        
+    def _update_ref_buffer(self, new_ref_obs: torch.Tensor):
+        if self.ref_obs_buffer is None:
+            B = new_ref_obs.shape[0]
+            self.ref_obs_buffer = torch.zeros((self.history_length, B, new_ref_obs.shape[1]),
+                                              device=new_ref_obs.device,
+                                              dtype=new_ref_obs.dtype)
+
+            
+        self.ref_obs_buffer = torch.roll(self.ref_obs_buffer, shifts=-1, dims=0)
+        self.ref_obs_buffer[-1, :, :] = new_ref_obs
+        
+            
+    def _get_activation(self, activation: str):
+        """Get activation function by name"""
+        activations = {
+            "elu": nn.ELU(),
+            "relu": nn.ReLU(),
+            "gelu": nn.GELU(),
+            "tanh": nn.Tanh(),
+            "silu": nn.SiLU(),
+        }
+        if activation.lower() not in activations:
+            raise ValueError(f"Unknown activation: {activation}. Choose from {list(activations.keys())}")
+        return activations[activation.lower()]
     
     def forward(
         self,
         observations: torch.Tensor,
-        ref_observations: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        ref_observations: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs
     ) -> torch.Tensor:
         """
         Args:
@@ -403,6 +489,21 @@ class FusedMultiModalMLP(nn.Module):
         Returns:
             output: (B, output_size)
         """
+        # special handler to match with mmgpt class
+        if self.reorgnize_obs: # MMGPT mode enabled
+            if len(observations.shape) == 2: # inference mode
+                self._update_buffer(observations)
+                observations = self.obs_buffer.permute(1,0,2)  # (B, history_length, obs_dim)
+                if ref_observations is not None:
+                    ref_obs, ref_mask = ref_observations
+                    self._update_ref_buffer(ref_obs)
+                    ref_observations = (self.ref_obs_buffer.permute(1,0,2), ref_mask)
+            else:
+                observations = observations.permute(1,0,2)  # (B, history_length, obs_dim)
+                ref_observations = None if ref_observations is None else (ref_observations[0].permute(1,0,2), ref_observations[1][-1])
+            
+        
+        
         main_output = self.main_net(observations)
         
         if not self.has_ref or ref_observations is None:
@@ -429,6 +530,8 @@ class FusedMultiModalMLP(nn.Module):
         else:
             raise ValueError(f"Unknown fusion_mode: {self.fusion_mode}")
         
+        if self.fuse_activation:
+            output = self.activation(output)
         return output
 
 
@@ -457,6 +560,7 @@ class ActorCriticMLPV2(nn.Module):
         load_dagger: bool = False,
         load_dagger_path: Optional[str] = None,
         load_actor_path: Optional[str] = None,
+        load_critic_path: Optional[str] = None,
         **kwargs
     ):
         """
@@ -561,6 +665,8 @@ class ActorCriticMLPV2(nn.Module):
         
         if load_actor_path:
             self.load_actor_weights(load_actor_path)
+        if load_critic_path:
+            self.load_critic_weights(load_critic_path)
         
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -663,9 +769,93 @@ class ActorCriticMLPV2(nn.Module):
     
     def load_actor_weights(self, path: str):
         """Load pretrained actor weights"""
-        # TODO: Implement weight loading with shape checking
-        print(f"Warning: load_actor_weights not fully implemented for ActorCriticMLPV2")
-        pass
+        state_dict = torch.load(path, map_location="cpu")
+        # check for 'actor' in the state_dict keys
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the actor_dagger weights through layer name matching (starting with 'actor')
+        actor_weights = {k[len('actor.'):]: v for k, v in model_state_dict.items() if k.startswith('actor')}
+        critic_weights = {k[len('critic.'):]: v for k, v in model_state_dict.items() if k.startswith('critic')}
+        actor_state_dict = self.actor.state_dict()
+        critic_state_dict = self.critic.state_dict()
+        new_actor_weights = {}
+        new_critic_weights = {}
+        # perform weights checking
+        for k, v in actor_weights.items():
+            if k not in actor_state_dict:
+                print(f"Warning: Key {k} not found in actor state_dict, removing...")
+                continue
+            if actor_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {actor_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_actor_weights[k] = v
+                
+        for k, v in critic_weights.items():
+            if k not in critic_state_dict:
+                print(f"Warning: Key {k} not found in critic state_dict, removing...")
+                continue
+            if critic_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {critic_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_critic_weights[k] = v   
+            
+        actor_weights = new_actor_weights
+        critic_weights = new_critic_weights
+        # perform actor state dict fullfilling
+        for k, v in actor_state_dict.items():
+            if k not in actor_weights:
+                actor_weights[k] = v
+                
+        for k, v in critic_state_dict.items():
+            if k not in critic_weights:
+                critic_weights[k] = v
+        # load the weights
+        # self.actor.load_state_dict(dagger_weights)
+        self.actor.load_state_dict(actor_weights)
+        self.critic.load_state_dict(critic_weights)
+        
+        # load std - NOTE: std is stored inside model_state_dict, not at top level
+        if self.noise_std_type == "scalar" and 'std' in model_state_dict:
+            self.std.data = model_state_dict['std']
+            print(f"Loaded std from checkpoint: {self.std.data[:5]}...")
+        elif self.noise_std_type == "log" and 'log_std' in model_state_dict:
+            self.log_std.data = model_state_dict['log_std']
+            print(f"Loaded log_std from checkpoint: {self.log_std.data[:5]}...")
+        
+        
+        print(f"Loaded actor weights from {path} to actor and critic")
+        
+    def load_critic_weights(self, path: str):
+        """Load pretrained critic weights"""
+        state_dict = torch.load(path, map_location="cpu")
+        # check for 'critic' in the state_dict keys
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the critic weights through layer name matching (starting with 'critic')
+        critic_weights = {k[len('critic.'):]: v for k, v in model_state_dict.items() if k.startswith('critic')}
+        critic_state_dict = self.critic.state_dict()
+        new_critic_weights = {}
+        # perform weights checking
+        for k, v in critic_weights.items():
+            if k not in critic_state_dict:
+                print(f"Warning: Key {k} not found in critic state_dict, removing...")
+                continue
+            if critic_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {critic_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_critic_weights[k] = v   
+            
+        critic_weights = new_critic_weights
+        # perform critic state dict fullfilling
+        for k, v in critic_state_dict.items():
+            if k not in critic_weights:
+                critic_weights[k] = v
+        # load the weights
+        self.critic.load_state_dict(critic_weights)
+        print(f"Loaded critic weights from {path} to critic")
+        
     
     def load_dagger_weights(self, path: str):
         """Load dagger (teacher) weights"""
