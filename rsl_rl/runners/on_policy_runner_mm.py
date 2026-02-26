@@ -217,6 +217,40 @@ class OnPolicyRunnerMM:
             action_shape=[self.env.num_actions],
         )
 
+        # --- Planner RL setup ---
+        self._planner_rl_enabled = getattr(self.env, 'planner_rl_enabled', False)
+        self._planner_rl_episode_mode = False  # episode-level planner RL (autoregressive multi-regen)
+        if self._planner_rl_enabled:
+            diffusion_buffer = self.env.diffusion_buffer
+            planner_params = diffusion_buffer.get_planner_trainable_params()
+            planner_lr = self.cfg.get("planner_learning_rate", 1e-5)
+            planner_max_grad_norm = self.cfg.get("planner_max_grad_norm", 1.0)
+            planner_use_muon = self.cfg.get("planner_use_muon", False)
+            self.alg.init_planner_optimizer(
+                planner_params, lr=planner_lr, max_grad_norm=planner_max_grad_norm,
+                use_muon=planner_use_muon, planner_model=diffusion_buffer.model,
+                muon_lr=self.cfg.get("planner_muon_lr", 0.001),
+                muon_momentum=self.cfg.get("planner_muon_momentum", 0.95),
+                muon_weight_decay=self.cfg.get("planner_muon_weight_decay", 0.0),
+                muon_backend=self.cfg.get("planner_muon_backend", "torch"),
+                muon_adjust_lr_fn=self.cfg.get("planner_muon_adjust_lr_fn", None),
+            )
+            print(f"[OnPolicyRunnerMM] Planner RL enabled: lr={planner_lr}, params={len(planner_params)}, muon={planner_use_muon}")
+
+            # Stage 1: Freeze controller (actor-critic) so only planner is trained
+            freeze_controller = self.cfg.get("freeze_controller", False)
+            if freeze_controller:
+                for param in self.alg.actor_critic.parameters():
+                    param.requires_grad = False
+                self.alg.actor_critic.eval()
+                self.alg.skip_controller_update = True
+                print(f"[OnPolicyRunnerMM] Controller (actor-critic) FROZEN for planner RL Stage 1")
+
+            # Episode-level planner RL: autoregressive multi-regen mode
+            self._planner_rl_episode_mode = self.cfg.get("planner_episode_mode", False)
+            if self._planner_rl_episode_mode:
+                print(f"[OnPolicyRunnerMM] Episode-level planner RL enabled (autoregressive multi-regen)")
+
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
 
         # Logging
@@ -279,6 +313,11 @@ class OnPolicyRunnerMM:
             cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_amp_score_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_amp_score_avg = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            # Per-env ring buffer for AMP observation history
+            amp_history_len = self.amp_cfg["net_cfg"]["amp_history_length"]
+            amp_obs_dim = self.amp_cfg["net_cfg"]["backbone_input_dim"]
+            amp_obs_buffer = torch.zeros(self.env.num_envs, amp_history_len, amp_obs_dim, device=self.device)
+            amp_obs_fill_count = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)  # how many obs each env has collected
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         if self.alg.rnd:
@@ -299,8 +338,37 @@ class OnPolicyRunnerMM:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+
+            # ====== Episode-level planner RL: separate code path ======
+            if self._planner_rl_episode_mode:
+                episode_cache = self._collect_planner_episode()
+                stop = time.time()
+                collection_time = stop - start
+
+                start = stop
+                planner_metrics = self.alg.planner_episode_update(
+                    self.env.diffusion_buffer, episode_cache,
+                )
+                # Create a minimal loss_dict for logging compatibility
+                loss_dict = {}
+                stop = time.time()
+                learn_time = stop - start
+                self.current_learning_iteration = it
+
+                if self.log_dir is not None and not self.disable_logs:
+                    self.log(locals())
+                    if it % self.save_interval == 0:
+                        self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                ep_infos.clear()
+                continue
+
+            # ====== Standard RL training path ======
             # Rollout
             with torch.inference_mode():
+                # Planner RL: sample all envs simultaneously before rollout
+                if self._planner_rl_enabled:
+                    self.env.diffusion_buffer.planner_rl_sample_all()
+
                 # ref_obss = []
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(#obs, critic_obs)
@@ -309,12 +377,12 @@ class OnPolicyRunnerMM:
                         critic_obs=critic_obs,
                         ref_critic_obs=critic_ref_obs_tuple,
                     )
-                    if self.amp_cfg: # currently, actions are not applied, so they do not affect amp observations
-                        amp_prev_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(env=self.amp_cfg["_env"])
-                        # prev_obs = obs.clone()
-                        # prev_obs = prev_obs.to(self.device)
-                        # prev_obs = self.obs_normalizer(prev_obs)
-                        # amp_prev_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(prev_obs, env=self.amp_cfg["_env"])
+                    if self.amp_cfg: # Get amp observation before step and shift into per-env ring buffer
+                        amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(env=self.amp_cfg["_env"])
+                        # Shift buffer left and insert new obs at the end
+                        amp_obs_buffer[:, :-1] = amp_obs_buffer[:, 1:].clone()
+                        amp_obs_buffer[:, -1] = amp_obs
+                        amp_obs_fill_count = (amp_obs_fill_count + 1).clamp(max=amp_history_len)
 
                     obs, ref_obs_tuple, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # move to the right device
@@ -345,6 +413,10 @@ class OnPolicyRunnerMM:
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
 
+                    # Accumulate rewards for planner RL
+                    if self._planner_rl_enabled:
+                        self.env.diffusion_buffer.accumulate_planner_reward(rewards.squeeze())
+
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
 
                     if self.log_dir is not None:
@@ -360,11 +432,26 @@ class OnPolicyRunnerMM:
                         # rewards = torch.clamp(rewards, min=0.0)
 
                         if self.amp_cfg:
-                            amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])( env=self.amp_cfg["_env"])
-                            amp_rewards = self.alg.amp.amp_reward(amp_prev_obs, amp_obs, epsilon=self.amp_cfg["epsilon"])
-                            amp_score = self.alg.amp.amp_score(amp_prev_obs, amp_obs)
-                            # amp_relative_score = amp_score - amp_prev_neg_score
-                            # amp_rewards += amp_relative_score * 5
+                            # Build amp history input per-env: [num_envs, H, D] -> [num_envs, H*D]
+                            # Only compute reward for envs that have enough history
+                            ready_mask = (amp_obs_fill_count >= amp_history_len)  # [num_envs]
+                            amp_input = amp_obs_buffer.flatten(-2, -1)  # [num_envs, H*D]
+                            if ready_mask.any():
+                                amp_rewards = self.alg.amp.amp_reward(amp_input, epsilon=self.amp_cfg["epsilon"])
+                                amp_score = self.alg.amp.amp_score(amp_input)
+                                # Zero out for envs that don't have enough history yet
+                                amp_rewards = amp_rewards * ready_mask.float()
+                                amp_score = amp_score * ready_mask.float()
+                            else:
+                                amp_rewards = torch.zeros(self.env.num_envs, device=self.device)
+                                amp_score = torch.zeros(self.env.num_envs, device=self.device)
+
+                            # Reset buffer only for done environments (per-env reset)
+                            done_ids = (dones > 0).nonzero(as_tuple=False).squeeze(-1)
+                            if done_ids.numel() > 0:
+                                amp_obs_buffer[done_ids] = 0
+                                amp_obs_fill_count[done_ids] = 0
+
                             rewards += amp_rewards * self.amp_cfg["amp_reward_scale"] * (self.amp_cfg['amp_pretrain_steps'] <= it) # only add amp reward after pretrain steps
                             cur_amp_reward_sum += amp_rewards * self.amp_cfg["amp_reward_scale"]
                             cur_amp_score_sum += amp_score
@@ -410,6 +497,11 @@ class OnPolicyRunnerMM:
             if self.amp_cfg is not None:
                 amp_prev_neg_score = loss_dict["mean_pred_pos_prob"]
 
+            # Planner RL update (after controller PPO update)
+            planner_metrics = {}
+            if self._planner_rl_enabled:
+                planner_metrics = self.alg.planner_update(self.env.diffusion_buffer)
+
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
@@ -428,6 +520,76 @@ class OnPolicyRunnerMM:
 
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+    def _collect_planner_episode(self):
+        """Collect a full episode for episode-level planner RL.
+
+        Runs the entire episode (500 steps at 50Hz = 10s) with frozen controller,
+        allowing natural autoregressive regen (~6 times). Regen snapshots are
+        cached by the diffusion buffer for gradient replay.
+
+        Returns:
+            EpisodeRegenCache with all regen snapshots and accumulated rewards.
+        """
+        db = self.env.diffusion_buffer
+        episode_steps = int(self.env.max_episode_length)
+
+        # Sync all envs to same initial state + text prompt, then begin episode
+        db.sync_episode_start()
+        db.begin_planner_rl_episode()
+
+        # Get initial observations
+        obs, extras = self.env.get_observations()
+        ref_obs_tuple, ref_extras = self.env.get_reference_observations()
+        critic_obs = extras["observations"].get("critic", obs)
+        critic_ref_obs_tuple = ref_extras["ref_observations"].get("critic", ref_obs_tuple) if ref_obs_tuple is not None else None
+        obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+        if ref_obs_tuple is not None:
+            ref_obs_tuple = tuple(r.to(self.device) for r in ref_obs_tuple)
+        if critic_ref_obs_tuple is not None:
+            critic_ref_obs_tuple = tuple(r.to(self.device) for r in critic_ref_obs_tuple)
+
+        with torch.inference_mode():
+            for step in range(episode_steps):
+                actions = self.alg.act(
+                    obs=obs,
+                    ref_obs=ref_obs_tuple,
+                    critic_obs=critic_obs,
+                    ref_critic_obs=critic_ref_obs_tuple,
+                )
+
+                obs, ref_obs_tuple, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                obs, critic_obs, rewards, dones = (
+                    obs.to(self.device),
+                    critic_obs.to(self.device),
+                    rewards.to(self.device),
+                    dones.to(self.device),
+                )
+                if ref_obs_tuple is not None:
+                    ref_obs_tuple = tuple(r.to(self.device) for r in ref_obs_tuple)
+
+                # Normalize observations
+                obs = self.obs_normalizer(obs)
+                if ref_obs_tuple is not None and self.ref_obs_normalizer is not None:
+                    ref_obs_tuple = (self.ref_obs_normalizer(ref_obs_tuple[0]), ref_obs_tuple[1])
+                if "critic" in infos["observations"]:
+                    critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
+                else:
+                    critic_obs = obs
+                if "critic" in infos["ref_observations"]:
+                    critic_ref_obs_tuple = infos["ref_observations"]["critic"]
+                    if self.critic_ref_obs_normalizer is not None:
+                        critic_ref_obs_tuple = (
+                            self.critic_ref_obs_normalizer(critic_ref_obs_tuple[0]),
+                            critic_ref_obs_tuple[1],
+                        )
+                else:
+                    critic_ref_obs_tuple = ref_obs_tuple
+
+                # Accumulate episode-level reward
+                db.accumulate_planner_episode_reward(rewards.squeeze())
+
+        return db.end_planner_rl_episode()
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -481,6 +643,13 @@ class OnPolicyRunnerMM:
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+
+        # Planner RL metrics
+        if self._planner_rl_enabled and locs.get("planner_metrics"):
+            for key, value in locs["planner_metrics"].items():
+                self.writer.add_scalar(f"PlannerRL/{key}", value, locs["it"])
+        elif self._planner_rl_enabled:
+            print(f"[PlannerRL] WARNING: planner_metrics empty at iter {locs['it']}")
 
         if self.amp_cfg:
             self.writer.add_scalar("AMP/mean_gradient_penalty", locs["loss_dict"]["mean_gradient_penalty"], locs["it"])
@@ -570,6 +739,11 @@ class OnPolicyRunnerMM:
             #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
 
         log_string += ep_string
+        # Planner RL console logging
+        if self._planner_rl_enabled and locs.get("planner_metrics"):
+            log_string += f"""{'-' * width}\n"""
+            for key, value in locs["planner_metrics"].items():
+                log_string += f"""{f'PlannerRL/{key}:':>{pad}} {value:.4f}\n"""
         # log_string += (
         #     f"""{'-' * width}\n"""
         #     f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
@@ -614,7 +788,15 @@ class OnPolicyRunnerMM:
         if self.alg.teacher_coef is not None:
             saved_dict["imitation_optimizer_state_dict"] = self.alg.imitation_optimizer.state_dict()
             saved_dict["dagger_optimizer_state_dict"] = self.alg.dagger_optimizer.state_dict()
-        
+
+        # Planner RL checkpoint
+        if self._planner_rl_enabled:
+            diffusion_buffer = self.env.diffusion_buffer
+            if diffusion_buffer is not None:
+                saved_dict["planner_model_state_dict"] = diffusion_buffer.model.state_dict()
+            if hasattr(self.alg, 'planner_optimizer') and self.alg.planner_optimizer is not None:
+                saved_dict["planner_optimizer_state_dict"] = self.alg.planner_optimizer.state_dict()
+
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -642,9 +824,13 @@ class OnPolicyRunnerMM:
         if self.alg.scaler is not None:
             self.alg.scaler.load_state_dict(loaded_dict["scaler_state_dict"])
         if self.alg.amp is not None:
-            self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
-            self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
-        self.current_learning_iteration = loaded_dict["iter"]
+            try:
+                self.alg.amp.load_state_dict(loaded_dict["amp_state_dict"])
+                self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+            except:
+                print("AMP state dict not available or mismatch in the loaded file. Skipping AMP loading.")
+        if load_optimizer:
+            self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):

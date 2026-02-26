@@ -214,6 +214,7 @@ class MMPPO:
         # AMP components
         if amp_cfg is not None:
             net_cfg = amp_cfg.get("net_cfg", {})
+            # import pdb; pdb.set_trace()
             self.amp = AMPNet(device=self.device, **net_cfg)
             self.amp_cfg = amp_cfg
             self.amp_optimizer = optim.Adam(self.amp.parameters(), lr=amp_cfg.get("learning_rate", 1e-3))
@@ -578,6 +579,18 @@ class MMPPO:
             return max_coef
 
     def update(self, epoch=0):
+        # Skip controller update if frozen (Stage 1 Planner RL)
+        if getattr(self, 'skip_controller_update', False):
+            self.storage.clear()
+            return {
+                "mean_value_loss": 0.0,
+                "mean_surrogate_loss": 0.0,
+                "mean_imitation_loss": 0.0,
+                "mean_dagger_loss": 0.0,
+                "mean_entropy": 0.0,
+                "mean_priv_reg_loss": 0.0,
+            }
+
         # Update current training stage based on epoch
         if epoch < self.teacher_only_interval:
             self.current_stage = 1  # Teacher-only stage
@@ -643,12 +656,9 @@ class MMPPO:
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
-            obs_prev_state,
-            ref_obs_prev_state,
-            ref_obs_prev_mask,
-            obs_cur_state,
-            ref_obs_cur_state,
-            ref_obs_cur_mask,
+            amp_obs_history,
+            amp_ref_obs_history,
+            amp_ref_obs_history_mask,
         ) in generator:
 
             num_aug = 1
@@ -901,12 +911,9 @@ class MMPPO:
                         'hid_states_batch': hid_states_batch,
                         'masks_batch': masks_batch,
                         'rnd_state_batch': rnd_state_batch,
-                        'obs_prev_state': obs_prev_state,
-                        'ref_obs_prev_state': ref_obs_prev_state,
-                        'ref_obs_prev_mask': ref_obs_prev_mask,
-                        'obs_cur_state': obs_cur_state,
-                        'ref_obs_cur_state': ref_obs_cur_state,
-                        'ref_obs_cur_mask': ref_obs_cur_mask,
+                        'amp_obs_history': amp_obs_history,
+                        'amp_ref_obs_history': amp_ref_obs_history,
+                        'amp_ref_obs_history_mask': amp_ref_obs_history_mask,
                     }, 'debug_batch.pt')
                     
                     print("Registering debug hooks to actor.decoder and critic.decoder...")
@@ -931,19 +938,24 @@ class MMPPO:
                 self.scaler.unscale_(self.optimizer)
             print_gpu_memory_summary("After backward pass")
 
-            if self.amp and (obs_prev_state is not None and obs_cur_state is not None and ref_obs_prev_state is not None and ref_obs_cur_state is not None and ref_obs_prev_mask is not None and ref_obs_cur_mask is not None):
+            if self.amp and amp_obs_history is not None and amp_ref_obs_history is not None and amp_ref_obs_history_mask is not None:
 
-                # amp_optimization_steps = self.amp_cfg.get("amp_optimization_steps", 3)
-                policy_score = self.amp.forward(torch.cat([obs_prev_state, obs_cur_state], dim=-1))
-                expert_score = self.amp.forward(torch.cat([ref_obs_prev_state, ref_obs_cur_state], dim=-1))
-                
+                # Flatten history: [B, H, D] -> [B, H*D]
+                policy_input = amp_obs_history.flatten(-2, -1)
+                expert_input = amp_ref_obs_history.flatten(-2, -1)
+                # Use the last timestep's mask only (the current step's validity)
+                expert_mask = amp_ref_obs_history_mask[:, -1]
+
+                policy_score = self.amp.forward(policy_input)
+                expert_score = self.amp.forward(expert_input)
+
                 pred_pos_prob = self.amp.out_activation(policy_score).mean()
                 pred_neg_prob = self.amp.out_activation(expert_score).mean()
                 pred_pos_acc = self.amp.policy_acc(policy_score)
-                pred_neg_acc = self.amp.expert_acc(expert_score, ref_obs_cur_mask * ref_obs_prev_mask)
+                pred_neg_acc = self.amp.expert_acc(expert_score, expert_mask)
                 policy_loss = self.amp.policy_loss(policy_score)
-                expert_loss = self.amp.expert_loss(expert_score, ref_obs_cur_mask)
-                gradient_penalty = self.amp.expert_grad_penalty(obs_cur_state, ref_obs_cur_state, ref_obs_cur_mask * ref_obs_prev_mask)
+                expert_loss = self.amp.expert_loss(expert_score, expert_mask)
+                gradient_penalty = self.amp.expert_grad_penalty(expert_input, expert_mask)
                 amp_loss = 0.5 * (policy_loss + expert_loss) + gradient_penalty * self.amp_cfg["gradient_penalty_coeff"]
 
                 if (epoch % self.amp_cfg["amp_update_interval"] == 0) or (epoch < self.amp_cfg["amp_pretrain_steps"]):
@@ -1402,5 +1414,149 @@ class MMPPO:
         self.dagger_optimizer.step()
         
         return latent_loss.item()
-        
-        
+
+    # --- Planner RL update ---
+
+    def init_planner_optimizer(self, params, lr=1e-5, max_grad_norm=1.0,
+                               use_muon=False, planner_model=None,
+                               muon_lr=0.001, muon_momentum=0.95, muon_weight_decay=0.0,
+                               muon_backend='torch', muon_adjust_lr_fn=None):
+        """Initialize a separate optimizer for the planner (DiT) parameters.
+
+        Args:
+            params: List of planner parameters from DiffusionBuffer.get_planner_trainable_params().
+            lr: Learning rate for the planner optimizer (AdamW lr when use_muon=True).
+            max_grad_norm: Max gradient norm for clipping.
+            use_muon: If True, use Muon for hidden weight matrices, AdamW for the rest.
+            planner_model: The HumanoidMDM model instance (required when use_muon=True).
+            muon_lr: Learning rate for Muon-optimized hidden weight matrices.
+            muon_momentum: Momentum for Muon optimizer.
+            muon_weight_decay: Weight decay for Muon-optimized parameters.
+            muon_backend: 'torch' for torch.optim.Muon (2.9+), 'pip' for pip muon package.
+            muon_adjust_lr_fn: LR adjustment for torch backend ('original', 'match_rms_adamw', or None).
+        """
+        if len(params) == 0:
+            return
+        if use_muon:
+            assert planner_model is not None, "planner_model required for Muon optimizer"
+            muon_params, adam_params = planner_model.get_muon_param_split()
+
+            if muon_backend == 'torch':
+                from torch.optim import Muon as TorchMuon
+                muon_opt = TorchMuon(
+                    muon_params, lr=muon_lr, momentum=muon_momentum,
+                    weight_decay=muon_weight_decay, adjust_lr_fn=muon_adjust_lr_fn,
+                )
+                adam_opt = optim.AdamW(
+                    adam_params, lr=lr, betas=(0.9, 0.95), weight_decay=0.0,
+                )
+                # DualOptimizer-style: step both, combine param_groups
+                class _DualOpt:
+                    def __init__(self, m, a):
+                        self.muon_opt, self.adam_opt = m, a
+                    @property
+                    def param_groups(self):
+                        return self.muon_opt.param_groups + self.adam_opt.param_groups
+                    def step(self, closure=None):
+                        self.muon_opt.step(closure); self.adam_opt.step(closure)
+                    def zero_grad(self, set_to_none=True):
+                        self.muon_opt.zero_grad(set_to_none=set_to_none)
+                        self.adam_opt.zero_grad(set_to_none=set_to_none)
+                    def state_dict(self):
+                        return {'muon': self.muon_opt.state_dict(), 'adam': self.adam_opt.state_dict()}
+                    def load_state_dict(self, sd):
+                        if 'muon' in sd:
+                            self.muon_opt.load_state_dict(sd['muon']); self.adam_opt.load_state_dict(sd['adam'])
+                self.planner_optimizer = _DualOpt(muon_opt, adam_opt)
+                backend_info = f"torch.optim.Muon (adjust_lr_fn={muon_adjust_lr_fn})"
+            else:
+                from muon import SingleDeviceMuonWithAuxAdam
+                param_groups = [
+                    dict(params=muon_params, use_muon=True,
+                         lr=muon_lr, momentum=muon_momentum, weight_decay=muon_weight_decay),
+                    dict(params=adam_params, use_muon=False,
+                         lr=lr, betas=(0.9, 0.95), weight_decay=0.0),
+                ]
+                self.planner_optimizer = SingleDeviceMuonWithAuxAdam(param_groups)
+                backend_info = "pip muon (SingleDeviceMuonWithAuxAdam)"
+
+            n_muon = sum(p.numel() for p in muon_params)
+            n_adam = sum(p.numel() for p in adam_params)
+            print(f"[Planner RL] {backend_info}: {n_muon:,} Muon params, {n_adam:,} AdamW params")
+        else:
+            self.planner_optimizer = optim.Adam(params, lr=lr)
+        self.planner_max_grad_norm = max_grad_norm
+
+    def planner_update(self, diffusion_buffer) -> dict:
+        """Perform a single planner RL gradient step.
+
+        Called after the standard PPO update (controller). This method:
+        1. Re-samples the planner with gradient (using cached context)
+        2. Computes the planner RL loss using accumulated rewards
+        3. Performs a gradient step on the planner parameters
+
+        Args:
+            diffusion_buffer: The DiffusionBuffer instance with planner RL state.
+
+        Returns:
+            Dict of loggable metrics (empty if planner RL is not active).
+        """
+        if not hasattr(self, 'planner_optimizer') or self.planner_optimizer is None:
+            print("[PlannerRL] planner_update skipped: no optimizer")
+            return {}
+
+        # Step 1: Re-sample with gradient
+        success = diffusion_buffer.planner_resample_with_grad()
+        if not success:
+            print("[PlannerRL] planner_update skipped: resample_with_grad returned False")
+            return {}
+
+        # Step 2: Compute loss from metadata + accumulated rewards
+        loss, metrics = diffusion_buffer.compute_planner_loss()
+        if loss is None:
+            print("[PlannerRL] planner_update skipped: compute_planner_loss returned None")
+            return {}
+
+        # Step 3: Gradient step
+        self.planner_optimizer.zero_grad()
+        loss.backward()
+        # Clip gradients on planner parameters
+        planner_params = [p for group in self.planner_optimizer.param_groups for p in group['params']]
+        grad_norm = nn.utils.clip_grad_norm_(planner_params, self.planner_max_grad_norm)
+        self.planner_optimizer.step()
+
+        metrics['grad_norm'] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+
+        # Deactivate rollout guard so compute() resumes normal per-env regen
+        diffusion_buffer._planner_rl_rollout_active = False
+
+        return metrics
+
+    def planner_episode_update(self, diffusion_buffer, episode_cache) -> dict:
+        """Perform a planner RL update from a complete episode's regen cache.
+
+        Replays all cached regen snapshots with gradient, accumulating
+        gradients across regens before a single optimizer step.
+
+        Args:
+            diffusion_buffer: The DiffusionBuffer instance.
+            episode_cache: EpisodeRegenCache from end_planner_rl_episode().
+
+        Returns:
+            Dict of loggable metrics.
+        """
+        if not hasattr(self, 'planner_optimizer') or self.planner_optimizer is None:
+            print("[PlannerRL] planner_episode_update skipped: no optimizer")
+            return {}
+
+        self.planner_optimizer.zero_grad()
+        total_loss, metrics = diffusion_buffer.replay_episode_with_grad(episode_cache)
+
+        # Clip gradients and step
+        planner_params = [p for group in self.planner_optimizer.param_groups for p in group['params']]
+        grad_norm = nn.utils.clip_grad_norm_(planner_params, self.planner_max_grad_norm)
+        self.planner_optimizer.step()
+
+        metrics['planner/grad_norm'] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        return metrics
+

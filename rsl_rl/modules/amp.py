@@ -35,6 +35,7 @@ class HingeLoss(nn.Module):
         elif self.reduction == "none":
             return loss
 
+
 class AMPNet(nn.Module):
     def __init__(
             self,
@@ -45,6 +46,7 @@ class AMPNet(nn.Module):
             out_activation: str = "tanh",
             device: str = "cpu",
             label_smoothing: float = 0.1,
+            amp_history_length: int = 1,
             **kwargs
     ):
         super().__init__()
@@ -54,9 +56,9 @@ class AMPNet(nn.Module):
             net_kwargs = kwargs.pop("net_kwargs")
         else:
             net_kwargs = {}
-
+        self.amp_history_len = amp_history_length
         self.backbone = build_backbone(
-            input_dim=backbone_input_dim,
+            input_dim=backbone_input_dim * self.amp_history_len,
             output_dim=backbone_output_dim,
             backbone=backbone,
             activation=activation,
@@ -114,23 +116,18 @@ class AMPNet(nn.Module):
         acc = (acc * tgt_mask).sum() / (tgt_mask.sum() + 1e-6)
         return acc
     
-    def expert_grad_penalty(self, expert_cur_state: torch.Tensor, expert_next_state: torch.Tensor, expert_available_mask: torch.Tensor) -> torch.Tensor:
+    def expert_grad_penalty(self, expert_input: torch.Tensor, expert_available_mask: torch.Tensor) -> torch.Tensor:
         """
         Compute the gradient penalty of the expert's score with respect to the current state.
-
-        AMPNet takes in [cur_state, next_state] and outputs a score for action classification (-1: not expert, 1: expert). This function records the gradient of the score with respect to input states. The mask is used to mask out environments where expert is not available:
         
         Parameters:
-            expert_cur_state: torch.Tensor, shape: (num_envs, state_dim)
-            expert_next_state: torch.Tensor, shape: (num_envs, state_dim)
+            expert_input: torch.Tensor, shape: (num_envs, input_dim)
             expert_available_mask: torch.Tensor, shape: (num_envs, 1)
 
         Returns:
             expert_grad_penalty: torch.Tensor, shape: (1,)
         """
         expert_available_mask = expert_available_mask.unsqueeze(-1)
-        assert expert_cur_state.shape == expert_next_state.shape
-        expert_input = torch.cat([expert_cur_state, expert_next_state], dim=-1)
         expert_input.requires_grad = True
 
         expert_score = self.forward(expert_input)
@@ -150,23 +147,21 @@ class AMPNet(nn.Module):
 
         return grad_penalty
 
-    def amp_reward(self, cur_state: torch.Tensor, next_state: torch.Tensor, epsilon: float = 1e-4, reward_shift: float = 0.45) -> torch.Tensor:
+    def amp_reward(self, policy_input: torch.Tensor, epsilon: float = 1e-4, reward_shift: float = 0.1) -> torch.Tensor:
         """
         Compute the AMP reward for the given current and next states.
 
         The reward is computed as the saturated cross entropy between the predicted score and the expert's score (1: expert, -1: not expert).
 
         Parameters:
-            cur_state: torch.Tensor, shape: (num_envs, state_dim)
-            next_state: torch.Tensor, shape: (num_envs, state_dim)
+            policy_input: torch.Tensor, shape: (num_envs, input_dim)
             epsilon: float, the threshold for the saturated cross entropy
             reward_shift: float, the shift of the reward (we tend to avoid positive reward when p_policy is close to 0 in order to avoid rapid reward growth)
         Returns:
             amp_reward: torch.Tensor, shape: (1,)
         """
-        assert cur_state.shape == next_state.shape
         with torch.no_grad():
-            expert_score = self.forward(torch.cat([cur_state, next_state], dim=-1)) # shape: (num_envs, 1)
+            expert_score = self.forward(policy_input) # shape: (num_envs, 1)
             expert_score = self.out_activation(expert_score) # shape: (num_envs, 1)
 
             reward = -torch.log(
@@ -178,12 +173,11 @@ class AMPNet(nn.Module):
         
         return reward.squeeze(-1)
     
-    def amp_score(self, cur_state: torch.Tensor, next_state: torch.Tensor) -> torch.Tensor:
+    def amp_score(self, policy_input: torch.Tensor) -> torch.Tensor:
         """
         Compute the AMP score for the given current and next states.
         """
-        assert cur_state.shape == next_state.shape
         with torch.no_grad():
-            score = self.forward(torch.cat([cur_state, next_state], dim=-1)) # shape: (num_envs, 1)
+            score = self.forward(policy_input) # shape: (num_envs, 1)
             score = self.out_activation(score) # shape: (num_envs, 1)
             return score.squeeze(-1)

@@ -50,7 +50,9 @@ class RolloutStorageMM:
         self.actions_shape = actions_shape
         self.rnd_state_shape = rnd_state_shape
         self.amp_cfg = amp_cfg
-        self.amp_shape = amp_cfg["net_cfg"]["backbone_input_dim"] // 2 if amp_cfg is not None else None
+        # backbone_input_dim is the per-timestep observation dim; amp_net input = backbone_input_dim * amp_history_len
+        self.amp_shape = amp_cfg["net_cfg"]["backbone_input_dim"] if amp_cfg is not None else None
+        self.amp_history_length = amp_cfg["net_cfg"]["amp_history_length"] if amp_cfg is not None else None
      
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
@@ -278,13 +280,13 @@ class RolloutStorageMM:
         if self.rnd_state_shape is not None:
             rnd_state = self.rnd_state.flatten(0, 1)
 
+        dones_flat = self.dones.flatten(0, 1)
+
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
                 batch_idx = indices[start:end]
-                prev_batch_idx = torch.where(batch_idx > self.num_envs, batch_idx - self.num_envs, batch_idx) # since the batch is not circular, we don't allow index < 0. The first batch will be ignored.
-
                 obs_batch = observations[batch_idx] # shape: (mini_batch_size, num_envs, *obs_shape)
                 ref_obs_batch = reference_observations[batch_idx] if reference_observations is not None else None
                 ref_obs_mask_batch = reference_observations_mask[batch_idx] if reference_observations_mask is not None else None
@@ -307,27 +309,23 @@ class RolloutStorageMM:
                 else:
                     rnd_state_batch = None
 
-                # get amp new
+                # AMP history extraction
                 if self.amp_cfg and amp_observations is not None:
-                    obs_prev_state = amp_observations[prev_batch_idx]
-                    ref_obs_prev_state = amp_reference_observations[prev_batch_idx]
-                    ref_obs_prev_mask = amp_reference_observations_mask[prev_batch_idx].squeeze(-1).bool()
-                    obs_cur_state = amp_observations[batch_idx]
-                    ref_obs_cur_state = amp_reference_observations[batch_idx]
-                    ref_obs_cur_mask = amp_reference_observations_mask[batch_idx].squeeze(-1).bool()
-
+                    amp_history_idx = self._compute_amp_history_indices(
+                        batch_idx, dones_flat
+                    )
+                    amp_obs_history = amp_observations[amp_history_idx]
+                    amp_ref_obs_history = amp_reference_observations[amp_history_idx]
+                    amp_ref_obs_history_mask = amp_reference_observations_mask[amp_history_idx].bool()
                 else:
-                    obs_prev_state = None
-                    ref_obs_prev_state = None
-                    ref_obs_prev_mask = None
-                    obs_cur_state = None
-                    ref_obs_cur_state = None
-                    ref_obs_cur_mask = None
-                
+                    amp_obs_history = None
+                    amp_ref_obs_history = None
+                    amp_ref_obs_history_mask = None
+
                 yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     None,
                     None,
-                ), None, rnd_state_batch, obs_prev_state, ref_obs_prev_state, ref_obs_prev_mask, obs_cur_state, ref_obs_cur_state, ref_obs_cur_mask
+                ), None, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask
 
     def _create_obs_buffer_slice(self, obs_sequence, idx, dones_sequence):
         """
@@ -420,6 +418,78 @@ class RolloutStorageMM:
         seq = obs_sequence[indices]  # (num_steps_per_env, mini_batch_size, *obs_shape)
         seq = seq * mask.unsqueeze(-1).expand_as(seq)  # Zero out invalid entries
         return seq
+
+    def _compute_amp_history_indices(self, batch_idx, dones_flat):
+        """
+        Compute AMP history indices with episode-boundary (done) clamping.
+
+        Given batch_idx indices into flattened storage, compute history lookback
+        indices of shape [B, H] where H = amp_history_length. Handles:
+        1. Environment boundary clamping (don't cross env boundaries)
+        2. Episode reset (done) clamping (if done found in history, clamp all
+           earlier indices to the first step after the done)
+
+        Example: num_envs=10, H=6, batch_idx=[55] (env=5, timestep=5)
+            raw history:        [5, 15, 25, 35, 45, 55]
+            dones at indices:   [0,  0,  1,  0,  0,  0]
+            after done-clamp:   [35, 35, 35, 35, 45, 55]
+
+        Args:
+            batch_idx: [B] indices into flattened storage
+            dones_flat: [Total, 1] or [Total] flattened dones tensor
+
+        Returns:
+            amp_history_indices: [B, H] long tensor of valid history indices
+        """
+        device = batch_idx.device
+        H = self.amp_history_length
+        B = batch_idx.shape[0]
+
+        if dones_flat.dim() > 1:
+            dones_flat = dones_flat.squeeze(-1)
+
+        # 1. Per-env lower bounds
+        env_lower_bounds = (batch_idx % self.num_envs).unsqueeze(-1)  # [B, 1]
+
+        # 2. Offsets from oldest to newest
+        offsets = torch.arange(H - 1, -1, -1, device=device) * self.num_envs  # [H]
+
+        # 3. Raw history indices
+        amp_history_indices = batch_idx.unsqueeze(-1) - offsets  # [B, H]
+
+        # 4. Clamp to env lower bound
+        amp_history_indices = torch.maximum(amp_history_indices, env_lower_bounds)  # [B, H]
+
+        # 5. Done-handling
+        total_steps = dones_flat.shape[0]
+        safe_indices = amp_history_indices.clamp(0, total_steps - 1)  # [B, H]
+
+        dones_at_history = dones_flat[safe_indices]  # [B, H]
+
+        positions = torch.arange(H, device=device).unsqueeze(0)  # [1, H]
+        done_mask = dones_at_history.bool()  # [B, H]
+
+        done_positions = done_mask.float() * positions.float()  # [B, H]
+        latest_done_pos, _ = done_positions.max(dim=-1)  # [B]
+        has_done = done_mask.any(dim=-1)  # [B]
+        latest_done_pos = torch.where(has_done, latest_done_pos.long(),
+                                       torch.tensor(-1, device=device, dtype=torch.long))  # [B]
+
+        should_clamp = positions.long() <= latest_done_pos.unsqueeze(-1)  # [B, H]
+
+        clamp_pos = (latest_done_pos + 1).clamp(max=H - 1)  # [B]
+        replacement_indices = amp_history_indices[
+            torch.arange(B, device=device), clamp_pos
+        ]  # [B]
+
+        amp_history_indices = torch.where(
+            should_clamp,
+            replacement_indices.unsqueeze(-1).expand_as(amp_history_indices),
+            amp_history_indices
+        )
+
+        return amp_history_indices  # [B, H]
+
     # for MMGPT (non recurrent)
     def buffer_mini_batch_generator(self, num_mini_batches, num_epochs=8, num_steps_per_env=None):
         if self.training_type != "rl":
@@ -473,15 +543,16 @@ class RolloutStorageMM:
         if self.rnd_state_shape is not None:
             rnd_state = self.rnd_state.flatten(0, 1)
 
+        dones_flat = self.dones.flatten(0, 1)
+
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
                 batch_idx = indices[start:end]
-                prev_batch_idx = torch.where(batch_idx > self.num_envs, batch_idx - self.num_envs, batch_idx) # since the batch is not circular, we don't allow index < 0. The first batch will be ignored.
 
                 # obs_batch = observations[batch_idx] # shape: (mini_batch_size, num_envs, *obs_shape)
-                obs_batch, masks_batch, clamped_indices, valid_mask = self._create_obs_buffer_slice(observations, batch_idx, self.dones.flatten(0, 1)) # shape: (num_steps_per_env, mini_batch_size, *obs_shape)
+                obs_batch, masks_batch, clamped_indices, valid_mask = self._create_obs_buffer_slice(observations, batch_idx, dones_flat) # shape: (num_steps_per_env, mini_batch_size, *obs_shape)
                 # obs_batch: (num_steps_per_env, mini_batch_size, *obs_shape)
                 # ref_obs_batch = reference_observations[batch_idx] if reference_observations is not None else None
                 # ref_obs_batch, _ = self._create_obs_buffer_slice(reference_observations, batch_idx, self.dones.flatten(0, 1)) if reference_observations is not None else (None, None)
@@ -515,27 +586,23 @@ class RolloutStorageMM:
                 else:
                     rnd_state_batch = None
 
-                # get amp new
+                # AMP history extraction
                 if self.amp_cfg and amp_observations is not None:
-                    obs_prev_state = amp_observations[prev_batch_idx]
-                    ref_obs_prev_state = amp_reference_observations[prev_batch_idx]
-                    ref_obs_prev_mask = amp_reference_observations_mask[prev_batch_idx].squeeze(-1).bool()
-                    obs_cur_state = amp_observations[batch_idx]
-                    ref_obs_cur_state = amp_reference_observations[batch_idx]
-                    ref_obs_cur_mask = amp_reference_observations_mask[batch_idx].squeeze(-1).bool()
-
+                    amp_history_idx = self._compute_amp_history_indices(
+                        batch_idx, dones_flat
+                    )
+                    amp_obs_history = amp_observations[amp_history_idx]
+                    amp_ref_obs_history = amp_reference_observations[amp_history_idx]
+                    amp_ref_obs_history_mask = amp_reference_observations_mask[amp_history_idx].bool()
                 else:
-                    obs_prev_state = None
-                    ref_obs_prev_state = None
-                    ref_obs_prev_mask = None
-                    obs_cur_state = None
-                    ref_obs_cur_state = None
-                    ref_obs_cur_mask = None
-                
+                    amp_obs_history = None
+                    amp_ref_obs_history = None
+                    amp_ref_obs_history_mask = None
+
                 yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     None,
                     None,
-                ), masks_batch, rnd_state_batch, obs_prev_state, ref_obs_prev_state, ref_obs_prev_mask, obs_cur_state, ref_obs_cur_state, ref_obs_cur_mask
+                ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask
     
     
 
@@ -608,35 +675,46 @@ class RolloutStorageMM:
                 dagger_actions_batch = self.dagger_actions[:, start:stop] if self.dagger_actions is not None else None
                 last_was_done = last_was_done.permute(1, 0)
                 
-                # get amp new states
-                if self.amp_cfg and ref_obs_batch is not None and ref_obs_mask_batch is not None:
-                    obs_prev_state = padded_amp_obs_trajectories[:, first_traj-1:last_traj-1] if first_traj > 0 else None # (T, N, D)
-                    ref_obs_prev_state = padded_amp_ref_obs_trajectories[:, first_traj-1:last_traj-1] if first_traj > 0 else None # (T, N, D)
-                    ref_obs_prev_mask = padded_amp_ref_observation_masks[:, first_traj-1:last_traj-1].squeeze(-1) if (padded_amp_ref_observation_masks is not None and first_traj > 0) else None # (T, N)
-                    obs_cur_state = padded_amp_obs_trajectories[:, first_traj:last_traj] # (T, N, D)
-                    ref_obs_cur_state = padded_amp_ref_obs_trajectories[:, first_traj:last_traj] if padded_amp_ref_obs_trajectories is not None else None # (T, N, D)
-                    ref_obs_cur_mask = padded_amp_ref_observation_masks[:, first_traj:last_traj].squeeze(-1) if padded_amp_ref_observation_masks is not None else None # (T, N)
-                    
-                    # reshape to (T*N, D) and (T*N,)
-                    obs_prev_state = obs_prev_state.reshape(-1, self.amp_shape) if obs_prev_state is not None else None
-                    ref_obs_prev_state = ref_obs_prev_state.reshape(-1, self.amp_shape) if ref_obs_prev_state is not None else None
-                    ref_obs_prev_mask = ref_obs_prev_mask.reshape(-1).bool() if ref_obs_prev_mask is not None else None
-                    obs_cur_state = obs_cur_state.reshape(-1, self.amp_shape)
-                    ref_obs_cur_state = ref_obs_cur_state.reshape(-1, self.amp_shape) if ref_obs_cur_state is not None else None
-                    ref_obs_cur_mask = ref_obs_cur_mask.reshape(-1).bool() if ref_obs_cur_mask is not None else None
-                else:
-                    obs_prev_state = None
-                    ref_obs_prev_state = None
-                    ref_obs_prev_mask = None
-                    obs_cur_state = None
-                    ref_obs_cur_state = None
-                    ref_obs_cur_mask = None
+                # AMP history extraction
+                if self.amp_cfg and padded_amp_obs_trajectories is not None:
+                    amp_obs_traj = padded_amp_obs_trajectories[:, first_traj:last_traj]  # (T, N, D)
+                    amp_ref_obs_traj = padded_amp_ref_obs_trajectories[:, first_traj:last_traj]  # (T, N, D)
+                    amp_ref_mask_traj = padded_amp_ref_observation_masks[:, first_traj:last_traj].squeeze(-1)  # (T, N)
+                    amp_traj_masks = obs_masks[:, first_traj:last_traj]  # (T, N)
 
+                    T_len, N_traj = amp_obs_traj.shape[0], amp_obs_traj.shape[1]
+                    H = self.amp_history_length
+
+                    # Build time indices for history lookback
+                    t_range = torch.arange(T_len, device=self.device)  # [T]
+                    h_offsets = torch.arange(H - 1, -1, -1, device=self.device)  # [H]
+                    time_indices = t_range.unsqueeze(-1) - h_offsets.unsqueeze(0)  # [T, H]
+                    time_indices = time_indices.clamp(min=0)  # [T, H]
+
+                    # Index trajectories: [T, H] indexing into [T, N, D] -> [T, H, N, D]
+                    amp_obs_history = amp_obs_traj[time_indices]  # [T, H, N, D]
+                    amp_ref_obs_history = amp_ref_obs_traj[time_indices]  # [T, H, N, D]
+                    amp_ref_obs_mask_history = amp_ref_mask_traj[time_indices]  # [T, H, N]
+
+                    # Reshape: (T, H, N, D) -> (T*N, H, D)
+                    amp_obs_history = amp_obs_history.permute(0, 2, 1, 3).reshape(-1, H, self.amp_shape)
+                    amp_ref_obs_history = amp_ref_obs_history.permute(0, 2, 1, 3).reshape(-1, H, self.amp_shape)
+                    amp_ref_obs_history_mask = amp_ref_obs_mask_history.permute(0, 2, 1).reshape(-1, H).bool()
+
+                    # Apply trajectory validity mask (T-outer, N-inner to match permute(0,2,1,3).reshape)
+                    amp_valid = amp_traj_masks.reshape(-1)  # [T*N]
+                    amp_obs_history = amp_obs_history * amp_valid.unsqueeze(-1).unsqueeze(-1)
+                    amp_ref_obs_history = amp_ref_obs_history * amp_valid.unsqueeze(-1).unsqueeze(-1)
+                    amp_ref_obs_history_mask = amp_ref_obs_history_mask & amp_valid.unsqueeze(-1).bool()
+                else:
+                    amp_obs_history = None
+                    amp_ref_obs_history = None
+                    amp_ref_obs_history_mask = None
 
                 yield obs_batch, ref_obs_batch_rtn, critic_obs_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     None,
                     None,
-                ), masks_batch, rnd_state_batch, obs_prev_state, ref_obs_prev_state, ref_obs_prev_mask, obs_cur_state, ref_obs_cur_state, ref_obs_cur_mask
+                ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask
                 
                 first_traj = last_traj
 
