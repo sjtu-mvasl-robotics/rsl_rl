@@ -90,6 +90,89 @@ class L2Loss(nn.Module):
         loss = torch.square(diff)
         return loss.mean()
 
+
+class TeacherReplayBuffer:
+    """Ring buffer storing K past rollouts' teacher-relevant data for replay distillation.
+
+    After each rollout, the teacher-relevant fields (obs, ref_obs, ref_mask, dones,
+    dagger_actions) are snapshotted into this buffer. During update(), extra imitation
+    gradient steps are performed over replay data to increase teacher signal utilization.
+    """
+
+    def __init__(self, capacity: int, device: str = "cpu"):
+        self.capacity = capacity
+        self.device = device
+        self.buffer: list[dict] = []
+        self.position = 0
+
+    def add_rollout(self, obs, ref_obs, ref_mask, dones, dagger_actions=None):
+        """Store a snapshot of teacher-relevant fields from the current rollout.
+
+        Args:
+            obs: [T, N, obs_dim]
+            ref_obs: [T, N, ref_obs_dim] or None
+            ref_mask: [T, N] or None
+            dones: [T, N, 1]
+            dagger_actions: [T, N, act_dim] or None
+        """
+        snapshot = {
+            'obs': obs.detach().clone(),
+            'ref_obs': ref_obs.detach().clone() if ref_obs is not None else None,
+            'ref_mask': ref_mask.detach().clone() if ref_mask is not None else None,
+            'dones': dones.detach().clone(),
+            'dagger_actions': dagger_actions.detach().clone() if dagger_actions is not None else None,
+        }
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(snapshot)
+        else:
+            self.buffer[self.position] = snapshot
+        self.position = (self.position + 1) % self.capacity
+
+    def __len__(self):
+        return len(self.buffer)
+
+    def sample_batch(self, batch_size: int):
+        """Sample a random mini-batch from all stored replay data.
+
+        Flattens all rollouts along T and N dims, then samples batch_size random indices.
+
+        Returns:
+            dict with keys: obs, ref_obs, ref_mask, dagger_actions (all [batch_size, ...])
+            or None if buffer is empty.
+        """
+        if len(self.buffer) == 0:
+            return None
+
+        # Concatenate all rollouts along env dim: [T, N_total, ...]
+        all_obs = torch.cat([s['obs'] for s in self.buffer], dim=1)
+        T, N = all_obs.shape[0], all_obs.shape[1]
+        total = T * N
+        actual_batch = min(batch_size, total)
+        indices = torch.randperm(total, device=all_obs.device)[:actual_batch]
+
+        result = {'obs': all_obs.reshape(total, -1)[indices]}
+
+        # ref_obs
+        ref_list = [s['ref_obs'] for s in self.buffer if s['ref_obs'] is not None]
+        if ref_list:
+            all_ref = torch.cat(ref_list, dim=1).reshape(total, -1)
+            result['ref_obs'] = all_ref[indices]
+            all_ref_mask = torch.cat([s['ref_mask'] for s in self.buffer if s['ref_mask'] is not None], dim=1).reshape(total)
+            result['ref_mask'] = all_ref_mask[indices]
+        else:
+            result['ref_obs'] = None
+            result['ref_mask'] = None
+
+        # dagger_actions
+        da_list = [s['dagger_actions'] for s in self.buffer if s['dagger_actions'] is not None]
+        if da_list:
+            all_da = torch.cat(da_list, dim=1).reshape(total, -1)
+            result['dagger_actions'] = all_da[indices]
+        else:
+            result['dagger_actions'] = None
+
+        return result
+
 class MMPPO:
     actor_critic: ActorCriticMMTransformer | ActorCriticMMTransformerV2 | ActorCriticMMGPT
 
@@ -155,6 +238,9 @@ class MMPPO:
         multi_gpu_cfg: dict | None = None,
         auto_mix_precision: bool = False, # do not mix this with amp_cfg (that amp stands for Adversarial Motion Prior)
         load_std_state_dict_path: str | None = None,
+        # Teacher replay buffer parameters
+        replay_buffer_size: int = 0,  # Number of past rollouts to keep for replay (0 = disabled)
+        replay_imitation_epochs: int = 1,  # Extra imitation passes over replay data per update
 
 
         **kwargs # reserved for future use
@@ -163,7 +249,12 @@ class MMPPO:
             print("[MMPPO] Fixing action std (sigma) during training.")
         self.device = device
         self.actor_critic = actor_critic  # Set early for detection logic
-        
+
+        # Teacher replay buffer
+        self.replay_buffer_size = replay_buffer_size
+        self.replay_imitation_epochs = replay_imitation_epochs
+        self.replay_buffer = None  # initialized in init_storage if enabled
+
         self.is_multi_gpu = multi_gpu_cfg is not None
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
@@ -271,6 +362,11 @@ class MMPPO:
         
         # Track current training stage
         self.current_stage = 1  # 1: teacher-only, 2: hybrid, 3: student
+
+        # Critic quality tracking (InterMimic-style)
+        self.ev_ma = 0.0          # EMA of explained variance
+        self.ev_ema_decay = 0.9
+        self.critic_win_streak = 0  # consecutive minibatches with ev_ma >= 0.6
         
         # Validation for teacher_only and hybrid intervals
         assert teacher_coef is not None or teacher_only_interval == 0, "teacher_only_interval should be 0 if teacher_coef is None"
@@ -359,8 +455,8 @@ class MMPPO:
         if self.use_latent_alignment_mlpv3 or (self.teacher_coef is not None and self.teacher_loss_coef is not None):
             # Validate teacher coefficient parameters (not needed for MLPv3)
             if not self.use_latent_alignment_mlpv3:
-                assert self.teacher_coef_mode in ["kl", "norm", "original_kl", "mse", "huber"], \
-                    "teacher_coef_mode should be one of: 'kl', 'norm', 'original_kl', 'mse', 'huber'"
+                assert self.teacher_coef_mode in ["kl", "norm", "original_kl", "mse", "huber", "wasserstein"], \
+                    "teacher_coef_mode should be one of: 'kl', 'norm', 'original_kl', 'mse', 'huber', 'wasserstein'"
                 if self.teacher_coef_range is None:
                     self.teacher_coef_range = (self.teacher_coef, self.teacher_coef)
                 else:
@@ -453,6 +549,15 @@ class MMPPO:
             amp_cfg=self.amp_cfg,
             device=self.device,
         )
+
+        # Initialize teacher replay buffer
+        if self.replay_buffer_size > 0 and self.teacher_coef is not None:
+            self.replay_buffer = TeacherReplayBuffer(
+                capacity=self.replay_buffer_size,
+                device=self.device
+            )
+            print(f"[MMPPO] Teacher replay buffer enabled: capacity={self.replay_buffer_size}, "
+                  f"replay_epochs={self.replay_imitation_epochs}")
 
 
     def test_mode(self):
@@ -750,25 +855,38 @@ class MMPPO:
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
-            # In teacher-only stage, we still train critic but skip actor's PPO update
-            if epoch < self.teacher_only_interval:
-                # Teacher-only stage: no policy gradient (surrogate loss), but train critic
-                surrogate_loss = torch.tensor(0.0, device=self.device)
-                
-                # Train critic to predict returns from teacher-guided trajectories
-                # This prepares critic for smooth transition to hybrid/student stages
-                if self.use_clipped_value_loss:
-                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                        -self.clip_param, self.clip_param
-                    )
-                    value_losses = (value_batch - returns_batch).pow(2)
-                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
-                else:
-                    value_loss = (returns_batch - value_batch).pow(2).mean()
+            # Value function loss (always computed for critic training)
+            if self.use_clipped_value_loss:
+                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                value_losses = (value_batch - returns_batch).pow(2)
+                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
-                # Normal PPO or Hybrid stage: compute surrogate and value loss
+                value_loss = (returns_batch - value_batch).pow(2).mean()
+
+            # Explained Variance (InterMimic-style): measures critic quality
+            # ev = 1 - Var(return - value) / Var(return), clamped to [-1, 1]
+            with torch.no_grad():
+                returns_var = returns_batch.var(unbiased=False) + 1e-8
+                errors_var = (returns_batch - value_batch).var(unbiased=False)
+                ev = (1.0 - errors_var / returns_var).clamp(-1.0, 1.0).item()
+                self.ev_ma = self.ev_ema_decay * self.ev_ma + (1.0 - self.ev_ema_decay) * ev
+                if self.ev_ma >= 0.6:
+                    self.critic_win_streak += 1
+                else:
+                    self.critic_win_streak = 0
+
+            # Critic is "ready" when: past teacher_supervising_intervals AND streak >= 3
+            critic_ready = (epoch > self.teacher_supervising_intervals and self.critic_win_streak >= 3)
+
+            # Surrogate loss
+            # In teacher-only stage OR critic not ready: skip actor PPO update, only train critic
+            if epoch < self.teacher_only_interval or not critic_ready:
+                surrogate_loss = torch.tensor(0.0, device=self.device)
+            else:
+                # Normal PPO or Hybrid stage: compute surrogate loss
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
                     ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
                     surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -777,24 +895,13 @@ class MMPPO:
                     )
                     surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-                    # Value function loss
-                    if self.use_clipped_value_loss:
-                        value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
-                            -self.clip_param, self.clip_param
-                        )
-                        value_losses = (value_batch - returns_batch).pow(2)
-                        value_losses_clipped = (value_clipped - returns_batch).pow(2)
-                        value_loss = torch.max(value_losses, value_losses_clipped).mean()
-                    else:
-                        value_loss = (returns_batch - value_batch).pow(2).mean()
-
             # Determine effective value_loss_coef based on stage
-            if epoch < self.teacher_only_interval:
-                # Teacher stage: use reduced coefficient to avoid dominating imitation loss
+            if epoch < self.teacher_only_interval or not critic_ready:
+                # Teacher stage or critic not ready: reduced value coef, no entropy term
                 effective_value_loss_coef = self.teacher_value_loss_coef
                 loss = surrogate_loss + effective_value_loss_coef * value_loss
             else:
-                # Hybrid/Student stage: use normal coefficient
+                # Hybrid/Student stage with critic ready: normal coefficient
                 effective_value_loss_coef = self.value_loss_coef
                 loss = surrogate_loss + effective_value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
                 
@@ -875,16 +982,15 @@ class MMPPO:
             print_gpu_memory_summary("Before optimizer.zero_grad")
             
             # Add imitation loss to the total loss based on training stage
-            if epoch < self.teacher_only_interval:
-                # Teacher-only stage: imitation loss is primary, but keep value_loss from earlier computation
-                # loss already contains: surrogate_loss(=0) + effective_value_loss_coef * value_loss - entropy
+            if epoch < self.teacher_only_interval or not critic_ready:
+                # Teacher-only stage OR critic pre-warming: BC is primary loss
+                # surrogate_loss=0 here, so loss = value_loss + imitation_loss
                 loss = loss + imitation_loss
             elif self.teacher_only_interval <= epoch < self.hybrid_training_intervals:
                 # Hybrid stage: combine PPO loss with stronger imitation loss
-                # Use a higher weight for imitation during hybrid stage
                 hybrid_imitation_weight = 2.0 * (self.teacher_loss_coef if self.teacher_loss_coef is not None else 0.1)
                 loss = loss + hybrid_imitation_weight * imitation_loss
-            # else: Stage 3 (student), imitation loss applied separately later
+            # else: Stage 3 critic-ready, imitation loss applied separately via imitation_optimizer
             
             # Gradient step
             self.optimizer.zero_grad()
@@ -1053,6 +1159,50 @@ class MMPPO:
                 dagger_loss = 0.0
             mean_dagger_loss += dagger_loss
 
+        # Teacher Replay Buffer: extra imitation-only gradient steps over past rollouts
+        mean_replay_imitation_loss = 0.0
+        replay_updates = 0
+        if (self.replay_buffer is not None and
+            len(self.replay_buffer) > 0 and
+            epoch >= self.teacher_only_interval and
+            not is_mmgpt):  # MMGPT requires trajectory context; skip replay for now
+            batch_size = self.storage.num_envs * 2  # use 2x env count for replay batches
+            for _ in range(self.replay_imitation_epochs):
+                replay_batch = self.replay_buffer.sample_batch(batch_size)
+                if replay_batch is None:
+                    break
+
+                obs_rb = replay_batch['obs']
+                ref_obs_rb = replay_batch['ref_obs']
+                ref_mask_rb = replay_batch['ref_mask']
+                dagger_actions_rb = replay_batch['dagger_actions']
+
+                ref_obs_tuple = (ref_obs_rb, ref_mask_rb) if ref_obs_rb is not None else None
+
+                # Re-query teacher on stored obs to get fresh imitation targets
+                replay_imit_loss = self._imitation_loss(
+                    actions_batch=dagger_actions_rb,
+                    obs_batch=obs_rb,
+                    ref_obs_batch=ref_obs_tuple,
+                    dagger_actions_batch=dagger_actions_rb,
+                    masks_batch=None,
+                    memory=None,
+                )
+
+                if replay_imit_loss.item() > 0:
+                    coef = self.teacher_loss_coef if self.teacher_loss_coef is not None else 0.1
+                    replay_loss = replay_imit_loss * coef
+                    self.imitation_optimizer.zero_grad()
+                    replay_loss.backward()
+                    nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), self.max_grad_norm)
+                    self.imitation_optimizer.step()
+
+                    mean_replay_imitation_loss += replay_imit_loss.item()
+                    replay_updates += 1
+
+        if replay_updates > 0:
+            mean_replay_imitation_loss /= replay_updates
+
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
@@ -1082,16 +1232,31 @@ class MMPPO:
                 self.teacher_loss_coef_range[0],
                 self.teacher_loss_coef * self.teacher_loss_coef_decay)
         print_gpu_memory_summary("End of epoch")
+
+        # Snapshot teacher-relevant data to replay buffer before clearing
+        if self.replay_buffer is not None and self.teacher_coef is not None:
+            self.replay_buffer.add_rollout(
+                obs=self.storage.observations,
+                ref_obs=self.storage.reference_observations,
+                ref_mask=self.storage.reference_observations_mask,
+                dones=self.storage.dones,
+                dagger_actions=self.storage.dagger_actions,
+            )
+
         self.storage.clear()
 
         loss_dict = {
             "mean_value_loss": mean_value_loss,
             "mean_surrogate_loss": mean_surrogate_loss,
             "mean_imitation_loss": mean_imitation_loss,
-            "mean_dagger_loss": mean_dagger_loss,	
+            "mean_dagger_loss": mean_dagger_loss,
             "mean_entropy": mean_entropy,
             "mean_priv_reg_loss": mean_priv_reg_loss,  # ASAP-style privilege regularization
+            "ev_ma": self.ev_ma,
+            "critic_win_streak": self.critic_win_streak,
         }
+        if self.replay_buffer is not None:
+            loss_dict["mean_replay_imitation_loss"] = mean_replay_imitation_loss
         if is_mmgpt:
             loss_dict["mean_aux_loss"] = mean_aux_loss
             loss_dict["mean_dreamer_loss"] = mean_dreamer_loss
@@ -1206,6 +1371,8 @@ class MMPPO:
         - "norm": L2 norm distance
         - "mse": Mean Squared Error (simple and effective)
         - "huber": Huber loss (robust to outliers)
+        - "wasserstein": W2 distance between diagonal Gaussians (mu+sigma), closed-form:
+                         W2^2 = ||mu_s - mu_t||^2 + ||sigma_s - sigma_t||^2
         """
         if dagger_actions_batch is not None:
             dagger_actions_batch = dagger_actions_batch.detach()
@@ -1276,10 +1443,35 @@ class MMPPO:
                     delta * (abs_diff - 0.5 * delta)
                 )
                 imitation_loss = huber.mean()
-            
+
+            elif self.teacher_coef_mode == "wasserstein":
+                # W2 distance between two diagonal Gaussians (closed-form):
+                #   W2^2(N(mu_s, diag(sigma_s^2)), N(mu_t, diag(sigma_t^2)))
+                #        = ||mu_s - mu_t||^2 + ||sigma_s - sigma_t||^2
+                # Student: act_inference gives mu_s; action_std gives sigma_s
+                # Teacher: act_dagger_inference gives mu_t; action_std_dagger gives sigma_t
+                with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                    mu_s = self.actor_critic.act_inference(
+                        observations=obs_batch, ref_observations=ref_obs_batch,
+                        masks=masks_batch, memory=memory
+                    )
+                sigma_s = self.actor_critic.action_std  # [B, act_dim], requires grad via actor params
+
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
+                        mu_t = self.actor_critic.act_dagger_inference(
+                            observations=obs_batch, ref_observations=ref_obs_batch,
+                            masks=masks_batch, memory=memory
+                        )
+                    sigma_t = self.actor_critic.action_std_dagger  # [B, act_dim], detached
+
+                mean_term = (mu_s - mu_t).pow(2).sum(dim=-1)          # [B]
+                std_term  = (sigma_s - sigma_t.detach()).pow(2).sum(dim=-1)  # [B]
+                imitation_loss = (mean_term + std_term).mean()
+
             else:
                 raise ValueError(f"Unknown teacher_coef_mode: {self.teacher_coef_mode}. "
-                               f"Choose from ['kl', 'original_kl', 'norm', 'mse', 'huber']")
+                               f"Choose from ['kl', 'original_kl', 'norm', 'mse', 'huber', 'wasserstein']")
                     
         else:
             imitation_loss = torch.tensor(0.0).to(self.device)   

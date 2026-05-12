@@ -129,9 +129,115 @@ class Conv1dCompressor(nn.Module):
         new_masks = new_mask_permuted.squeeze(1).permute(1, 0).bool()
         
         return compressed_seq, new_masks
-    
- 
-    
+
+
+class PerceiverCompressor(nn.Module):
+    """Perceiver-style cross-attention compressor as alternative to Conv1dCompressor.
+
+    Uses learnable latent tokens that cross-attend to the input sequence,
+    producing a fixed-size compressed representation. Supports causal masking
+    where latent i only attends to the first ceil((i+1)*T/L) timesteps.
+    """
+    def __init__(self, d_model: int, num_latents: int = 32, num_heads: int = 4, stride: int = 1):
+        super().__init__()
+        self.num_latents = num_latents
+        self.stride = stride  # kept for API compatibility
+        self.d_model = d_model
+        self.latents = nn.Parameter(torch.randn(num_latents, d_model) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=False)
+        self.norm_latent = nn.LayerNorm(d_model)
+        self.norm_seq = nn.LayerNorm(d_model)
+
+    def forward(self, seq: torch.Tensor, masks: torch.Tensor):
+        """
+        Args:
+            seq: [T, B, D] input sequence
+            masks: [T, B] boolean mask (True = valid)
+        Returns:
+            compressed: [num_latents, B, D]
+            new_masks: [num_latents, B] boolean mask
+        """
+        T, B, D = seq.shape
+
+        # Expand latents for batch: [num_latents, B, D]
+        latents = self.latents.unsqueeze(1).expand(-1, B, -1)
+        latents_normed = self.norm_latent(latents)
+        seq_normed = self.norm_seq(seq)
+
+        # key_padding_mask: [B, T], float mask (-inf for padding, 0 for valid)
+        key_padding_mask = torch.zeros(B, T, device=seq.device)
+        key_padding_mask.masked_fill_(~masks.T.bool(), float('-inf'))
+
+        # Causal cross-attention mask: latent i attends to seq[:ceil((i+1)*T/L)]
+        attn_mask = self._build_causal_cross_mask(self.num_latents, T, seq.device)
+
+        compressed, _ = self.cross_attn(
+            query=latents_normed,   # [num_latents, B, D]
+            key=seq_normed,         # [T, B, D]
+            value=seq_normed,       # [T, B, D]
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+        )
+        compressed = compressed + latents  # residual connection
+
+        # All latents are valid if any token in the sequence is valid
+        new_masks = masks.any(dim=0).unsqueeze(0).expand(self.num_latents, -1)  # [num_latents, B]
+        return compressed, new_masks
+
+    @staticmethod
+    def _build_causal_cross_mask(num_latents: int, T: int, device: torch.device) -> torch.Tensor:
+        """Build causal cross-attention mask. Latent i can attend to positions [0, cutoff_i).
+
+        Returns:
+            mask: [num_latents, T] float mask, -inf where blocked, 0.0 where allowed
+        """
+        latent_idx = torch.arange(num_latents, device=device, dtype=torch.float32).unsqueeze(1)
+        seq_idx = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(0)
+        cutoffs = ((latent_idx + 1) * T / num_latents).ceil()  # [L, 1]
+        blocked = seq_idx >= cutoffs  # [L, T] True where blocked
+        mask = torch.zeros(num_latents, T, device=device)
+        mask.masked_fill_(blocked, float('-inf'))
+        return mask
+
+
+class PerceiverUpsampler(nn.Module):
+    """Cross-attention upsampler that maps compressed latents back to original sequence length.
+
+    Uses positional queries to cross-attend into compressed latent representations,
+    matching the ConvTranspose1dCompressor interface: forward(compressed_seq, original_len).
+    """
+    def __init__(self, d_model: int, max_seq_len: int, num_heads: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.pos_queries = nn.Embedding(max_seq_len, d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, batch_first=False)
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+
+    def forward(self, compressed_seq: torch.Tensor, original_len: int):
+        """
+        Args:
+            compressed_seq: [num_latents, B, D]
+            original_len: T_in
+        Returns:
+            upsampled: [T_in, B, D]
+        """
+        B = compressed_seq.shape[1]
+        device = compressed_seq.device
+
+        # Positional queries: [T_in, B, D]
+        pos_idx = torch.arange(original_len, device=device)
+        queries = self.pos_queries(pos_idx).unsqueeze(1).expand(-1, B, -1)
+
+        upsampled, _ = self.cross_attn(
+            query=self.norm_q(queries),
+            key=self.norm_kv(compressed_seq),
+            value=compressed_seq,
+        )
+        upsampled = upsampled + queries  # residual
+        return upsampled
+
+
 class ConvTranspose1dCompressor(nn.Module):
     def __init__(self, d_model, stride=2, kernel_size=4):
         super().__init__()
@@ -339,7 +445,7 @@ class MMGPT(nn.Module):
         dim_model = 64,
         num_heads = 2,
         num_layers = 2,
-        ffn_ratio = 4,
+        ffn_ratio = 4, # For SwiGLU, recommended ratio is 8/3 (~2.67)
         dropout = 0.0,
         name = "",
         term_dict = None,
@@ -348,7 +454,7 @@ class MMGPT(nn.Module):
         concatenate_term_names: Optional[List[List[str]]] = None,
         concatenate_ref_term_names: Optional[List[List[str]]] = None,
         num_steps_per_env = 24, # default, remember to parse this!
-        max_seq_len = 24, 
+        max_seq_len = 24,
         mlp_hidden_dims = [],
         apply_rope = False, # default: APE; set True to use RoPE
         apply_res = True,
@@ -356,15 +462,15 @@ class MMGPT(nn.Module):
         # HINT: The following parameters matters **SIGNIFICANTLY** to the performance for allowing temporal prediction features!
         pred_obs_term_names: Optional[List[str]] = None,
         pred_obs_term_weights: Optional[List[float]] = None,
-        apply_mlp_residual = False,     
+        apply_mlp_residual = False,
         # some not pretty fix
         default_joint_pos: Optional[torch.Tensor] = None,
+        # Compressor config
+        compressor_type: str = "conv1d",  # "conv1d" or "perceiver"
+        perceiver_num_latents: int = 32,
+        perceiver_num_heads: int = 4,
         **kwargs
     ):
-        if dim_model > 128:
-            ffn_ratio = 2
-        else:
-            ffn_ratio = 4
         super().__init__()
         self.name = name
         self.obs_dim = obs_size
@@ -492,14 +598,25 @@ class MMGPT(nn.Module):
         self.padding = (self.kernel_size - self.stride) // 2 if self.kernel_size > self.stride else 0
         padding_needed = (self.stride - self.num_steps_per_env % self.stride) % self.stride if self.stride > 1 else 0
         L_in_padded = self.num_steps_per_env + padding_needed
-        
+        self.compressor_type = compressor_type
+
         if self.stride > 1:
-            self.compressed_len = math.floor((L_in_padded + 2 * self.padding - self.kernel_size) / self.stride) + 1
+            if compressor_type == "perceiver":
+                self.compressed_len = perceiver_num_latents
+                self.compressor = PerceiverCompressor(dim_model, num_latents=perceiver_num_latents, num_heads=perceiver_num_heads, stride=self.stride)
+                self.ref_compressor = PerceiverCompressor(dim_model, num_latents=perceiver_num_latents, num_heads=perceiver_num_heads, stride=self.stride) if ref_obs_size > 0 else None
+                self.upsampler = PerceiverUpsampler(dim_model, max_seq_len=num_steps_per_env, num_heads=perceiver_num_heads)
+            else:
+                # Default: Conv1dCompressor
+                self.compressed_len = math.floor((L_in_padded + 2 * self.padding - self.kernel_size) / self.stride) + 1
+                self.compressor = Conv1dCompressor(dim_model, self.stride, self.kernel_size)
+                self.ref_compressor = Conv1dCompressor(dim_model, self.stride, self.kernel_size) if ref_obs_size > 0 else None
+                self.upsampler = ConvTranspose1dCompressor(dim_model, self.stride, self.kernel_size)
         else:
             self.compressed_len = self.num_steps_per_env
-        self.compressor = Conv1dCompressor(dim_model, self.stride, self.kernel_size) if self.stride > 1 else None
-        self.ref_compressor = Conv1dCompressor(dim_model, self.stride, self.kernel_size) if self.stride > 1 and ref_obs_size > 0 else None
-        self.upsampler = ConvTranspose1dCompressor(dim_model, self.stride, self.kernel_size) if self.stride > 1 else None
+            self.compressor = None
+            self.ref_compressor = None
+            self.upsampler = None
         
         self.pos_emb = nn.Embedding(self.compressed_len, dim_model) if not self.apply_rope else None # *2 for obs and ref_obs
         self.modality_emb = nn.Embedding(2, dim_model) # 0 for obs, 1 for ref_obs
@@ -522,8 +639,6 @@ class MMGPT(nn.Module):
         self.fc = nn.Sequential(
             nn.LayerNorm(dim_model),
             nn.Linear(dim_model, dim_model * 2),
-            nn.SiLU(),
-            nn.Linear(dim_model * 2, dim_model * 2),
             nn.SiLU(),
             nn.Linear(dim_model * 2, dim_out)
         )
@@ -759,7 +874,7 @@ class MMGPT(nn.Module):
             upsampled_out = self.upsampler(obs_out_seq, T_in) # [T_in, B, D]
         else:
             upsampled_out = obs_out_seq # [T_in, B, D]
-            
+
 
         # if self.apply_res:
         #     # Add residual connection    
@@ -1525,7 +1640,7 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                  load_critic_path=None,
                  load_std_path=None,
                  enable_lora=False,
-                 dropout=0.1,
+                 dropout=0.0,
                  apply_rope=False,
                  default_joint_pos: Optional[torch.Tensor] = None,
                  use_mlp_dagger: bool = False,
@@ -1577,7 +1692,7 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
             self.load_dagger_weights(load_dagger_path)
             lora_r = kwargs.get('lora_r', 8)
             lora_alpha = kwargs.get('lora_alpha', 16)
-            lora_dropout = kwargs.get('lora_dropout', 0.05)
+            lora_dropout = kwargs.get('lora_dropout', 0.0)
             if enable_lora:
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
                 

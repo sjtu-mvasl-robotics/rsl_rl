@@ -979,7 +979,7 @@ class ActorCriticMMTransformer(nn.Module):
             load_dagger_path=None,
             load_actor_path=None,
             enable_lora=True,
-            dropout=0.05,
+            dropout=0.0,
             **kwargs
     ):
         super().__init__()
@@ -1001,7 +1001,7 @@ class ActorCriticMMTransformer(nn.Module):
             self.load_dagger_weights(load_dagger_path)
             lora_r = kwargs.get('lora_r', 8)
             lora_alpha = kwargs.get('lora_alpha', 16)
-            lora_dropout = kwargs.get('lora_dropout', 0.05)
+            lora_dropout = kwargs.get('lora_dropout', 0.0)
             if enable_lora:
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             
@@ -1176,7 +1176,7 @@ class ActorCriticMMTransformer(nn.Module):
             
         print(f"Loaded dagger weights from {path} to actor_dagger")
         
-    def apply_dagger_lora(self, r=8, alpha=16, dropout=0.05):
+    def apply_dagger_lora(self, r=8, alpha=16, dropout=0.0):
         for param in self.actor_dagger.transformer.parameters():
             param.requires_grad = False
         
@@ -1567,7 +1567,7 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
             load_dagger_path=None,
             load_actor_path=None,
             enable_lora=False,
-            dropout=0.05,
+            dropout=0.0,
             **kwargs
     ):
         nn.Module.__init__(self)
@@ -1587,7 +1587,7 @@ class ActorCriticMMTransformerV2(ActorCriticMMTransformer):
             self.load_dagger_weights(load_dagger_path)
             lora_r = kwargs.get('lora_r', 8)
             lora_alpha = kwargs.get('lora_alpha', 16)
-            lora_dropout = kwargs.get('lora_dropout', 0.05)
+            lora_dropout = kwargs.get('lora_dropout', 0.0)
             if enable_lora:
                 self.apply_dagger_lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
             

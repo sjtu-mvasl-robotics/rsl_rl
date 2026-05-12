@@ -15,6 +15,7 @@ from .actor_critic_mm_transformer import ActorCriticMMTransformer, ActorCriticMM
 from .actor_critic_mm_gpt import ActorCriticMMGPT
 from .actor_critic_mlp import ActorCriticMLP, MultiModalMLP
 from .actor_critic_mlp_v2 import ActorCriticMLPV2, MultiModalMLPV2
+from .actor_critic_mlp_v2_moe import ActorCriticMLPV2MoE
 from .actor_critic_mlp_v3 import ActorCriticMLPV3
 from .conv_encoder import ConvEncoder, PrivilegeEncoder, MotionEncoder
 from .student_teacher_transformer import StudentTeacherMMTransformer, StudentTeacherMMTransformerV2
@@ -37,6 +38,7 @@ __all__ = [
     "ActorCriticMLP",
     "MultiModalMLP",
     "ActorCriticMLPV2",
+    "ActorCriticMLPV2MoE",
     "MultiModalMLPV2",
     "ActorCriticMLPV3",
     "ConvEncoder",

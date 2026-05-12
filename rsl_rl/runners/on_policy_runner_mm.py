@@ -88,7 +88,7 @@ class OnPolicyRunnerMM:
 
         actor_critic_name = self.policy_cfg.pop("class_name")
         actor_critic_class = eval(actor_critic_name)  # ActorCritic
-        if actor_critic_name in ["ActorCriticMMTransformerV2", "ActorCriticMMGPT", "ActorCriticMLPV2"]:
+        if actor_critic_name in ["ActorCriticMMTransformerV2", "ActorCriticMMGPT", "ActorCriticMLPV2", "ActorCriticMLPV2MoE"]:
             def get_term_dict(dict_names, dict_dims):
                 ret = dict(
                     (key, dict((name, dim[0]) for name, dim in zip(dict_names[key], dict_dims[key]) if dim[0] > 0))
