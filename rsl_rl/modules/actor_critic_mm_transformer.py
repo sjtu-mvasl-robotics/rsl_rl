@@ -16,8 +16,10 @@ from torch.distributions import Normal
 from typing import Optional, Tuple
 # from timm.models.vision_transformer import LayerScale
 import time
-from peft import get_peft_model, LoraConfig, TaskType
-from peft.tuners.lora import Linear as LoRALinear
+try:
+    from peft.tuners.lora import Linear as LoRALinear
+except ImportError:
+    LoRALinear = None
 from rsl_rl.utils import resolve_nn_activation
 from rsl_rl.modules.actor_critic_mlp_v2 import MultiModalMLPV2, FusedMultiModalMLP
 
@@ -1177,6 +1179,10 @@ class ActorCriticMMTransformer(nn.Module):
         print(f"Loaded dagger weights from {path} to actor_dagger")
         
     def apply_dagger_lora(self, r=8, alpha=16, dropout=0.0):
+        if LoRALinear is None:
+            raise ImportError(
+                "apply_dagger_lora requires the optional 'peft' package"
+            )
         for param in self.actor_dagger.transformer.parameters():
             param.requires_grad = False
         
