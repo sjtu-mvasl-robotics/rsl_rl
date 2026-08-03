@@ -3,10 +3,11 @@
 #  SPDX-License-Identifier: BSD-3-Clause
 
 from setuptools import find_packages, setup
+from rsl_rl import __version__
 
 setup(
     name="rsl_rl",
-    version="2.3.1.dev3",
+    version=__version__,
     packages=find_packages(),
     author="Yifei Yao",
     maintainer="Yifei Yao",

@@ -10,6 +10,11 @@ from rsl_rl.runners.on_policy_runner_mm import (
     _amp_reward_enabled,
     _compose_amp_training_rewards,
 )
+import rsl_rl
+
+
+def test_source_checkout_exposes_distribution_version():
+    assert rsl_rl.__version__ == "2.3.1.dev3"
 
 
 def test_plain_ppo_never_waits_for_teacher_critic_gate():
