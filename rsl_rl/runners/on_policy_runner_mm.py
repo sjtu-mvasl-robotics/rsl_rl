@@ -19,6 +19,26 @@ from rsl_rl.modules import *
 from rsl_rl.utils import store_code_state, string_to_callable
 
 
+def _compose_amp_training_rewards(
+    base_rewards: torch.Tensor,
+    amp_rewards: torch.Tensor,
+    *,
+    scale: float,
+    enabled: bool,
+) -> torch.Tensor:
+    """Compose the reward that is stored for PPO without mutating env output."""
+
+    if not enabled:
+        return base_rewards.clone()
+    return base_rewards + amp_rewards * scale
+
+
+def _amp_reward_enabled(iteration: int, pretrain_steps: int) -> bool:
+    """Use AMP shaping starting at the configured integer iteration."""
+
+    return iteration >= pretrain_steps
+
+
 class OnPolicyRunnerMM:
     """On-policy runner for training and evaluation."""
 
@@ -409,13 +429,55 @@ class OnPolicyRunnerMM:
                     else:
                         critic_ref_obs_tuple = ref_obs_tuple
 
-                    
-                    # process the step
+                    # The reward passed to process_env_step is the sole source
+                    # for GAE/returns.  Compose AMP shaping before storage; the
+                    # previous order added it only to logging after storage.
+                    base_rewards = rewards
+                    amp_rewards = None
+                    amp_score = None
+                    if self.amp_cfg:
+                        ready_mask = amp_obs_fill_count >= amp_history_len
+                        amp_input = amp_obs_buffer.flatten(-2, -1)
+                        if ready_mask.any():
+                            amp_rewards = self.alg.amp.amp_reward(
+                                amp_input, epsilon=self.amp_cfg["epsilon"]
+                            )
+                            amp_score = self.alg.amp.amp_score(amp_input)
+                            amp_rewards = amp_rewards * ready_mask.float()
+                            amp_score = amp_score * ready_mask.float()
+                        else:
+                            amp_rewards = torch.zeros(
+                                self.env.num_envs, device=self.device
+                            )
+                            amp_score = torch.zeros(
+                                self.env.num_envs, device=self.device
+                            )
+
+                        rewards = _compose_amp_training_rewards(
+                            base_rewards,
+                            amp_rewards,
+                            scale=self.amp_cfg["amp_reward_scale"],
+                            enabled=_amp_reward_enabled(
+                                it, self.amp_cfg["amp_pretrain_steps"]
+                            ),
+                        )
+
+                        # A done transition still uses the completed history
+                        # above; clear only the next episode's history state.
+                        done_ids = (dones > 0).nonzero(as_tuple=False).squeeze(-1)
+                        if done_ids.numel() > 0:
+                            amp_obs_buffer[done_ids] = 0
+                            amp_obs_fill_count[done_ids] = 0
+
+                    # Store the fully composed controller-training reward.
                     self.alg.process_env_step(rewards, dones, infos)
 
-                    # Accumulate rewards for planner RL
+                    # Planner RL retains its environment reward contract; AMP
+                    # is a controller-only learned shaping term.
                     if self._planner_rl_enabled:
-                        self.env.diffusion_buffer.accumulate_planner_reward(rewards.squeeze())
+                        self.env.diffusion_buffer.accumulate_planner_reward(
+                            base_rewards.squeeze()
+                        )
 
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
 
@@ -432,27 +494,6 @@ class OnPolicyRunnerMM:
                         # rewards = torch.clamp(rewards, min=0.0)
 
                         if self.amp_cfg:
-                            # Build amp history input per-env: [num_envs, H, D] -> [num_envs, H*D]
-                            # Only compute reward for envs that have enough history
-                            ready_mask = (amp_obs_fill_count >= amp_history_len)  # [num_envs]
-                            amp_input = amp_obs_buffer.flatten(-2, -1)  # [num_envs, H*D]
-                            if ready_mask.any():
-                                amp_rewards = self.alg.amp.amp_reward(amp_input, epsilon=self.amp_cfg["epsilon"])
-                                amp_score = self.alg.amp.amp_score(amp_input)
-                                # Zero out for envs that don't have enough history yet
-                                amp_rewards = amp_rewards * ready_mask.float()
-                                amp_score = amp_score * ready_mask.float()
-                            else:
-                                amp_rewards = torch.zeros(self.env.num_envs, device=self.device)
-                                amp_score = torch.zeros(self.env.num_envs, device=self.device)
-
-                            # Reset buffer only for done environments (per-env reset)
-                            done_ids = (dones > 0).nonzero(as_tuple=False).squeeze(-1)
-                            if done_ids.numel() > 0:
-                                amp_obs_buffer[done_ids] = 0
-                                amp_obs_fill_count[done_ids] = 0
-
-                            rewards += amp_rewards * self.amp_cfg["amp_reward_scale"] * (self.amp_cfg['amp_pretrain_steps'] <= it) # only add amp reward after pretrain steps
                             cur_amp_reward_sum += amp_rewards * self.amp_cfg["amp_reward_scale"]
                             cur_amp_score_sum += amp_score
                             cur_amp_score_avg = cur_amp_score_sum / (cur_episode_length + 1)
@@ -1092,4 +1133,3 @@ class OnPolicyRunnerMM:
         )
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
-            

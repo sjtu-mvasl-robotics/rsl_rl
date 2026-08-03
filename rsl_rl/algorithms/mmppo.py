@@ -26,6 +26,31 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.utils import string_to_callable
 import time
 
+
+def _actor_ppo_enabled(
+    *,
+    teacher_enabled: bool,
+    epoch: int,
+    teacher_only_interval: int,
+    teacher_supervising_intervals: int,
+    critic_win_streak: int,
+) -> bool:
+    """Return whether the rollout policy must receive the PPO objective.
+
+    Critic-readiness gating belongs to teacher/DAgger warm-up.  Applying it to
+    ordinary PPO (``teacher_coef is None``) creates a deadlock: the actor never
+    changes, while a critic trained on that fixed policy may never reach the
+    explained-variance threshold that would unlock it.
+    """
+
+    if not teacher_enabled:
+        return True
+    critic_ready = (
+        epoch > teacher_supervising_intervals and critic_win_streak >= 3
+    )
+    return epoch >= teacher_only_interval and critic_ready
+
+
 class DebugHook:
     def __init__(self, name):
         self.name = name
@@ -694,6 +719,8 @@ class MMPPO:
                 "mean_dagger_loss": 0.0,
                 "mean_entropy": 0.0,
                 "mean_priv_reg_loss": 0.0,
+                "actor_ppo_update_fraction": 0.0,
+                "mean_actor_grad_norm": 0.0,
             }
 
         # Update current training stage based on epoch
@@ -712,6 +739,8 @@ class MMPPO:
         mean_dagger_loss = 0.0
         mean_entropy = 0.0
         mean_priv_reg_loss = 0.0  # ASAP-style privilege regularization loss
+        actor_ppo_update_batches = 0
+        mean_actor_grad_norm = 0.0
         if is_mmgpt:
             mean_aux_loss = 0.0
             mean_dreamer_loss = 0.0
@@ -878,14 +907,21 @@ class MMPPO:
                 else:
                     self.critic_win_streak = 0
 
-            # Critic is "ready" when: past teacher_supervising_intervals AND streak >= 3
-            critic_ready = (epoch > self.teacher_supervising_intervals and self.critic_win_streak >= 3)
+            teacher_enabled = self.teacher_coef is not None
+            actor_ppo_enabled = _actor_ppo_enabled(
+                teacher_enabled=teacher_enabled,
+                epoch=epoch,
+                teacher_only_interval=self.teacher_only_interval,
+                teacher_supervising_intervals=self.teacher_supervising_intervals,
+                critic_win_streak=self.critic_win_streak,
+            )
 
             # Surrogate loss
-            # In teacher-only stage OR critic not ready: skip actor PPO update, only train critic
-            if epoch < self.teacher_only_interval or not critic_ready:
+            # Only an explicitly enabled teacher warm-up may suppress PPO.
+            if not actor_ppo_enabled:
                 surrogate_loss = torch.tensor(0.0, device=self.device)
             else:
+                actor_ppo_update_batches += 1
                 # Normal PPO or Hybrid stage: compute surrogate loss
                 with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
                     ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
@@ -896,7 +932,7 @@ class MMPPO:
                     surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
             # Determine effective value_loss_coef based on stage
-            if epoch < self.teacher_only_interval or not critic_ready:
+            if not actor_ppo_enabled:
                 # Teacher stage or critic not ready: reduced value coef, no entropy term
                 effective_value_loss_coef = self.teacher_value_loss_coef
                 loss = surrogate_loss + effective_value_loss_coef * value_loss
@@ -982,7 +1018,7 @@ class MMPPO:
             print_gpu_memory_summary("Before optimizer.zero_grad")
             
             # Add imitation loss to the total loss based on training stage
-            if epoch < self.teacher_only_interval or not critic_ready:
+            if not actor_ppo_enabled:
                 # Teacher-only stage OR critic pre-warming: BC is primary loss
                 # surrogate_loss=0 here, so loss = value_loss + imitation_loss
                 loss = loss + imitation_loss
@@ -1109,6 +1145,13 @@ class MMPPO:
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
+            actor_grad_sq_norm = sum(
+                parameter.grad.detach().float().pow(2).sum()
+                for parameter in self.actor_critic.actor.parameters()
+                if parameter.grad is not None
+            )
+            if isinstance(actor_grad_sq_norm, torch.Tensor):
+                mean_actor_grad_norm += actor_grad_sq_norm.sqrt().item()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             if not self.auto_mix_precision:
                 self.optimizer.step()
@@ -1210,6 +1253,7 @@ class MMPPO:
         mean_dagger_loss /= num_updates
         mean_entropy /= num_updates
         mean_priv_reg_loss /= num_updates  # ASAP-style privilege regularization
+        mean_actor_grad_norm /= num_updates
         if is_mmgpt:
             mean_aux_loss /= num_updates
         if self.amp:
@@ -1254,6 +1298,8 @@ class MMPPO:
             "mean_priv_reg_loss": mean_priv_reg_loss,  # ASAP-style privilege regularization
             "ev_ma": self.ev_ma,
             "critic_win_streak": self.critic_win_streak,
+            "actor_ppo_update_fraction": actor_ppo_update_batches / num_updates,
+            "mean_actor_grad_norm": mean_actor_grad_norm,
         }
         if self.replay_buffer is not None:
             loss_dict["mean_replay_imitation_loss"] = mean_replay_imitation_loss
@@ -1751,4 +1797,3 @@ class MMPPO:
 
         metrics['planner/grad_norm'] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
         return metrics
-
