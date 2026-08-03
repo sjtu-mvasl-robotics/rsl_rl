@@ -43,15 +43,17 @@ def test_amp_reward_is_composed_without_mutating_environment_reward():
     base = torch.tensor([1.0, -0.5])
     amp = torch.tensor([0.4, 0.2])
 
-    disabled = _compose_amp_training_rewards(
+    disabled, disabled_amp = _compose_amp_training_rewards(
         base, amp, scale=0.5, enabled=False
     )
-    enabled = _compose_amp_training_rewards(
+    enabled, enabled_amp = _compose_amp_training_rewards(
         base, amp, scale=0.5, enabled=True
     )
 
     torch.testing.assert_close(disabled, base)
+    torch.testing.assert_close(disabled_amp, torch.zeros_like(amp))
     torch.testing.assert_close(enabled, torch.tensor([1.2, -0.4]))
+    torch.testing.assert_close(enabled_amp, torch.tensor([0.2, 0.1]))
     torch.testing.assert_close(base, torch.tensor([1.0, -0.5]))
     assert disabled.data_ptr() != base.data_ptr()
 
@@ -63,13 +65,16 @@ def test_amp_pretrain_boundary_is_explicit():
 
 def test_runner_stores_amp_reward_before_process_env_step():
     source = inspect.getsource(OnPolicyRunnerMM.learn)
-    compose_at = source.index("rewards = _compose_amp_training_rewards(")
+    compose_at = source.index("rewards, applied_amp_rewards = _compose_amp_training_rewards(")
     clear_done_at = source.index("amp_obs_buffer[done_ids] = 0", compose_at)
     storage_at = source.index("self.alg.process_env_step(rewards, dones, infos)")
     planner_at = source.index("accumulate_planner_reward(\n                            base_rewards.squeeze()")
     logging_at = source.index("if self.log_dir is not None:", compose_at)
+    applied_logging_at = source.index(
+        "cur_amp_reward_sum += applied_amp_rewards", logging_at
+    )
 
-    assert compose_at < clear_done_at < storage_at < planner_at < logging_at
+    assert compose_at < clear_done_at < storage_at < planner_at < logging_at < applied_logging_at
 
 
 class _TinyActorCritic(nn.Module):
@@ -178,12 +183,13 @@ def test_composed_amp_reward_precedes_timeout_bootstrap_in_storage():
     observation = torch.tensor([[0.2, -0.1, 0.4]])
     algorithm.act(observation, None, observation, None)
     bootstrap_value = algorithm.transition.values.squeeze().clone()
-    training_reward = _compose_amp_training_rewards(
+    training_reward, applied_amp_reward = _compose_amp_training_rewards(
         torch.tensor([1.0]),
         torch.tensor([0.4]),
         scale=0.5,
         enabled=True,
     )
+    torch.testing.assert_close(applied_amp_reward, torch.tensor([0.2]))
     algorithm.process_env_step(
         training_reward,
         torch.tensor([False]),

@@ -25,12 +25,13 @@ def _compose_amp_training_rewards(
     *,
     scale: float,
     enabled: bool,
-) -> torch.Tensor:
-    """Compose the reward that is stored for PPO without mutating env output."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the PPO reward and the AMP shaping term actually applied to it."""
 
-    if not enabled:
-        return base_rewards.clone()
-    return base_rewards + amp_rewards * scale
+    applied_amp_rewards = (
+        amp_rewards * scale if enabled else torch.zeros_like(amp_rewards)
+    )
+    return base_rewards + applied_amp_rewards, applied_amp_rewards
 
 
 def _amp_reward_enabled(iteration: int, pretrain_steps: int) -> bool:
@@ -453,7 +454,7 @@ class OnPolicyRunnerMM:
                                 self.env.num_envs, device=self.device
                             )
 
-                        rewards = _compose_amp_training_rewards(
+                        rewards, applied_amp_rewards = _compose_amp_training_rewards(
                             base_rewards,
                             amp_rewards,
                             scale=self.amp_cfg["amp_reward_scale"],
@@ -494,7 +495,10 @@ class OnPolicyRunnerMM:
                         # rewards = torch.clamp(rewards, min=0.0)
 
                         if self.amp_cfg:
-                            cur_amp_reward_sum += amp_rewards * self.amp_cfg["amp_reward_scale"]
+                            # Log the shaping term that was actually stored for
+                            # PPO.  During AMP pretraining this is exactly zero,
+                            # rather than the discriminator's unapplied candidate.
+                            cur_amp_reward_sum += applied_amp_rewards
                             cur_amp_score_sum += amp_score
                             cur_amp_score_avg = cur_amp_score_sum / (cur_episode_length + 1)
                         if self.alg.rnd:
