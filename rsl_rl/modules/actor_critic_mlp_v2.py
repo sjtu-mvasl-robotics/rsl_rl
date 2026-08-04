@@ -439,6 +439,9 @@ class FusedMultiModalMLP(nn.Module):
         fuse_activation: bool = False,
         reorgnize_obs: bool = False,
         joint_decoder_hidden_dims: Optional[list[int]] = None,
+        reference_history_length: Optional[int] = None,
+        reference_encoder_output_dim: Optional[int] = None,
+        project_reference_features: bool = False,
     ):
         super().__init__()
         self.reorgnize_obs = reorgnize_obs
@@ -446,6 +449,22 @@ class FusedMultiModalMLP(nn.Module):
         
         self.fusion_mode = fusion_mode
         self.fuse_activation = fuse_activation
+        self.reference_history_length = (
+            history_length
+            if reference_history_length is None
+            else reference_history_length
+        )
+        self.reference_encoder_output_dim = reference_encoder_output_dim
+        self.project_reference_features = project_reference_features
+        if project_reference_features and reference_encoder_output_dim is None:
+            raise ValueError(
+                "project_reference_features requires reference_encoder_output_dim"
+            )
+        if (
+            reference_encoder_output_dim is not None
+            and reference_encoder_output_dim <= 0
+        ):
+            raise ValueError("reference_encoder_output_dim must be positive")
         self.has_ref = ref_term_dict is not None and bool(list(ref_term_dict.values())[0])
         
         # Main network
@@ -468,10 +487,14 @@ class FusedMultiModalMLP(nn.Module):
         if self.has_ref:
             self.ref_net = MultiModalMLPV2(
                 term_dict=ref_term_dict,
-                output_size=output_size,
+                output_size=(
+                    output_size
+                    if reference_encoder_output_dim is None
+                    else reference_encoder_output_dim
+                ),
                 hidden_dims=hidden_dims,
                 activation=activation,
-                history_length=history_length,
+                history_length=self.reference_history_length,
                 encoder_latent_dim=encoder_latent_dim,
                 encoder_compress_threshold=encoder_compress_threshold,
                 use_layer_norm=use_layer_norm,
@@ -501,8 +524,13 @@ class FusedMultiModalMLP(nn.Module):
                 )
                 decoder_layers = []
                 if fusion_mode == "sonic_joint_decoder":
+                    reference_feature_dim = (
+                        reference_encoder_output_dim
+                        if project_reference_features
+                        else hidden_dims[-1]
+                    )
                     decoder_input_dim = (
-                        self.main_net.total_obs_dim + hidden_dims[-1]
+                        self.main_net.total_obs_dim + reference_feature_dim
                     )
                 else:
                     decoder_input_dim = hidden_dims[-1] * 2
@@ -618,7 +646,11 @@ class FusedMultiModalMLP(nn.Module):
         
         ref_obs, ref_mask = ref_observations
         if self.fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
-            ref_features = self.ref_net.encode(ref_obs)
+            ref_features = (
+                self.ref_net(ref_obs)
+                if self.project_reference_features
+                else self.ref_net.encode(ref_obs)
+            )
             if ref_mask is not None:
                 ref_mask_expanded = ref_mask.unsqueeze(-1).float()
                 ref_features = ref_features * ref_mask_expanded
@@ -691,6 +723,9 @@ class ActorCriticMLPV2(nn.Module):
         fusion_mode: str = "gated",  # How to fuse actor obs and ref_obs
         critic_fusion_mode: Optional[str] = None,
         joint_decoder_hidden_dims: Optional[list[int]] = None,
+        reference_history_length: Optional[int] = None,
+        reference_encoder_output_dim: Optional[int] = None,
+        project_reference_features: bool = False,
         load_dagger: bool = False,
         load_dagger_path: Optional[str] = None,
         load_actor_path: Optional[str] = None,
@@ -746,6 +781,9 @@ class ActorCriticMLPV2(nn.Module):
             use_layer_norm=use_layer_norm,
             fusion_mode=fusion_mode,
             joint_decoder_hidden_dims=joint_decoder_hidden_dims,
+            reference_history_length=reference_history_length,
+            reference_encoder_output_dim=reference_encoder_output_dim,
+            project_reference_features=project_reference_features,
             name="actor"
         )
         
