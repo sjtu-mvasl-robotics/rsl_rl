@@ -1,5 +1,6 @@
 import inspect
 
+import pytest
 import torch
 from torch import nn
 from torch.distributions import Normal
@@ -9,6 +10,7 @@ from rsl_rl.runners.on_policy_runner_mm import (
     OnPolicyRunnerMM,
     _amp_reward_enabled,
     _compose_amp_training_rewards,
+    _restore_sonic_adaptive_sampler_state,
 )
 import rsl_rl
 
@@ -100,11 +102,54 @@ def test_sonic_adaptive_statistics_are_checkpointed_backward_compatibly():
 
     assert '"sonic_adaptive_sampler_state_dict"' in save_source
     assert "sonic_adaptive_state_dict" in save_source
-    assert (
-        'loaded_dict.get("sonic_adaptive_sampler_state_dict")'
-        in load_source
+    assert "_restore_sonic_adaptive_sampler_state" in load_source
+
+
+class _SamplerStateEnv:
+    def __init__(self, enabled: bool, expose_loader: bool = True):
+        self.enabled = enabled
+        self.loaded_state = None
+        if expose_loader:
+            self.load_sonic_adaptive_state_dict = self._load
+
+    def sonic_adaptive_sampling_enabled(self):
+        return self.enabled
+
+    def _load(self, state):
+        self.loaded_state = state
+
+
+def test_adaptive_checkpoint_is_policy_loadable_by_strict_base_eval():
+    state = {"num_episodes": torch.tensor([3.0])}
+    base_env = _SamplerStateEnv(enabled=False)
+
+    restored = _restore_sonic_adaptive_sampler_state(
+        base_env, {"sonic_adaptive_sampler_state_dict": state}
     )
-    assert "load_sonic_adaptive_state_dict" in load_source
+
+    assert restored is False
+    assert base_env.loaded_state is None
+
+
+def test_adaptive_resume_strictly_restores_sampler_state():
+    state = {"num_episodes": torch.tensor([3.0])}
+    adaptive_env = _SamplerStateEnv(enabled=True)
+
+    restored = _restore_sonic_adaptive_sampler_state(
+        adaptive_env, {"sonic_adaptive_sampler_state_dict": state}
+    )
+
+    assert restored is True
+    assert adaptive_env.loaded_state is state
+
+    broken_adaptive_env = _SamplerStateEnv(
+        enabled=True, expose_loader=False
+    )
+    with pytest.raises(RuntimeError, match="cannot restore"):
+        _restore_sonic_adaptive_sampler_state(
+            broken_adaptive_env,
+            {"sonic_adaptive_sampler_state_dict": state},
+        )
 
 
 class _TinyActorCritic(nn.Module):

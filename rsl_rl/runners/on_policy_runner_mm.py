@@ -40,6 +40,35 @@ def _amp_reward_enabled(iteration: int, pretrain_steps: int) -> bool:
     return iteration >= pretrain_steps
 
 
+def _restore_sonic_adaptive_sampler_state(env, loaded_dict) -> bool:
+    """Restore curriculum state only when the active task owns that state.
+
+    Adaptive checkpoints remain valid policy checkpoints for the ordinary
+    frame-zero evaluation task.  That task deliberately ignores curriculum
+    statistics, while an adaptive resume must advertise support and restore
+    the payload strictly.
+    """
+
+    adaptive_state = loaded_dict.get("sonic_adaptive_sampler_state_dict")
+    if adaptive_state is None:
+        return False
+    adaptive_env = getattr(env, "unwrapped", env)
+    adaptive_enabled = getattr(
+        adaptive_env, "sonic_adaptive_sampling_enabled", None
+    )
+    if not callable(adaptive_enabled) or not adaptive_enabled():
+        return False
+    load_adaptive_state = getattr(
+        adaptive_env, "load_sonic_adaptive_state_dict", None
+    )
+    if not callable(load_adaptive_state):
+        raise RuntimeError(
+            "adaptive task cannot restore the checkpoint's SONIC sampler state"
+        )
+    load_adaptive_state(adaptive_state)
+    return True
+
+
 class OnPolicyRunnerMM:
     """On-policy runner for training and evaluation."""
 
@@ -916,18 +945,7 @@ class OnPolicyRunnerMM:
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path, map_location=self.device, weights_only=True)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
-        adaptive_state = loaded_dict.get("sonic_adaptive_sampler_state_dict")
-        if adaptive_state is not None:
-            adaptive_env = getattr(self.env, "unwrapped", self.env)
-            load_adaptive_state = getattr(
-                adaptive_env, "load_sonic_adaptive_state_dict", None
-            )
-            if not callable(load_adaptive_state):
-                raise RuntimeError(
-                    "checkpoint contains SONIC adaptive state but the active "
-                    "environment cannot restore it"
-                )
-            load_adaptive_state(adaptive_state)
+        _restore_sonic_adaptive_sampler_state(self.env, loaded_dict)
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
             self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
