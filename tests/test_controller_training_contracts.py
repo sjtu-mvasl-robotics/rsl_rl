@@ -82,6 +82,31 @@ def test_runner_stores_amp_reward_before_process_env_step():
     assert compose_at < clear_done_at < storage_at < planner_at < logging_at < applied_logging_at
 
 
+def test_sonic_adaptive_distribution_updates_only_after_each_rollout():
+    source = inspect.getsource(OnPolicyRunnerMM.learn)
+    rollout_at = source.index("for i in range(self.num_steps_per_env):")
+    update_at = source.index("loss_dict = self.alg.update(epoch=it)")
+    adaptive_at = source.index(
+        'getattr(\n                adaptive_env, "update_sonic_adaptive_sampling", None'
+    )
+
+    assert rollout_at < update_at < adaptive_at
+    assert source.count('"update_sonic_adaptive_sampling"') == 1
+
+
+def test_sonic_adaptive_statistics_are_checkpointed_backward_compatibly():
+    save_source = inspect.getsource(OnPolicyRunnerMM.save)
+    load_source = inspect.getsource(OnPolicyRunnerMM.load)
+
+    assert '"sonic_adaptive_sampler_state_dict"' in save_source
+    assert "sonic_adaptive_state_dict" in save_source
+    assert (
+        'loaded_dict.get("sonic_adaptive_sampler_state_dict")'
+        in load_source
+    )
+    assert "load_sonic_adaptive_state_dict" in load_source
+
+
 class _TinyActorCritic(nn.Module):
     """Small CPU policy exposing the contract MMPPO uses in one update."""
 

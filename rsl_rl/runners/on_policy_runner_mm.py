@@ -564,6 +564,15 @@ class OnPolicyRunnerMM:
                     self.alg.compute_returns(critic_obs, critic_ref_obs_tuple)
 
             loss_dict = self.alg.update(epoch=it)
+            # Match SONIC's curriculum boundary: accumulate motion/bin
+            # occupancy during all 24 rollout steps, then recompute exactly
+            # once so the sampling distribution is frozen within a rollout.
+            adaptive_env = getattr(self.env, "unwrapped", self.env)
+            update_adaptive_sampling = getattr(
+                adaptive_env, "update_sonic_adaptive_sampling", None
+            )
+            if callable(update_adaptive_sampling):
+                update_adaptive_sampling()
             if self.amp_cfg is not None:
                 amp_prev_neg_score = loss_dict["mean_pred_pos_prob"]
 
@@ -889,6 +898,15 @@ class OnPolicyRunnerMM:
             if hasattr(self.alg, 'planner_optimizer') and self.alg.planner_optimizer is not None:
                 saved_dict["planner_optimizer_state_dict"] = self.alg.planner_optimizer.state_dict()
 
+        adaptive_env = getattr(self.env, "unwrapped", self.env)
+        adaptive_state_fn = getattr(
+            adaptive_env, "sonic_adaptive_state_dict", None
+        )
+        if callable(adaptive_state_fn):
+            adaptive_state = adaptive_state_fn()
+            if adaptive_state is not None:
+                saved_dict["sonic_adaptive_sampler_state_dict"] = adaptive_state
+
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
@@ -898,6 +916,18 @@ class OnPolicyRunnerMM:
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path, map_location=self.device, weights_only=True)
         self.alg.actor_critic.load_state_dict(loaded_dict["model_state_dict"])
+        adaptive_state = loaded_dict.get("sonic_adaptive_sampler_state_dict")
+        if adaptive_state is not None:
+            adaptive_env = getattr(self.env, "unwrapped", self.env)
+            load_adaptive_state = getattr(
+                adaptive_env, "load_sonic_adaptive_state_dict", None
+            )
+            if not callable(load_adaptive_state):
+                raise RuntimeError(
+                    "checkpoint contains SONIC adaptive state but the active "
+                    "environment cannot restore it"
+                )
+            load_adaptive_state(adaptive_state)
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
             self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
