@@ -322,6 +322,31 @@ class OnPolicyRunnerMM:
             critic_ref_obs_tuple = tuple(critic_ref_obs.to(self.device) for critic_ref_obs in critic_ref_obs_tuple)
         self.train_mode()  # switch to train mode (for dropout for example)
 
+        # Normalize the initial transition as well.  Previously only values
+        # returned by env.step() were normalized, so the first action after a
+        # fresh learn()/resume call saw a different observation contract.
+        obs = self.obs_normalizer(obs)
+        if ref_obs_tuple is not None and self.ref_obs_normalizer is not None:
+            ref_obs_tuple = (
+                self.ref_obs_normalizer(ref_obs_tuple[0]),
+                ref_obs_tuple[1],
+            )
+        if "critic" in extras["observations"]:
+            critic_obs = self.critic_obs_normalizer(critic_obs)
+        else:
+            critic_obs = obs
+        if (
+            critic_ref_obs_tuple is not None
+            and self.critic_ref_obs_normalizer is not None
+            and "critic" in ref_extras["ref_observations"]
+        ):
+            critic_ref_obs_tuple = (
+                self.critic_ref_obs_normalizer(critic_ref_obs_tuple[0]),
+                critic_ref_obs_tuple[1],
+            )
+        else:
+            critic_ref_obs_tuple = ref_obs_tuple
+
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
@@ -593,6 +618,28 @@ class OnPolicyRunnerMM:
             ref_obs_tuple = tuple(r.to(self.device) for r in ref_obs_tuple)
         if critic_ref_obs_tuple is not None:
             critic_ref_obs_tuple = tuple(r.to(self.device) for r in critic_ref_obs_tuple)
+
+        obs = self.obs_normalizer(obs)
+        if ref_obs_tuple is not None and self.ref_obs_normalizer is not None:
+            ref_obs_tuple = (
+                self.ref_obs_normalizer(ref_obs_tuple[0]),
+                ref_obs_tuple[1],
+            )
+        if "critic" in extras["observations"]:
+            critic_obs = self.critic_obs_normalizer(critic_obs)
+        else:
+            critic_obs = obs
+        if (
+            critic_ref_obs_tuple is not None
+            and self.critic_ref_obs_normalizer is not None
+            and "critic" in ref_extras["ref_observations"]
+        ):
+            critic_ref_obs_tuple = (
+                self.critic_ref_obs_normalizer(critic_ref_obs_tuple[0]),
+                critic_ref_obs_tuple[1],
+            )
+        else:
+            critic_ref_obs_tuple = ref_obs_tuple
 
         with torch.inference_mode():
             for step in range(episode_steps):
@@ -911,6 +958,10 @@ class OnPolicyRunnerMM:
         if self.empirical_normalization:
             self.obs_normalizer.train()
             self.critic_obs_normalizer.train()
+            if self.ref_obs_normalizer is not None:
+                self.ref_obs_normalizer.train()
+            if self.critic_ref_obs_normalizer is not None:
+                self.critic_ref_obs_normalizer.train()
 
     def eval_mode(self):
         self.alg.actor_critic.eval()
@@ -921,6 +972,10 @@ class OnPolicyRunnerMM:
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.critic_obs_normalizer.eval()
+            if self.ref_obs_normalizer is not None:
+                self.ref_obs_normalizer.eval()
+            if self.critic_ref_obs_normalizer is not None:
+                self.critic_ref_obs_normalizer.eval()
 
     def collect_dataset(self, num_episodes: int, save_path: str = None, max_steps_per_episode: int = None):
         """
@@ -1014,11 +1069,9 @@ class OnPolicyRunnerMM:
                 rewards = rewards.to(self.device)
                 dones = dones.to(self.device)
                 
-                # 更新 obs 归一化统计（如果使用）
-                if self.empirical_normalization:
-                    obs = self.obs_normalizer(obs)
-                    if ref_obs_tuple is not None and self.ref_obs_normalizer is not None:
-                        ref_obs_tuple = (self.ref_obs_normalizer(ref_obs_tuple[0]), ref_obs_tuple[1])
+                # Keep dataset observations raw.  The inference-policy wrapper
+                # owns normalization; normalizing here would feed the next
+                # action through the same normalizer a second time.
                 
                 current_rewards.append(rewards.cpu().numpy())
                 current_dones.append(dones.cpu().numpy())

@@ -310,17 +310,8 @@ class MultiModalMLPV2(nn.Module):
         
         return nn.Sequential(*layers)
     
-    def forward(self, obs: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            obs: Flattened observations (B, total_obs_dim)
-                 In IsaacLab format: [a_1, a_2, a_3, b_1, b_2, b_3, ...]
-        
-        Returns:
-            output: (B, output_size)
-        """
+    def encode(self, obs: torch.Tensor) -> torch.Tensor:
+        """Encode one flattened observation group without its output head."""
         if self.temporal_encoder is not None:
             # Extract temporal features
             temporal_features = self.temporal_encoder(obs)  # (B, encoder_output_dim)
@@ -343,11 +334,12 @@ class MultiModalMLPV2(nn.Module):
             # No history: direct pass-through
             concatenated = obs
         
-        # Pass through main MLP
-        features = self.main_mlp(concatenated)  # (B, hidden_dims[-1])
-        output = self.output_layer(features)  # (B, output_size)
-        
-        return output
+        return self.main_mlp(concatenated)
+
+    def forward(self, obs: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Encode observations and apply this branch's output head."""
+
+        return self.output_layer(self.encode(obs))
 
 
 class FusedMultiModalMLP(nn.Module):
@@ -370,6 +362,7 @@ class FusedMultiModalMLP(nn.Module):
         name: str = "fused_mlp",
         fuse_activation: bool = False,
         reorgnize_obs: bool = False,
+        joint_decoder_hidden_dims: Optional[list[int]] = None,
     ):
         super().__init__()
         self.reorgnize_obs = reorgnize_obs
@@ -418,6 +411,33 @@ class FusedMultiModalMLP(nn.Module):
                 )
             elif fusion_mode == "concat":
                 self.fusion_proj = nn.Linear(output_size * 2, output_size)
+            elif fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
+                # SONIC conditions its dynamics decoder jointly on encoded
+                # reference tokens and proprioception.  ``joint_decoder``
+                # combines two encoded branches, while
+                # ``sonic_joint_decoder`` keeps normalized proprioception raw
+                # at the fusion boundary, matching SONIC's token_flattened +
+                # proprioception decoder contract more closely.
+                decoder_dims = (
+                    list(joint_decoder_hidden_dims)
+                    if joint_decoder_hidden_dims
+                    else list(hidden_dims)
+                )
+                decoder_layers = []
+                if fusion_mode == "sonic_joint_decoder":
+                    decoder_input_dim = (
+                        self.main_net.total_obs_dim + hidden_dims[-1]
+                    )
+                else:
+                    decoder_input_dim = hidden_dims[-1] * 2
+                for decoder_dim in decoder_dims:
+                    decoder_layers.append(nn.Linear(decoder_input_dim, decoder_dim))
+                    if use_layer_norm:
+                        decoder_layers.append(nn.LayerNorm(decoder_dim))
+                    decoder_layers.append(self._get_activation(activation))
+                    decoder_input_dim = decoder_dim
+                decoder_layers.append(nn.Linear(decoder_input_dim, output_size))
+                self.joint_decoder = nn.Sequential(*decoder_layers)
         else:
             self.ref_net = None
             
@@ -504,34 +524,68 @@ class FusedMultiModalMLP(nn.Module):
             
         
         
-        main_output = self.main_net(observations)
+        if self.fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
+            if self.fusion_mode == "sonic_joint_decoder":
+                # The main branch remains the exact invalid-reference
+                # fallback, but its output head expects encoded features.
+                main_features = observations
+                main_output = self.main_net(observations)
+            else:
+                main_features = self.main_net.encode(observations)
+                main_output = self.main_net.output_layer(main_features)
+        else:
+            main_features = None
+            main_output = self.main_net(observations)
         
         if not self.has_ref or ref_observations is None:
             return main_output
         
         ref_obs, ref_mask = ref_observations
-        ref_output = self.ref_net(ref_obs)
-        
-        # Apply mask: only use ref_output where mask is True
-        if ref_mask is not None:
-            ref_mask = ref_mask.unsqueeze(-1).float()  # (B, 1)
-            ref_output = ref_output * ref_mask
+        if self.fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
+            ref_features = self.ref_net.encode(ref_obs)
+            if ref_mask is not None:
+                ref_mask_expanded = ref_mask.unsqueeze(-1).float()
+                ref_features = ref_features * ref_mask_expanded
+            else:
+                ref_mask_expanded = None
+            fused_output = self.joint_decoder(
+                torch.cat([main_features, ref_features], dim=-1)
+            )
+        else:
+            ref_output = self.ref_net(ref_obs)
+            ref_mask_expanded = (
+                ref_mask.unsqueeze(-1).float() if ref_mask is not None else None
+            )
         
         # Fuse main and ref outputs
         if self.fusion_mode == "gated":
             gate_input = torch.cat([main_output, ref_output], dim=-1)
             gate = self.gate(gate_input)
-            output = main_output * (1 - gate) + ref_output * gate
+            fused_output = main_output * (1 - gate) + ref_output * gate
         elif self.fusion_mode == "add":
-            output = main_output + ref_output
+            fused_output = main_output + ref_output
         elif self.fusion_mode == "concat":
             concat = torch.cat([main_output, ref_output], dim=-1)
-            output = self.fusion_proj(concat)
+            fused_output = self.fusion_proj(concat)
+        elif self.fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
+            pass
         else:
             raise ValueError(f"Unknown fusion_mode: {self.fusion_mode}")
-        
+
         if self.fuse_activation:
-            output = self.activation(output)
+            fused_output = self.activation(fused_output)
+
+        # An invalid reference must be an exact main-branch passthrough.  The
+        # old gated implementation zeroed ref_output before computing the gate
+        # and still attenuated main_output by (1 - gate).
+        if ref_mask_expanded is not None:
+            output = (
+                main_output * (1.0 - ref_mask_expanded)
+                + fused_output * ref_mask_expanded
+            )
+        else:
+            output = fused_output
+
         return output
 
 
@@ -551,12 +605,15 @@ class ActorCriticMLPV2(nn.Module):
         critic_hidden_dims: list[int] = [512, 256, 128],
         activation: str = "elu",
         init_noise_std: float = 1.0,
+        min_noise_std: Optional[float] = None,
+        max_noise_std: Optional[float] = None,
         noise_std_type: str = "scalar",
         history_length: int = 1,
         encoder_latent_dim: int = 128,
         encoder_compress_threshold: int = 32,
         use_layer_norm: bool = False,
         fusion_mode: str = "gated",  # How to fuse actor obs and ref_obs
+        joint_decoder_hidden_dims: Optional[list[int]] = None,
         load_dagger: bool = False,
         load_dagger_path: Optional[str] = None,
         load_actor_path: Optional[str] = None,
@@ -573,12 +630,16 @@ class ActorCriticMLPV2(nn.Module):
             critic_hidden_dims: Hidden layer dimensions for critic
             activation: Activation function
             init_noise_std: Initial standard deviation for action noise
+            min_noise_std: Optional lower bound applied to sampled-action std
+            max_noise_std: Optional upper bound applied to sampled-action std
             noise_std_type: "scalar" or "log"
             history_length: Length of history sequence
             encoder_latent_dim: Latent dimension for compressing large per-step features
             encoder_compress_threshold: Compress per-step features > this to latent_dim
             use_layer_norm: Whether to use LayerNorm
-            fusion_mode: How to fuse main and reference features ("gated", "add", "concat")
+            fusion_mode: How to fuse main and reference features.  The
+                ``sonic_joint_decoder`` mode encodes the reference and then
+                jointly decodes it with raw normalized proprioception.
             load_dagger: Whether to load dagger (teacher) model
             load_dagger_path: Path to dagger model weights
             load_actor_path: Path to pretrained actor weights
@@ -607,6 +668,7 @@ class ActorCriticMLPV2(nn.Module):
             encoder_compress_threshold=encoder_compress_threshold,
             use_layer_norm=use_layer_norm,
             fusion_mode=fusion_mode,
+            joint_decoder_hidden_dims=joint_decoder_hidden_dims,
             name="actor"
         )
         
@@ -638,11 +700,24 @@ class ActorCriticMLPV2(nn.Module):
             encoder_compress_threshold=encoder_compress_threshold,
             use_layer_norm=use_layer_norm,
             fusion_mode=fusion_mode,
+            joint_decoder_hidden_dims=joint_decoder_hidden_dims,
             name="critic"
         )
         
         # Action noise
         self.noise_std_type = noise_std_type
+        if min_noise_std is not None and min_noise_std <= 0.0:
+            raise ValueError("min_noise_std must be positive when specified")
+        if max_noise_std is not None and max_noise_std <= 0.0:
+            raise ValueError("max_noise_std must be positive when specified")
+        if (
+            min_noise_std is not None
+            and max_noise_std is not None
+            and min_noise_std > max_noise_std
+        ):
+            raise ValueError("min_noise_std cannot exceed max_noise_std")
+        self.min_noise_std = min_noise_std
+        self.max_noise_std = max_noise_std
         if noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
             if load_dagger:
@@ -705,6 +780,15 @@ class ActorCriticMLPV2(nn.Module):
     
     def reset(self, dones=None):
         pass
+
+    def _clamp_action_std(self, std: torch.Tensor) -> torch.Tensor:
+        if self.min_noise_std is None and self.max_noise_std is None:
+            return std
+        return torch.clamp(
+            std,
+            min=self.min_noise_std,
+            max=self.max_noise_std,
+        )
     
     def update_distribution(self, observations, ref_observations=None, **kwargs):
         """Update action distribution for actor"""
@@ -712,11 +796,13 @@ class ActorCriticMLPV2(nn.Module):
         
         # Set std
         if self.noise_std_type == "scalar":
-            std = self.std.expand_as(mean)
+            std = self.std
         elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)
+            std = torch.exp(self.log_std)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
+
+        std = self._clamp_action_std(std).expand_as(mean)
         
         self.distribution = Normal(mean, std)
     
@@ -727,11 +813,13 @@ class ActorCriticMLPV2(nn.Module):
         mean = self.actor_dagger(observations)
         
         if self.noise_std_type == "scalar":
-            std = self.std_dagger.expand_as(mean)
+            std = self.std_dagger
         elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std_dagger).expand_as(mean)
+            std = torch.exp(self.log_std_dagger)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
+
+        std = self._clamp_action_std(std).expand_as(mean)
         
         self.distribution_dagger = Normal(mean, std)
     
