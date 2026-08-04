@@ -212,6 +212,8 @@ class MMPPO:
         value_loss_coef=1.0,
         entropy_coef=0.0,
         learning_rate=1e-3,
+        actor_learning_rate: float | None = None,
+        critic_learning_rate: float | None = None,
         max_lr=1e-2,
         min_lr=1e-4,
         max_lr_after_certain_epoch=5e-3,
@@ -359,14 +361,24 @@ class MMPPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
         
-        self.learning_rate = learning_rate
+        self._uses_split_actor_critic_lr = (
+            actor_learning_rate is not None or critic_learning_rate is not None
+        )
+        self.learning_rate = (
+            learning_rate if actor_learning_rate is None else actor_learning_rate
+        )
+        self.critic_learning_rate = (
+            learning_rate if critic_learning_rate is None else critic_learning_rate
+        )
+        if self.learning_rate <= 0.0 or self.critic_learning_rate <= 0.0:
+            raise ValueError("actor and critic learning rates must be positive")
         self.max_lr = max_lr
         self.min_lr = min_lr
         self.max_lr_after_certain_epoch = max_lr_after_certain_epoch
         self.max_lr_restriction_epoch = max_lr_restriction_epoch
         self.min_lr_after_certain_epoch = min_lr_after_certain_epoch
         self.min_lr_restriction_epoch = min_lr_restriction_epoch
-        assert min_lr <= learning_rate <= max_lr, "learning_rate should be in range [min_lr, max_lr], and min_lr <= max_lr"
+        assert min_lr <= self.learning_rate <= max_lr, "actor learning rate should be in range [min_lr, max_lr], and min_lr <= max_lr"
         self.ref_action_idx = ref_action_idx
         self.teacher_coef = teacher_coef
         self.teacher_coef_range = teacher_coef_range
@@ -408,13 +420,39 @@ class MMPPO:
         self.actor_critic.to(self.device)
         self.storage = None  # initialized later
         is_log_std = self.actor_critic.noise_std_type == "log"
-        self.optimizer = optim.AdamW(
-            itertools.chain(
-                self.actor_critic.actor.parameters(),
-                self.actor_critic.critic.parameters(),
-                [] if fix_sigma else ([self.actor_critic.std] if not is_log_std else [self.actor_critic.log_std]),
+        actor_and_std_params = itertools.chain(
+            self.actor_critic.actor.parameters(),
+            []
+            if fix_sigma
+            else (
+                [self.actor_critic.std]
+                if not is_log_std
+                else [self.actor_critic.log_std]
             ),
-            lr=learning_rate) # Avoid optimizing dagger parameters if self.teacher_coef is None
+        )
+        if self._uses_split_actor_critic_lr:
+            self.optimizer = optim.AdamW(
+                [
+                    {
+                        "params": actor_and_std_params,
+                        "lr": self.learning_rate,
+                        "name": "actor",
+                    },
+                    {
+                        "params": self.actor_critic.critic.parameters(),
+                        "lr": self.critic_learning_rate,
+                        "name": "critic",
+                    },
+                ]
+            )
+        else:
+            self.optimizer = optim.AdamW(
+                itertools.chain(
+                    actor_and_std_params,
+                    self.actor_critic.critic.parameters(),
+                ),
+                lr=self.learning_rate,
+            )  # Avoid optimizing dagger parameters if teacher_coef is None.
         
         if load_std_state_dict_path is not None: # force replace optimizer's term for actor_critic.std or actor_critic.std with the one inside the state dict
             state_dict = torch.load(load_std_state_dict_path, map_location=self.device)
@@ -554,6 +592,18 @@ class MMPPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+
+    def _apply_adaptive_learning_rates(self) -> None:
+        """Apply KL-adapted actor LR without overwriting SONIC's critic LR."""
+
+        for param_group in self.optimizer.param_groups:
+            if (
+                self._uses_split_actor_critic_lr
+                and param_group.get("name") == "critic"
+            ):
+                param_group["lr"] = self.critic_learning_rate
+            else:
+                param_group["lr"] = self.learning_rate
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, actor_ref_obs_shape, critic_obs_shape, critic_ref_obs_shape, action_shape):
         if self.rnd:
@@ -870,8 +920,7 @@ class MMPPO:
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
                 
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = self.learning_rate
+                self._apply_adaptive_learning_rates()
                         
             elif self.schedule == "linear" or self.schedule == "cosine":
                 if self.is_multi_gpu:
@@ -879,10 +928,11 @@ class MMPPO:
                     torch.distributed.broadcast(lr_tensor, src=0)
                     self.learning_rate = lr_tensor.item()
                 self.lr_scheduler.step()
-                self.learning_rate = self.lr_scheduler.get_last_lr()[0]
-                # print(f"Updated learning rate to {self.learning_rate} at epoch {epoch}.")
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = self.learning_rate
+                scheduled_lrs = self.lr_scheduler.get_last_lr()
+                self.learning_rate = scheduled_lrs[0]
+                if self._uses_split_actor_critic_lr and len(scheduled_lrs) > 1:
+                    self.critic_learning_rate = scheduled_lrs[1]
+                # The scheduler has already updated every optimizer group.
 
             # Value function loss (always computed for critic training)
             if self.use_clipped_value_loss:

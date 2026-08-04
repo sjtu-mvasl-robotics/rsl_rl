@@ -342,6 +342,82 @@ class MultiModalMLPV2(nn.Module):
         return self.output_layer(self.encode(obs))
 
 
+class DirectConcatMLP(nn.Module):
+    """Direct MLP over normalized state and reference observations.
+
+    SONIC's critic is a single six-layer MLP over ``critic_obs`` rather than
+    two independent encoders followed by another decoder.  This module keeps
+    the local reference mask explicit while preserving that direct topology.
+    """
+
+    fusion_mode = "direct_concat"
+
+    def __init__(
+        self,
+        term_dict: dict[str, dict[str, int]],
+        ref_term_dict: Optional[dict[str, dict[str, int]]],
+        output_size: int,
+        hidden_dims: list[int],
+        activation: str,
+        use_layer_norm: bool,
+    ):
+        super().__init__()
+        self.state_input_dim = sum(next(iter(term_dict.values())).values())
+        self.reference_input_dim = (
+            sum(next(iter(ref_term_dict.values())).values())
+            if ref_term_dict and next(iter(ref_term_dict.values()))
+            else 0
+        )
+        activations = {
+            "elu": nn.ELU,
+            "relu": nn.ReLU,
+            "gelu": nn.GELU,
+            "tanh": nn.Tanh,
+            "silu": nn.SiLU,
+        }
+        activation_cls = activations.get(activation.lower())
+        if activation_cls is None:
+            raise ValueError(
+                f"Unknown activation: {activation}. "
+                f"Choose from {list(activations)}"
+            )
+
+        layers = []
+        input_dim = self.state_input_dim + self.reference_input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(activation_cls())
+            input_dim = hidden_dim
+        layers.append(nn.Linear(input_dim, output_size))
+        self.network = nn.Sequential(*layers)
+
+    def reset(self, dones: Optional[torch.Tensor] = None):
+        del dones
+
+    def forward(
+        self,
+        observations: torch.Tensor,
+        ref_observations: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del kwargs
+        if self.reference_input_dim == 0:
+            return self.network(observations)
+        if ref_observations is None:
+            reference = observations.new_zeros(
+                observations.shape[0], self.reference_input_dim
+            )
+        else:
+            reference, reference_mask = ref_observations
+            if reference_mask is not None:
+                reference = reference * reference_mask.unsqueeze(-1).to(
+                    reference.dtype
+                )
+        return self.network(torch.cat((observations, reference), dim=-1))
+
+
 class FusedMultiModalMLP(nn.Module):
     """
     Wrapper that combines main and ref MultiModalMLPV2 networks.
@@ -613,6 +689,7 @@ class ActorCriticMLPV2(nn.Module):
         encoder_compress_threshold: int = 32,
         use_layer_norm: bool = False,
         fusion_mode: str = "gated",  # How to fuse actor obs and ref_obs
+        critic_fusion_mode: Optional[str] = None,
         joint_decoder_hidden_dims: Optional[list[int]] = None,
         load_dagger: bool = False,
         load_dagger_path: Optional[str] = None,
@@ -688,21 +765,34 @@ class ActorCriticMLPV2(nn.Module):
         else:
             self.actor_dagger = None
         
-        # Critic network (fuses main + ref observations)
-        self.critic = FusedMultiModalMLP(
-            term_dict=critic_term_dict,
-            ref_term_dict=critic_ref_term_dict,
-            output_size=1,  # Value function outputs single value
-            hidden_dims=critic_hidden_dims,
-            activation=activation,
-            history_length=history_length,
-            encoder_latent_dim=encoder_latent_dim,
-            encoder_compress_threshold=encoder_compress_threshold,
-            use_layer_norm=use_layer_norm,
-            fusion_mode=fusion_mode,
-            joint_decoder_hidden_dims=joint_decoder_hidden_dims,
-            name="critic"
-        )
+        # SONIC uses a direct critic MLP while its actor encodes commands into
+        # tokens.  Keep the legacy shared fusion mode as the default so old
+        # checkpoints/configs remain loadable.
+        resolved_critic_fusion_mode = critic_fusion_mode or fusion_mode
+        if resolved_critic_fusion_mode == "direct_concat":
+            self.critic = DirectConcatMLP(
+                term_dict=critic_term_dict,
+                ref_term_dict=critic_ref_term_dict,
+                output_size=1,
+                hidden_dims=critic_hidden_dims,
+                activation=activation,
+                use_layer_norm=use_layer_norm,
+            )
+        else:
+            self.critic = FusedMultiModalMLP(
+                term_dict=critic_term_dict,
+                ref_term_dict=critic_ref_term_dict,
+                output_size=1,  # Value function outputs single value
+                hidden_dims=critic_hidden_dims,
+                activation=activation,
+                history_length=history_length,
+                encoder_latent_dim=encoder_latent_dim,
+                encoder_compress_threshold=encoder_compress_threshold,
+                use_layer_norm=use_layer_norm,
+                fusion_mode=resolved_critic_fusion_mode,
+                joint_decoder_hidden_dims=joint_decoder_hidden_dims,
+                name="critic"
+            )
         
         # Action noise
         self.noise_std_type = noise_std_type

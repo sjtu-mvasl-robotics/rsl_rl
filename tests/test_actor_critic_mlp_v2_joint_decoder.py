@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import torch
 
-from rsl_rl.modules.actor_critic_mlp_v2 import ActorCriticMLPV2, FusedMultiModalMLP
+from rsl_rl.modules.actor_critic_mlp_v2 import (
+    ActorCriticMLPV2,
+    DirectConcatMLP,
+    FusedMultiModalMLP,
+)
+from rsl_rl.algorithms.mmppo import MMPPO
 
 
 def _make_model(fusion_mode: str) -> FusedMultiModalMLP:
@@ -122,3 +127,78 @@ def test_action_noise_matches_sonic_clamp_contract():
     model.update_distribution(torch.randn(4, 5))
     expected = torch.tensor([0.001, 0.05, 0.5]).expand(4, 3)
     torch.testing.assert_close(model.action_std, expected)
+
+
+def test_direct_concat_critic_has_one_mlp_and_respects_reference_mask():
+    critic = DirectConcatMLP(
+        term_dict={"critic": {"state": 5}},
+        ref_term_dict={"critic": {"target": 7}},
+        output_size=1,
+        hidden_dims=[16, 8],
+        activation="silu",
+        use_layer_norm=False,
+    )
+    assert critic.network[0].in_features == 12
+    observations = torch.randn(4, 5, requires_grad=True)
+    references = torch.randn(4, 7, requires_grad=True)
+    mask = torch.tensor([True, False, True, False])
+    output = critic(observations, (references, mask))
+    output.sum().backward()
+    assert output.shape == (4, 1)
+    assert observations.grad is not None
+    assert references.grad is not None
+    torch.testing.assert_close(references.grad[~mask], torch.zeros_like(references.grad[~mask]))
+
+
+def test_actor_critic_can_use_sonic_actor_and_direct_critic_topologies():
+    model = ActorCriticMLPV2(
+        term_dict={"policy": {"state": 5}, "critic": {"state": 9}},
+        ref_term_dict={"policy": {"target": 7}, "critic": {"target": 11}},
+        num_actions=3,
+        actor_hidden_dims=[16, 8],
+        critic_hidden_dims=[32, 16, 8],
+        joint_decoder_hidden_dims=[16, 8],
+        fusion_mode="sonic_joint_decoder",
+        critic_fusion_mode="direct_concat",
+        activation="silu",
+    )
+    assert model.actor.fusion_mode == "sonic_joint_decoder"
+    assert model.critic.fusion_mode == "direct_concat"
+    assert model.critic.network[0].in_features == 20
+
+
+def test_mmppo_preserves_separate_sonic_actor_and_critic_learning_rates():
+    model = ActorCriticMLPV2(
+        term_dict={"policy": {"state": 5}, "critic": {"state": 9}},
+        ref_term_dict={"policy": {"target": 7}, "critic": {"target": 11}},
+        num_actions=3,
+        actor_hidden_dims=[16, 8],
+        critic_hidden_dims=[32, 16, 8],
+        joint_decoder_hidden_dims=[16, 8],
+        fusion_mode="sonic_joint_decoder",
+        critic_fusion_mode="direct_concat",
+        activation="silu",
+    )
+    algorithm = MMPPO(
+        model,
+        learning_rate=2.0e-5,
+        actor_learning_rate=2.0e-5,
+        critic_learning_rate=1.0e-3,
+        min_lr=1.0e-5,
+        max_lr=2.0e-4,
+        desired_kl=0.01,
+        schedule="adaptive",
+    )
+    learning_rates = {
+        group.get("name"): group["lr"]
+        for group in algorithm.optimizer.param_groups
+    }
+    assert learning_rates == {"actor": 2.0e-5, "critic": 1.0e-3}
+
+    algorithm.learning_rate = 3.0e-5
+    algorithm._apply_adaptive_learning_rates()
+    learning_rates = {
+        group.get("name"): group["lr"]
+        for group in algorithm.optimizer.param_groups
+    }
+    assert learning_rates == {"actor": 3.0e-5, "critic": 1.0e-3}
