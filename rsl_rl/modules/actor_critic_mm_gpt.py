@@ -462,6 +462,9 @@ class MMGPT(nn.Module):
         # HINT: The following parameters matters **SIGNIFICANTLY** to the performance for allowing temporal prediction features!
         pred_obs_term_names: Optional[List[str]] = None,
         pred_obs_term_weights: Optional[List[float]] = None,
+        aux_backbone_grad: bool = True,
+        dreamer_gradient_mode: str = "backbone_only",
+        score_prediction_enabled: bool = False,
         apply_mlp_residual = False,
         # some not pretty fix
         default_joint_pos: Optional[torch.Tensor] = None,
@@ -520,6 +523,17 @@ class MMGPT(nn.Module):
             raise ValueError("For MMGPT to work normally, please set `last_action` term in observation terms, and name it as `actions`.")        
         self.pred_obs_term_names = pred_obs_term_names
         self.pred_obs_term_weights = pred_obs_term_weights
+        self.aux_backbone_grad = bool(aux_backbone_grad)
+        if dreamer_gradient_mode not in {
+            "backbone_only",
+            "backbone_and_action_head",
+        }:
+            raise ValueError(
+                "dreamer_gradient_mode must be 'backbone_only' or "
+                f"'backbone_and_action_head', got {dreamer_gradient_mode!r}"
+            )
+        self.dreamer_gradient_mode = dreamer_gradient_mode
+        self.score_prediction_enabled = bool(score_prediction_enabled)
         if self.pred_obs_term_names is not None and len(self.pred_obs_term_names) > 0:
             assert self.pred_obs_term_weights is not None and len(self.pred_obs_term_weights) == len(self.pred_obs_term_names), "pred_obs_term_weights should be provided with the same length as pred_obs_term_names."
 
@@ -893,6 +907,11 @@ class MMGPT(nn.Module):
             for obs_term_slice, aux_head, weight in zip(self.obs_indices, self.aux_heads, self.pred_obs_term_weights):
                 target = obs[:, :, obs_term_slice[0]:obs_term_slice[1]] # [T_in, B, dim]
                 pred_in = upsampled_out[:-1]  # [T_in-1, B, D]
+                if not self.aux_backbone_grad:
+                    # Head-only control: retain supervised prediction-head
+                    # learning while preventing the future target from
+                    # shaping the shared policy representation.
+                    pred_in = pred_in.detach()
                 # FiLM modulation
                 pred_in = gamma * pred_in + beta  # [T_in-1, B, D]
                 pred = aux_head(pred_in) # [T_in - 1, B, dim]
@@ -909,13 +928,18 @@ class MMGPT(nn.Module):
         else:
             self.aux_loss = 0.0
         
-        pred_actions = self.fc(upsampled_out.detach()) # [T_in, B, dim_out]
+        # PPO must reach both the action decoder and the shared MMGPT
+        # backbone.  Auxiliary gradient routing is controlled independently
+        # above and must never detach the policy path.
+        pred_actions = self.fc(upsampled_out) # [T_in, B, dim_out]
         
         if compute_dreamer_reward:
             # dreamer reward computation
             cur_obs_latent = res_obs_emb[:-1, :, :]  # [T_in-1, B, dim_model]
             next_obs_latent = res_obs_emb[1:, :, :]  # [T_in-1, B, dim_model]
-            cur_actions = pred_actions[:-1, :, :]  # [T_in-1, B, dim_out]
+            # Score prediction is currently diagnostic-only.  Do not let its
+            # untrained head alter the action decoder if it is enabled later.
+            cur_actions = pred_actions[:-1, :, :].detach()  # [T_in-1, B, dim_out]
             dreamer_input = torch.cat([cur_obs_latent, cur_actions, next_obs_latent], dim=-1)  # [T_in-1, B, dim_model*2 + dim_out]
             dreamer_rewards = self.dreamer_reward_head(dreamer_input).squeeze(-1)  # [T_in-1, B]
             # mask
@@ -940,6 +964,10 @@ class MMGPT(nn.Module):
             # extract target actions from ref_obs
             cur_latent = upsampled_out[-1, :, :]  # [B, dim_out]
             cur_action = pred_actions[-1, :, :]
+            if self.dreamer_gradient_mode == "backbone_only":
+                # The imagined prediction error trains the representation via
+                # cur_latent, but treats the already-decoded action as fixed.
+                cur_action = cur_action.detach()
             # no parameter update for aux head
             joint_pred_aux_idx = self.obs_term_names.index('joint_pos')
             film_params = {k: v.detach() for k, v in self.action_film.named_parameters()}
@@ -1051,7 +1079,16 @@ class MMGPT(nn.Module):
         """
         is_batch_mode = masks is not None
         if is_batch_mode:
-            return self._forward_batch(obs, ref_obs, masks, memory=memory, unpad_output=unpad_output, compute_aux_loss=True, compute_dreamer_loss=True, compute_dreamer_reward=True) # compute aux loss only in batch mode
+            return self._forward_batch(
+                obs,
+                ref_obs,
+                masks,
+                memory=memory,
+                unpad_output=unpad_output,
+                compute_aux_loss=True,
+                compute_dreamer_loss=True,
+                compute_dreamer_reward=self.score_prediction_enabled,
+            )
         else:
             return self._forward_inference(obs, ref_obs)
         

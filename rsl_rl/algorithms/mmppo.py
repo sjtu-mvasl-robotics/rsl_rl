@@ -268,6 +268,10 @@ class MMPPO:
         # Teacher replay buffer parameters
         replay_buffer_size: int = 0,  # Number of past rollouts to keep for replay (0 = disabled)
         replay_imitation_epochs: int = 1,  # Extra imitation passes over replay data per update
+        # MMGPT self-supervision coefficients.  Keep these independent from
+        # PPO so zero-valued controls retain the exact same network shape.
+        aux_loss_coef: float = 1.0,
+        dreamer_loss_coef: float = 1.0,
 
 
         **kwargs # reserved for future use
@@ -396,6 +400,10 @@ class MMPPO:
         self.teacher_supervising_intervals = teacher_supervising_intervals
         self.teacher_updating_intervals = teacher_updating_intervals
         self.teacher_apply_interval = teacher_apply_interval
+        self.aux_loss_coef = float(aux_loss_coef)
+        self.dreamer_loss_coef = float(dreamer_loss_coef)
+        if self.aux_loss_coef < 0.0 or self.dreamer_loss_coef < 0.0:
+            raise ValueError("MMGPT auxiliary loss coefficients must be non-negative")
         
         # Track current training stage
         self.current_stage = 1  # 1: teacher-only, 2: hybrid, 3: student
@@ -794,6 +802,8 @@ class MMPPO:
         if is_mmgpt:
             mean_aux_loss = 0.0
             mean_dreamer_loss = 0.0
+            mean_weighted_aux_loss = 0.0
+            mean_weighted_dreamer_loss = 0.0
 
         if self.rnd:
             mean_rnd_loss = 0.0
@@ -993,11 +1003,15 @@ class MMPPO:
                 
             if is_mmgpt:
                 aux_loss = self.actor_critic.actor_aux_loss
-                loss = loss + aux_loss
+                weighted_aux_loss = self.aux_loss_coef * aux_loss
+                loss = loss + weighted_aux_loss
                 mean_aux_loss += aux_loss.item()
+                mean_weighted_aux_loss += weighted_aux_loss.item()
                 dreamer_loss = self.actor_critic.actor_dreamer_loss
-                loss = loss + dreamer_loss
+                weighted_dreamer_loss = self.dreamer_loss_coef * dreamer_loss
+                loss = loss + weighted_dreamer_loss
                 mean_dreamer_loss += dreamer_loss.item()
+                mean_weighted_dreamer_loss += weighted_dreamer_loss.item()
 
             # Direction 1: Privilege encoder regularization (ASAP-style bidirectional alignment)
             # Constrains privilege encoder to stay close to history encoder (prevents over-reliance on privileged info)
@@ -1306,6 +1320,9 @@ class MMPPO:
         mean_actor_grad_norm /= num_updates
         if is_mmgpt:
             mean_aux_loss /= num_updates
+            mean_dreamer_loss /= num_updates
+            mean_weighted_aux_loss /= num_updates
+            mean_weighted_dreamer_loss /= num_updates
         if self.amp:
             mean_amp_loss /= num_updates
             mean_gradient_penalty /= num_updates
@@ -1356,6 +1373,10 @@ class MMPPO:
         if is_mmgpt:
             loss_dict["mean_aux_loss"] = mean_aux_loss
             loss_dict["mean_dreamer_loss"] = mean_dreamer_loss
+            loss_dict["mean_weighted_aux_loss"] = mean_weighted_aux_loss
+            loss_dict["mean_weighted_dreamer_loss"] = mean_weighted_dreamer_loss
+            loss_dict["aux_loss_coef"] = self.aux_loss_coef
+            loss_dict["dreamer_loss_coef"] = self.dreamer_loss_coef
         if self.rnd:
             loss_dict["mean_rnd_loss"] = mean_rnd_loss
         if self.symmetry:
