@@ -214,6 +214,7 @@ class MMPPO:
         learning_rate=1e-3,
         actor_learning_rate: float | None = None,
         critic_learning_rate: float | None = None,
+        weight_decay: float = 1.0e-2,
         max_lr=1e-2,
         min_lr=1e-4,
         max_lr_after_certain_epoch=5e-3,
@@ -372,6 +373,9 @@ class MMPPO:
         )
         if self.learning_rate <= 0.0 or self.critic_learning_rate <= 0.0:
             raise ValueError("actor and critic learning rates must be positive")
+        if weight_decay < 0.0:
+            raise ValueError("weight_decay must be non-negative")
+        self.weight_decay = float(weight_decay)
         self.max_lr = max_lr
         self.min_lr = min_lr
         self.max_lr_after_certain_epoch = max_lr_after_certain_epoch
@@ -443,7 +447,8 @@ class MMPPO:
                         "lr": self.critic_learning_rate,
                         "name": "critic",
                     },
-                ]
+                ],
+                weight_decay=self.weight_decay,
             )
         else:
             self.optimizer = optim.AdamW(
@@ -452,6 +457,7 @@ class MMPPO:
                     self.actor_critic.critic.parameters(),
                 ),
                 lr=self.learning_rate,
+                weight_decay=self.weight_decay,
             )  # Avoid optimizing dagger parameters if teacher_coef is None.
         
         if load_std_state_dict_path is not None: # force replace optimizer's term for actor_critic.std or actor_critic.std with the one inside the state dict

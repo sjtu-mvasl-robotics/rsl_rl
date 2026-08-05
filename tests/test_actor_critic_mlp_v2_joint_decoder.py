@@ -227,6 +227,48 @@ def test_mmppo_preserves_separate_sonic_actor_and_critic_learning_rates():
     assert learning_rates == {"actor": 3.0e-5, "critic": 1.0e-3}
 
 
+def test_mmppo_supports_sonic_effective_single_adamw_group():
+    model = ActorCriticMLPV2(
+        term_dict={"policy": {"state": 5}, "critic": {"state": 9}},
+        ref_term_dict={"policy": {"target": 7}, "critic": {"target": 11}},
+        num_actions=3,
+        actor_hidden_dims=[16, 8],
+        critic_hidden_dims=[32, 16, 8],
+        joint_decoder_hidden_dims=[16, 8],
+        fusion_mode="sonic_joint_decoder",
+        critic_fusion_mode="direct_concat_ref_first",
+        activation="silu",
+    )
+    algorithm = MMPPO(
+        model,
+        learning_rate=2.0e-5,
+        actor_learning_rate=None,
+        critic_learning_rate=None,
+        weight_decay=0.0,
+        normalize_advantage_per_mini_batch=False,
+        min_lr=1.0e-5,
+        max_lr=2.0e-4,
+        desired_kl=0.01,
+        schedule="adaptive",
+    )
+
+    assert algorithm._uses_split_actor_critic_lr is False
+    assert algorithm.normalize_advantage_per_mini_batch is False
+    assert len(algorithm.optimizer.param_groups) == 1
+    group = algorithm.optimizer.param_groups[0]
+    assert group["lr"] == 2.0e-5
+    assert group["weight_decay"] == 0.0
+    optimized_parameter_count = sum(
+        parameter.numel() for parameter in group["params"]
+    )
+    expected_parameter_count = (
+        sum(parameter.numel() for parameter in model.actor.parameters())
+        + sum(parameter.numel() for parameter in model.critic.parameters())
+        + model.std.numel()
+    )
+    assert optimized_parameter_count == expected_parameter_count
+
+
 def test_mmppo_entropy_loss_updates_trainable_sonic_std():
     model = ActorCriticMLPV2(
         term_dict={"policy": {"state": 2}, "critic": {"state": 2}},
