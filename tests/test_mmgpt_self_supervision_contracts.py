@@ -5,6 +5,7 @@ import torch
 
 from rsl_rl.algorithms.mmppo import MMPPO
 from rsl_rl.modules.actor_critic_mm_gpt import MMGPT
+from rsl_rl.modules.actor_critic_mlp_v2 import FusedMultiModalMLP
 
 
 _TERM_DIMS = {
@@ -135,3 +136,35 @@ def test_mmppo_scales_and_averages_both_mmgpt_losses():
     assert "weighted_dreamer_loss = self.dreamer_loss_coef * dreamer_loss" in source
     assert "mean_aux_loss /= num_updates" in source
     assert "mean_dreamer_loss /= num_updates" in source
+
+
+def test_single_frame_privileged_critic_has_scalar_value_per_environment():
+    critic = FusedMultiModalMLP(
+        term_dict={"critic": {"privileged_state": 5}},
+        ref_term_dict={"critic": {"privileged_reference": 3}},
+        output_size=1,
+        hidden_dims=[8],
+        activation="elu",
+        history_length=1,
+        encoder_latent_dim=4,
+        encoder_compress_threshold=32,
+        use_layer_norm=False,
+        fusion_mode="gated",
+        reorgnize_obs=True,
+    )
+    observations = torch.randn(4, 5)
+    references = torch.randn(4, 3)
+    reference_mask = torch.ones(4, dtype=torch.bool)
+
+    inference_values = critic(
+        observations,
+        (references, reference_mask),
+    )
+    critic.reset()
+    batch_values = critic(
+        observations.unsqueeze(0),
+        (references.unsqueeze(0), reference_mask.unsqueeze(0)),
+    )
+
+    assert inference_values.shape == (4, 1)
+    assert batch_values.shape == (4, 1)

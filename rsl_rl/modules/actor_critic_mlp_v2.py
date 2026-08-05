@@ -625,6 +625,19 @@ class FusedMultiModalMLP(nn.Module):
             else:
                 observations = observations.permute(1,0,2)  # (B, history_length, obs_dim)
                 ref_observations = None if ref_observations is None else (ref_observations[0].permute(1,0,2), ref_observations[1][-1])
+
+            # A one-frame critic is non-recurrent at this boundary.  Keeping a
+            # singleton history axis makes its value shape (B, 1, 1), which
+            # then broadcasts against PPO rewards/returns instead of matching
+            # their (B, 1) contract.  Remove only an actual singleton temporal
+            # axis; multi-frame actor/critic histories remain unchanged.
+            if observations.ndim == 3 and observations.shape[1] == 1:
+                observations = observations[:, 0, :]
+            if ref_observations is not None:
+                ref_obs, ref_mask = ref_observations
+                if ref_obs.ndim == 3 and ref_obs.shape[1] == 1:
+                    ref_obs = ref_obs[:, 0, :]
+                ref_observations = (ref_obs, ref_mask)
             
         
         
