@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import inspect
+
 import torch
+from torch import nn
 
 from rsl_rl.modules.actor_critic_mlp_v2 import (
     ActorCriticMLPV2,
@@ -150,6 +153,26 @@ def test_direct_concat_critic_has_one_mlp_and_respects_reference_mask():
     torch.testing.assert_close(references.grad[~mask], torch.zeros_like(references.grad[~mask]))
 
 
+def test_sonic_direct_concat_critic_can_preserve_reference_first_order():
+    critic = DirectConcatMLP(
+        term_dict={"critic": {"state": 2}},
+        ref_term_dict={"critic": {"reference": 2}},
+        output_size=1,
+        hidden_dims=[],
+        activation="silu",
+        use_layer_norm=False,
+        reference_first=True,
+    )
+    critic.network = nn.Identity()
+
+    state = torch.tensor([[1.0, 2.0]])
+    reference = torch.tensor([[3.0, 4.0]])
+    output = critic(state, (reference, torch.tensor([True])))
+
+    torch.testing.assert_close(output, torch.tensor([[3.0, 4.0, 1.0, 2.0]]))
+    assert critic.fusion_mode == "direct_concat_ref_first"
+
+
 def test_actor_critic_can_use_sonic_actor_and_direct_critic_topologies():
     model = ActorCriticMLPV2(
         term_dict={"policy": {"state": 5}, "critic": {"state": 9}},
@@ -202,3 +225,59 @@ def test_mmppo_preserves_separate_sonic_actor_and_critic_learning_rates():
         for group in algorithm.optimizer.param_groups
     }
     assert learning_rates == {"actor": 3.0e-5, "critic": 1.0e-3}
+
+
+def test_mmppo_entropy_loss_updates_trainable_sonic_std():
+    model = ActorCriticMLPV2(
+        term_dict={"policy": {"state": 2}, "critic": {"state": 2}},
+        ref_term_dict={
+            "policy": {"command": 2},
+            "critic": {"command": 2},
+        },
+        num_actions=2,
+        actor_hidden_dims=[4],
+        critic_hidden_dims=[4],
+        activation="silu",
+        init_noise_std=0.05,
+        min_noise_std=0.001,
+        max_noise_std=0.5,
+        history_length=1,
+        fusion_mode="concat",
+        critic_fusion_mode="direct_concat_ref_first",
+    )
+    algorithm = MMPPO(
+        model,
+        entropy_coef=1.0e-2,
+        learning_rate=1.0e-2,
+        actor_learning_rate=1.0e-2,
+        critic_learning_rate=1.0e-2,
+        min_lr=1.0e-5,
+        max_lr=1.0,
+        fix_sigma=False,
+    )
+
+    optimized_parameters = [
+        parameter
+        for group in algorithm.optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    assert any(parameter is model.std for parameter in optimized_parameters)
+    assert algorithm.entropy_coef == 1.0e-2
+    assert "- self.entropy_coef * entropy_batch.mean()" in inspect.getsource(
+        MMPPO.update
+    )
+
+    state = torch.zeros(8, 2)
+    reference = torch.zeros(8, 2)
+    model.update_distribution(
+        state, (reference, torch.ones(8, dtype=torch.bool))
+    )
+    before = model.std.detach().clone()
+    entropy_loss = -algorithm.entropy_coef * model.entropy.mean()
+    algorithm.optimizer.zero_grad()
+    entropy_loss.backward()
+
+    assert model.std.grad is not None
+    assert torch.all(model.std.grad < 0.0)
+    algorithm.optimizer.step()
+    assert torch.all(model.std.detach() > before)
