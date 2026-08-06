@@ -360,8 +360,13 @@ class DirectConcatMLP(nn.Module):
         hidden_dims: list[int],
         activation: str,
         use_layer_norm: bool,
+        reference_first: bool = False,
     ):
         super().__init__()
+        self.reference_first = reference_first
+        self.fusion_mode = (
+            "direct_concat_ref_first" if reference_first else "direct_concat"
+        )
         self.state_input_dim = sum(next(iter(term_dict.values())).values())
         self.reference_input_dim = (
             sum(next(iter(ref_term_dict.values())).values())
@@ -415,7 +420,12 @@ class DirectConcatMLP(nn.Module):
                 reference = reference * reference_mask.unsqueeze(-1).to(
                     reference.dtype
                 )
-        return self.network(torch.cat((observations, reference), dim=-1))
+        inputs = (
+            torch.cat((reference, observations), dim=-1)
+            if self.reference_first
+            else torch.cat((observations, reference), dim=-1)
+        )
+        return self.network(inputs)
 
 
 class FusedMultiModalMLP(nn.Module):
@@ -820,7 +830,10 @@ class ActorCriticMLPV2(nn.Module):
         # tokens.  Keep the legacy shared fusion mode as the default so old
         # checkpoints/configs remain loadable.
         resolved_critic_fusion_mode = critic_fusion_mode or fusion_mode
-        if resolved_critic_fusion_mode == "direct_concat":
+        if resolved_critic_fusion_mode in (
+            "direct_concat",
+            "direct_concat_ref_first",
+        ):
             self.critic = DirectConcatMLP(
                 term_dict=critic_term_dict,
                 ref_term_dict=critic_ref_term_dict,
@@ -828,6 +841,9 @@ class ActorCriticMLPV2(nn.Module):
                 hidden_dims=critic_hidden_dims,
                 activation=activation,
                 use_layer_norm=use_layer_norm,
+                reference_first=(
+                    resolved_critic_fusion_mode == "direct_concat_ref_first"
+                ),
             )
         else:
             self.critic = FusedMultiModalMLP(
