@@ -39,7 +39,23 @@ class RolloutStorageMM:
         def clear(self):
             self.__init__()
 
-    def __init__(self, training_type, num_envs, num_transitions_per_env, obs_shape, ref_obs_shape, privileged_obs_shape, privileged_ref_obs_shape, actions_shape, apply_dagger_actions = False, rnd_state_shape = None, amp_cfg = None, device="cpu"):
+    def __init__(
+        self,
+        training_type,
+        num_envs,
+        num_transitions_per_env,
+        obs_shape,
+        ref_obs_shape,
+        privileged_obs_shape,
+        privileged_ref_obs_shape,
+        actions_shape,
+        apply_dagger_actions=False,
+        rnd_state_shape=None,
+        amp_cfg=None,
+        device="cpu",
+        actor_history_length=1,
+        critic_history_length=1,
+    ):
         self.training_type = training_type
         self.device = device
         self.num_transitions_per_env = num_transitions_per_env
@@ -50,6 +66,12 @@ class RolloutStorageMM:
         self.actions_shape = actions_shape
         self.rnd_state_shape = rnd_state_shape
         self.amp_cfg = amp_cfg
+        self.actor_history_length = int(actor_history_length)
+        self.critic_history_length = int(critic_history_length)
+        if self.actor_history_length < 1:
+            raise ValueError("actor_history_length must be at least 1")
+        if self.critic_history_length < 1:
+            raise ValueError("critic_history_length must be at least 1")
         # backbone_input_dim is the per-timestep observation dim; amp_net input = backbone_input_dim * amp_history_len
         self.amp_shape = amp_cfg["net_cfg"]["backbone_input_dim"] if amp_cfg is not None else None
         self.amp_history_length = amp_cfg["net_cfg"]["amp_history_length"] if amp_cfg is not None else None
@@ -113,6 +135,12 @@ class RolloutStorageMM:
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
+
+        # A rollout boundary is not necessarily an episode boundary. Keep the
+        # raw prefix needed to reconstruct the first history windows of the
+        # next rollout under the current network parameters. Episode boundaries
+        # are applied later from the carried done flags.
+        self._init_history_prefixes()
 
         # rnn
         self.saved_hidden_states_a = None
@@ -178,7 +206,149 @@ class RolloutStorageMM:
             self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
             self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
 
+    def _init_history_prefixes(self):
+        actor_prefix_len = self.actor_history_length - 1
+        critic_prefix_len = self.critic_history_length - 1
+
+        def zeros_like_sequence(sequence, prefix_len, *, dtype=None):
+            if prefix_len == 0 or sequence is None:
+                return None
+            shape = (prefix_len, *sequence.shape[1:])
+            return torch.zeros(
+                shape,
+                device=self.device,
+                dtype=sequence.dtype if dtype is None else dtype,
+            )
+
+        self.actor_history_prefix_observations = zeros_like_sequence(
+            self.observations, actor_prefix_len
+        )
+        self.actor_history_prefix_reference_observations = zeros_like_sequence(
+            self.reference_observations, actor_prefix_len
+        )
+        self.actor_history_prefix_reference_masks = zeros_like_sequence(
+            self.reference_observations_mask,
+            actor_prefix_len,
+            dtype=torch.bool,
+        )
+        self.actor_history_prefix_dones = zeros_like_sequence(
+            self.dones, actor_prefix_len
+        )
+        self.actor_history_prefix_valid = (
+            torch.zeros(
+                actor_prefix_len,
+                self.num_envs,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if actor_prefix_len > 0
+            else None
+        )
+
+        critic_observations = (
+            self.privileged_observations
+            if self.privileged_observations is not None
+            else self.observations
+        )
+        critic_reference_observations = (
+            self.privileged_reference_observations
+            if self.privileged_reference_observations is not None
+            else self.reference_observations
+        )
+        critic_reference_masks = (
+            self.privileged_reference_observations_mask
+            if self.privileged_reference_observations_mask is not None
+            else self.reference_observations_mask
+        )
+        self.critic_history_prefix_observations = zeros_like_sequence(
+            critic_observations, critic_prefix_len
+        )
+        self.critic_history_prefix_reference_observations = zeros_like_sequence(
+            critic_reference_observations, critic_prefix_len
+        )
+        self.critic_history_prefix_reference_masks = zeros_like_sequence(
+            critic_reference_masks,
+            critic_prefix_len,
+            dtype=torch.bool,
+        )
+        self.critic_history_prefix_dones = zeros_like_sequence(
+            self.dones, critic_prefix_len
+        )
+        self.critic_history_prefix_valid = (
+            torch.zeros(
+                critic_prefix_len,
+                self.num_envs,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if critic_prefix_len > 0
+            else None
+        )
+
+    @staticmethod
+    def _carry_prefix(prefix, current, num_current):
+        if prefix is None:
+            return
+        if current is None:
+            raise ValueError("cannot carry a history prefix from a missing sequence")
+        combined = torch.cat((prefix, current[:num_current]), dim=0)
+        prefix.copy_(combined[-prefix.shape[0] :])
+
+    def _carry_history_prefixes(self):
+        if self.step == 0:
+            return
+
+        current_valid = torch.ones(
+            self.step,
+            self.num_envs,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        critic_observations = (
+            self.privileged_observations
+            if self.privileged_observations is not None
+            else self.observations
+        )
+        critic_reference_observations = (
+            self.privileged_reference_observations
+            if self.privileged_reference_observations is not None
+            else self.reference_observations
+        )
+        critic_reference_masks = (
+            self.privileged_reference_observations_mask
+            if self.privileged_reference_observations_mask is not None
+            else self.reference_observations_mask
+        )
+
+        for prefix, current in (
+            (self.actor_history_prefix_observations, self.observations),
+            (
+                self.actor_history_prefix_reference_observations,
+                self.reference_observations,
+            ),
+            (
+                self.actor_history_prefix_reference_masks,
+                self.reference_observations_mask,
+            ),
+            (self.actor_history_prefix_dones, self.dones),
+            (self.actor_history_prefix_valid, current_valid),
+            (self.critic_history_prefix_observations, critic_observations),
+            (
+                self.critic_history_prefix_reference_observations,
+                critic_reference_observations,
+            ),
+            (
+                self.critic_history_prefix_reference_masks,
+                critic_reference_masks,
+            ),
+            (self.critic_history_prefix_dones, self.dones),
+            (self.critic_history_prefix_valid, current_valid),
+        ):
+            if prefix is not None:
+                self._carry_prefix(prefix, current, self.step)
+
     def clear(self):
+        self._carry_history_prefixes()
         self.step = 0
 
     def compute_returns(self, last_values, gamma, lam, normalize_advantage: bool = True):
@@ -327,7 +497,14 @@ class RolloutStorageMM:
                     None,
                 ), None, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask
 
-    def _create_obs_buffer_slice(self, obs_sequence, idx, dones_sequence):
+    def _create_obs_buffer_slice(
+        self,
+        obs_sequence,
+        idx,
+        dones_sequence,
+        num_steps_per_env=None,
+        sequence_valid=None,
+    ):
         """
         Create a special obs buffer slice for buffer_mini_batch_generator.
         Optimized version using PyTorch parallel operations instead of loops.
@@ -338,16 +515,22 @@ class RolloutStorageMM:
             dones_sequence: Flattened dones sequence of shape (total_steps, 1) 
             num_steps_per_env: Number of steps to look back per environment
             num_envs: Number of environments
+            sequence_valid: Optional flattened mask marking physically present
+                prefix/current observations.
             
         Returns:
             obs_buffer: Buffer of shape (num_steps_per_env, mini_batch_size, *obs_shape)
             mask: Mask of shape (num_steps_per_env, mini_batch_size) indicating valid entries
         """
-        num_steps_per_env = self.num_transitions_per_env
+        num_steps_per_env = (
+            self.actor_history_length
+            if num_steps_per_env is None
+            else int(num_steps_per_env)
+        )
+        if num_steps_per_env < 1:
+            raise ValueError("num_steps_per_env must be at least 1")
         num_envs = self.num_envs
         device = obs_sequence.device
-        obs_shape = obs_sequence.shape[1:]
-        mini_batch_size = idx.shape[0]
         
         # Flatten dones for easier indexing
         dones_flat = dones_sequence.squeeze(-1) if dones_sequence.dim() > 1 else dones_sequence
@@ -368,14 +551,20 @@ class RolloutStorageMM:
         
         # Clamp indices to valid range to avoid indexing errors
         clamped_indices = torch.clamp(target_indices, 0, obs_sequence.shape[0] - 1)
+
+        if sequence_valid is not None:
+            sequence_valid = sequence_valid.reshape(-1).bool()
+            if sequence_valid.shape[0] != obs_sequence.shape[0]:
+                raise ValueError(
+                    "sequence_valid must match flattened observation length, "
+                    f"got {sequence_valid.shape[0]} and {obs_sequence.shape[0]}"
+                )
+            valid_mask = valid_mask & sequence_valid[clamped_indices]
         
         # Gather observations using advanced indexing
         # obs_sequence: (total_steps, *obs_shape)
         # clamped_indices: (num_steps_per_env, mini_batch_size)
         obs_buffer = obs_sequence[clamped_indices]  # (num_steps_per_env, mini_batch_size, *obs_shape)
-        
-        # Zero out invalid entries
-        obs_buffer = obs_buffer * valid_mask.unsqueeze(-1).expand_as(obs_buffer)
         
         # Apply done masking
         # Get dones for all target indices
@@ -386,16 +575,22 @@ class RolloutStorageMM:
         # We need to find the last True value in each column (batch sample)
         # First, create a mask for done positions
         done_positions = dones_buffer.bool()  # (num_steps_per_env, mini_batch_size)
+        # dones[t] is observed after taking the action from obs[t]. It cuts the
+        # edge between obs[t] and obs[t + 1], but must not remove obs[t] when
+        # recomputing that transition's own action/log-probability.
+        done_positions[-1] = False
         
         # For each batch sample, find the latest done step
         # We'll use a clever approach: multiply done positions by step indices and take max
         step_indices = torch.arange(num_steps_per_env, device=device).unsqueeze(1)  # (num_steps_per_env, 1)
-        done_step_indices = done_positions.float() * step_indices.float()  # (num_steps_per_env, mini_batch_size)
-        
+        done_step_indices = torch.where(
+            done_positions,
+            step_indices.expand_as(done_positions),
+            -torch.ones_like(done_positions, dtype=torch.long),
+        )
+
         # Get the latest done step for each batch sample (-1 if no done found)
-        latest_done_steps, _ = torch.max(done_step_indices, dim=0)  # (mini_batch_size,)
-        has_done = torch.any(done_positions, dim=0)  # (mini_batch_size,)
-        latest_done_steps = torch.where(has_done, latest_done_steps, -1)  # Set to -1 where no done
+        latest_done_steps = done_step_indices.max(dim=0).values
         
         # Create done masking
         # For each batch sample, mask out steps from 0 to latest_done_step (inclusive)
@@ -405,18 +600,20 @@ class RolloutStorageMM:
         # Create mask: False where step <= latest_done_step, True otherwise
         done_mask = step_range > latest_done_expanded  # (num_steps_per_env, mini_batch_size)
         
-        # Where there's no done (latest_done_steps == -1), all steps should be True
-        no_done_mask = latest_done_steps == -1  # (mini_batch_size,)
-        done_mask = torch.where(no_done_mask.unsqueeze(0), True, done_mask)
-        
         # Combine validity mask and done mask
         final_mask = valid_mask & done_mask
-        
-        return obs_buffer, final_mask, clamped_indices, valid_mask
+
+        # Zero reset-crossing frames before any temporal compressor sees them;
+        # the attention padding mask remains the second line of defense.
+        mask_shape = final_mask.shape + (1,) * (obs_buffer.dim() - 2)
+        obs_buffer = obs_buffer * final_mask.reshape(mask_shape).to(obs_buffer.dtype)
+
+        return obs_buffer, final_mask, clamped_indices, final_mask
     
     def _buffer_sample(self, obs_sequence, indices, mask):
         seq = obs_sequence[indices]  # (num_steps_per_env, mini_batch_size, *obs_shape)
-        seq = seq * mask.unsqueeze(-1).expand_as(seq)  # Zero out invalid entries
+        mask_shape = mask.shape + (1,) * (seq.dim() - 2)
+        seq = seq * mask.reshape(mask_shape).to(seq.dtype)
         return seq
 
     def _compute_amp_history_indices(self, batch_idx, dones_flat):
@@ -495,26 +692,116 @@ class RolloutStorageMM:
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
 
+        actor_history_length = (
+            self.actor_history_length
+            if num_steps_per_env is None
+            else int(num_steps_per_env)
+        )
+        if not 1 <= actor_history_length <= self.actor_history_length:
+            raise ValueError(
+                "requested actor history length must be between 1 and the "
+                f"configured {self.actor_history_length}, got {actor_history_length}"
+            )
+        critic_history_length = self.critic_history_length
+
+        def prepend(prefix, current, history_length):
+            prefix_length = history_length - 1
+            if prefix_length == 0:
+                return current
+            if prefix is None or prefix.shape[0] < prefix_length:
+                raise RuntimeError(
+                    f"missing {prefix_length}-step rollout history prefix"
+                )
+            return torch.cat((prefix[-prefix_length:], current), dim=0)
+
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
         # indices = torch.arange(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
-        observations = self.observations.flatten(0, 1)
+        current_valid = torch.ones(
+            self.num_transitions_per_env,
+            self.num_envs,
+            device=self.device,
+            dtype=torch.bool,
+        )
+
+        actor_observation_sequence = prepend(
+            self.actor_history_prefix_observations,
+            self.observations,
+            actor_history_length,
+        )
+        actor_done_sequence = prepend(
+            self.actor_history_prefix_dones,
+            self.dones,
+            actor_history_length,
+        )
+        actor_valid_sequence = prepend(
+            self.actor_history_prefix_valid,
+            current_valid,
+            actor_history_length,
+        )
+        observations = actor_observation_sequence.flatten(0, 1)
+        actor_dones_flat = actor_done_sequence.flatten(0, 1)
+        actor_valid_flat = actor_valid_sequence.flatten(0, 1)
+        actor_index_offset = (actor_history_length - 1) * self.num_envs
+
         if self.privileged_observations is not None:
-            critic_observations = self.privileged_observations.flatten(0, 1)
+            current_critic_observations = self.privileged_observations
         else:
-            critic_observations = observations
+            current_critic_observations = self.observations
+
+        critic_observation_sequence = prepend(
+            self.critic_history_prefix_observations,
+            current_critic_observations,
+            critic_history_length,
+        )
+        critic_done_sequence = prepend(
+            self.critic_history_prefix_dones,
+            self.dones,
+            critic_history_length,
+        )
+        critic_valid_sequence = prepend(
+            self.critic_history_prefix_valid,
+            current_valid,
+            critic_history_length,
+        )
+        critic_observations = critic_observation_sequence.flatten(0, 1)
+        critic_dones_flat = critic_done_sequence.flatten(0, 1)
+        critic_valid_flat = critic_valid_sequence.flatten(0, 1)
+        critic_index_offset = (critic_history_length - 1) * self.num_envs
         
         if self.reference_observations is not None:
-            reference_observations = self.reference_observations.flatten(0, 1)
-            reference_observations_mask = self.reference_observations_mask.flatten(0, 1)
+            reference_observations = prepend(
+                self.actor_history_prefix_reference_observations,
+                self.reference_observations,
+                actor_history_length,
+            ).flatten(0, 1)
+            reference_observations_mask = prepend(
+                self.actor_history_prefix_reference_masks,
+                self.reference_observations_mask,
+                actor_history_length,
+            ).flatten(0, 1)
             if self.privileged_reference_observations is not None:
-                critic_reference_observations = self.privileged_reference_observations.flatten(0, 1)
-                critic_reference_observations_mask = self.privileged_reference_observations_mask.flatten(0, 1)
+                current_critic_reference_observations = (
+                    self.privileged_reference_observations
+                )
+                current_critic_reference_masks = (
+                    self.privileged_reference_observations_mask
+                )
             else:
-                critic_reference_observations = reference_observations
-                critic_reference_observations_mask = reference_observations_mask
+                current_critic_reference_observations = self.reference_observations
+                current_critic_reference_masks = self.reference_observations_mask
+            critic_reference_observations = prepend(
+                self.critic_history_prefix_reference_observations,
+                current_critic_reference_observations,
+                critic_history_length,
+            ).flatten(0, 1)
+            critic_reference_observations_mask = prepend(
+                self.critic_history_prefix_reference_masks,
+                current_critic_reference_masks,
+                critic_history_length,
+            ).flatten(0, 1)
         else:
             reference_observations = None
             reference_observations_mask = None
@@ -550,26 +837,40 @@ class RolloutStorageMM:
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
                 batch_idx = indices[start:end]
+                actor_batch_idx = batch_idx + actor_index_offset
+                critic_batch_idx = batch_idx + critic_index_offset
 
                 # obs_batch = observations[batch_idx] # shape: (mini_batch_size, num_envs, *obs_shape)
-                obs_batch, masks_batch, clamped_indices, valid_mask = self._create_obs_buffer_slice(observations, batch_idx, dones_flat) # shape: (num_steps_per_env, mini_batch_size, *obs_shape)
+                obs_batch, masks_batch, clamped_indices, sample_mask = self._create_obs_buffer_slice(
+                    observations,
+                    actor_batch_idx,
+                    actor_dones_flat,
+                    num_steps_per_env=actor_history_length,
+                    sequence_valid=actor_valid_flat,
+                ) # shape: (num_steps_per_env, mini_batch_size, *obs_shape)
                 # obs_batch: (num_steps_per_env, mini_batch_size, *obs_shape)
                 # ref_obs_batch = reference_observations[batch_idx] if reference_observations is not None else None
                 # ref_obs_batch, _ = self._create_obs_buffer_slice(reference_observations, batch_idx, self.dones.flatten(0, 1)) if reference_observations is not None else (None, None)
-                ref_obs_batch = self._buffer_sample(reference_observations, clamped_indices, valid_mask) if reference_observations is not None else None
+                ref_obs_batch = self._buffer_sample(reference_observations, clamped_indices, sample_mask) if reference_observations is not None else None
                 # ref_obs_mask_batch = reference_observations_mask[batch_idx] if reference_observations_mask is not None else None
                 # ref_obs_mask_batch, _ = self._create_obs_buffer_slice(reference_observations_mask.unsqueeze(-1).float(), batch_idx, self.dones.flatten(0, 1)) if reference_observations_mask is not None else (None, None)
-                ref_obs_mask_batch = self._buffer_sample(reference_observations_mask.unsqueeze(-1).float(), clamped_indices, valid_mask).squeeze(-1) if reference_observations_mask is not None else None
+                ref_obs_mask_batch = self._buffer_sample(reference_observations_mask.unsqueeze(-1).float(), clamped_indices, sample_mask).squeeze(-1).bool() if reference_observations_mask is not None else None
                 # ref_obs_mask_batch = ref_obs_mask_batch.squeeze(-1).bool() if ref_obs_mask_batch is not None else None
                 ref_obs_batch_rtn = (ref_obs_batch, ref_obs_mask_batch) if ref_obs_batch is not None else None
                 # critic_observations_batch = critic_observations[batch_idx]
                 # critic_observations_batch, _ = self._create_obs_buffer_slice(critic_observations, batch_idx, self.dones.flatten(0, 1))
-                critic_observations_batch = self._buffer_sample(critic_observations, clamped_indices, valid_mask)
+                critic_observations_batch, _, critic_clamped_indices, critic_sample_mask = self._create_obs_buffer_slice(
+                    critic_observations,
+                    critic_batch_idx,
+                    critic_dones_flat,
+                    num_steps_per_env=critic_history_length,
+                    sequence_valid=critic_valid_flat,
+                )
                 # critic_ref_obs_batch = critic_reference_observations[batch_idx] if critic_reference_observations is not None else None
                 # critic_ref_obs_batch, _ = self._create_obs_buffer_slice(critic_reference_observations, batch_idx, self.dones.flatten(0, 1)) if critic_reference_observations is not None else (None, None)
-                critic_ref_obs_batch = self._buffer_sample(critic_reference_observations, clamped_indices, valid_mask) if critic_reference_observations is not None else None
+                critic_ref_obs_batch = self._buffer_sample(critic_reference_observations, critic_clamped_indices, critic_sample_mask) if critic_reference_observations is not None else None
                 # critic_ref_obs_mask_batch, _ = self._create_obs_buffer_slice(critic_reference_observations_mask.unsqueeze(-1).float(), batch_idx, self.dones.flatten(0, 1)) if critic_reference_observations_mask is not None else (None, None)
-                critic_ref_obs_mask_batch = self._buffer_sample(critic_reference_observations_mask.unsqueeze(-1).float(), clamped_indices, valid_mask).squeeze(-1) if critic_reference_observations_mask is not None else None
+                critic_ref_obs_mask_batch = self._buffer_sample(critic_reference_observations_mask.unsqueeze(-1).float(), critic_clamped_indices, critic_sample_mask).squeeze(-1).bool() if critic_reference_observations_mask is not None else None
                 # critic_ref_obs_mask_batch = critic_ref_obs_mask_batch.squeeze(-1).bool() if critic_ref_obs_mask_batch is not None else None
                 critic_ref_obs_batch_rtn = (critic_ref_obs_batch, critic_ref_obs_mask_batch) if critic_ref_obs_batch is not None else None
                 actions_batch = actions[batch_idx]

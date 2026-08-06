@@ -67,6 +67,123 @@ class RoPEMultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.use_sdpa = use_sdpa
 
+    @staticmethod
+    def _expand_attention_mask(
+        mask: torch.Tensor,
+        batch_size: int,
+        num_heads: int,
+        query_len: int,
+        key_len: int,
+    ) -> torch.Tensor:
+        """Expand a MultiheadAttention-style mask for SDPA broadcasting.
+
+        Boolean masks use the ``nn.MultiheadAttention`` convention throughout
+        this module: ``True`` means that the query/key pair is blocked.  SDPA
+        uses the opposite convention for boolean masks, so callers must first
+        convert the returned mask to an additive attention bias.
+        """
+
+        if tuple(mask.shape[-2:]) != (query_len, key_len):
+            raise ValueError(
+                "attention mask must end in "
+                f"({query_len}, {key_len}), got {tuple(mask.shape)}"
+            )
+        if mask.dim() == 2:
+            return mask.unsqueeze(0).unsqueeze(0)
+        if mask.dim() == 3:
+            if mask.shape[0] == batch_size:
+                return mask.unsqueeze(1)
+            if mask.shape[0] == batch_size * num_heads:
+                return mask.reshape(
+                    batch_size, num_heads, query_len, key_len
+                )
+            raise ValueError(
+                "3-D attention mask leading dimension must be batch_size or "
+                f"batch_size * num_heads, got {tuple(mask.shape)}"
+            )
+        if mask.dim() == 4:
+            return mask
+        raise ValueError(
+            f"attention mask must be 2-D, 3-D, or 4-D, got {mask.dim()}-D"
+        )
+
+    def _build_attention_bias(
+        self,
+        attn_mask: Optional[torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor],
+        is_causal: bool,
+        batch_size: int,
+        query_len: int,
+        key_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Build one additive mask shared by the SDPA and manual paths.
+
+        ``attn_mask`` and ``key_padding_mask`` follow PyTorch
+        MultiheadAttention semantics (``True`` is blocked).  Returning a float
+        bias avoids relying on SDPA's inverted boolean-mask convention.
+        Fully blocked rows are temporarily made safe and reported separately;
+        their attention outputs are zeroed after the kernel call.
+        """
+
+        attention_bias = None
+
+        def add_component(component: torch.Tensor) -> None:
+            nonlocal attention_bias
+            if component.dtype == torch.bool:
+                component_bias = torch.zeros(
+                    component.shape, dtype=dtype, device=device
+                ).masked_fill(component.to(device=device), float("-inf"))
+            else:
+                component_bias = component.to(device=device, dtype=dtype)
+            attention_bias = (
+                component_bias
+                if attention_bias is None
+                else attention_bias + component_bias
+            )
+
+        if attn_mask is not None:
+            add_component(
+                self._expand_attention_mask(
+                    attn_mask,
+                    batch_size,
+                    self.num_heads,
+                    query_len,
+                    key_len,
+                )
+            )
+
+        if is_causal:
+            causal_blocked = torch.ones(
+                query_len, key_len, dtype=torch.bool, device=device
+            ).triu(diagonal=1)
+            add_component(causal_blocked.unsqueeze(0).unsqueeze(0))
+
+        if key_padding_mask is not None:
+            if tuple(key_padding_mask.shape) != (batch_size, key_len):
+                raise ValueError(
+                    "key padding mask must have shape "
+                    f"({batch_size}, {key_len}), got {tuple(key_padding_mask.shape)}"
+                )
+            add_component(
+                key_padding_mask.to(device=device, dtype=torch.bool)
+                .unsqueeze(1)
+                .unsqueeze(2)
+            )
+
+        fully_blocked = None
+        if attention_bias is not None:
+            fully_blocked = torch.isneginf(attention_bias).all(
+                dim=-1, keepdim=True
+            )
+            # Both the manual softmax and some SDPA kernels can produce NaNs
+            # for an all -inf row. Its result is semantically unused, so make
+            # the kernel row safe and explicitly zero it afterwards.
+            attention_bias = attention_bias.masked_fill(fully_blocked, 0.0)
+
+        return attention_bias, fully_blocked
+
     def forward(
         self,
         query: torch.Tensor,
@@ -105,29 +222,35 @@ class RoPEMultiHeadAttention(nn.Module):
             q = self.rope.rotate_queries_or_keys(q, interleave=interleave)
             k = self.rope.rotate_queries_or_keys(k, interleave=interleave)
 
-        # Use PyTorch's optimized scaled_dot_product_attention when possible
-        use_sdpa = self.use_sdpa and hasattr(F, 'scaled_dot_product_attention') and (
-            attn_mask is None or attn_mask.dtype == torch.bool
+        # Use one mask contract for both implementations. Internally True means
+        # blocked, matching nn.MultiheadAttention and TransformerEncoder.
+        # Convert it to additive bias before entering SDPA, whose bool mask has
+        # the opposite meaning (True means allowed).
+        native_causal = (
+            is_causal and attn_mask is None and key_padding_mask is None
+        )
+        attention_bias, fully_blocked = self._build_attention_bias(
+            attn_mask=None if native_causal else attn_mask,
+            key_padding_mask=None if native_causal else key_padding_mask,
+            is_causal=False if native_causal else is_causal,
+            batch_size=batch_size,
+            query_len=seq_len,
+            key_len=seq_len,
+            dtype=q.dtype,
+            device=q.device,
         )
 
-        if use_sdpa:
-            # Prepare attention mask for SDPA
-            sdpa_attn_mask = None
-            if attn_mask is not None:
-                if attn_mask.dim() == 2:
-                    sdpa_attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-                elif attn_mask.dim() == 3:
-                    sdpa_attn_mask = attn_mask.unsqueeze(1)
-                else:
-                    sdpa_attn_mask = attn_mask
+        # Use PyTorch's optimized scaled_dot_product_attention when possible.
+        use_sdpa = self.use_sdpa and hasattr(F, 'scaled_dot_product_attention')
 
+        if use_sdpa:
             attn_output = F.scaled_dot_product_attention(
                 query=q,
                 key=k,
                 value=v,
-                attn_mask=sdpa_attn_mask,
+                attn_mask=attention_bias,
                 dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=is_causal
+                is_causal=native_causal,
             )
             attn_weights = None
 
@@ -135,24 +258,30 @@ class RoPEMultiHeadAttention(nn.Module):
             # Fallback to manual attention computation
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-            if attn_mask is not None:
-                if attn_mask.dim() == 2:
-                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-                elif attn_mask.dim() == 3:
-                    attn_mask = attn_mask.unsqueeze(1)
-                attn_weights = attn_weights.masked_fill(attn_mask, float('-inf'))
-
-            if is_causal:
-                causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1)
-                attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-
-            if key_padding_mask is not None:
-                key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-                attn_weights = attn_weights.masked_fill(key_padding_mask, float('-inf'))
+            if native_causal:
+                causal_blocked = torch.ones(
+                    seq_len, seq_len, dtype=torch.bool, device=query.device
+                ).triu(diagonal=1)
+                attn_weights = attn_weights.masked_fill(
+                    causal_blocked, float("-inf")
+                )
+            elif attention_bias is not None:
+                attn_weights = attn_weights + attention_bias
 
             attn_weights = F.softmax(attn_weights, dim=-1)
+            if fully_blocked is not None:
+                attn_weights = attn_weights.masked_fill(fully_blocked, 0.0)
             attn_weights = self.dropout(attn_weights)
             attn_output = torch.matmul(attn_weights, v)
+
+        if fully_blocked is not None:
+            attn_output = attn_output.masked_fill(fully_blocked, 0.0)
+
+        query_padding_mask = None
+        if key_padding_mask is not None:
+            query_padding_mask = key_padding_mask.to(
+                device=query.device, dtype=torch.bool
+            ).unsqueeze(-1)
 
         # Transpose back and reshape
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -160,6 +289,8 @@ class RoPEMultiHeadAttention(nn.Module):
 
         # Final linear projection
         output = self.out_proj(attn_output)
+        if query_padding_mask is not None:
+            output = output.masked_fill(query_padding_mask, 0.0)
 
         return output, attn_weights
 

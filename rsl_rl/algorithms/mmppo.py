@@ -624,6 +624,13 @@ class MMPPO:
             rnd_state_shape = [self.rnd.num_states]
         else:
             rnd_state_shape = None
+        is_mmgpt = isinstance(self.actor_critic, ActorCriticMMGPT)
+        actor_history_length = (
+            self.actor_critic.actor.num_steps_per_env if is_mmgpt else 1
+        )
+        critic_history_length = (
+            self.actor_critic.critic_history_length if is_mmgpt else 1
+        )
         self.storage = RolloutStorageMM(
             training_type,
             num_envs,
@@ -637,6 +644,8 @@ class MMPPO:
             apply_dagger_actions=(self.teacher_coef is not None),
             amp_cfg=self.amp_cfg,
             device=self.device,
+            actor_history_length=actor_history_length,
+            critic_history_length=critic_history_length,
         )
 
         # Initialize teacher replay buffer

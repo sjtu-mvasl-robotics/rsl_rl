@@ -965,11 +965,18 @@ class MMGPT(nn.Module):
                 # temporal shifting: note that target (obs) is the last timestep, and pred is current timestep. Thus, the computation should be between pred[:-1] and target[1:]
                 target_shifted = target[1:, :, :]
                 pred_shifted = pred
-                # compute mask: only consider valid positions in both target and pred, the mask is aligned with target_shifted
-                valid_mask = masks[1:] # shape: [T_in-1, B]
-                target_valid = target_shifted[valid_mask]
-                pred_valid = pred_shifted[valid_mask]
-                aux_loss_i = self.aux_loss_fn(pred_valid, target_valid)
+                # A one-step prediction is valid only when both endpoints are
+                # in the same unmasked trajectory segment. In particular, do
+                # not train the world-model head across an episode reset.
+                valid_mask = masks[:-1] & masks[1:] # shape: [T_in-1, B]
+                if valid_mask.any():
+                    target_valid = target_shifted[valid_mask]
+                    pred_valid = pred_shifted[valid_mask]
+                    aux_loss_i = self.aux_loss_fn(pred_valid, target_valid)
+                else:
+                    # Keep a differentiable zero instead of asking MSELoss to
+                    # reduce an empty tensor on the first frame after reset.
+                    aux_loss_i = pred_shifted.sum() * 0.0
                 self.aux_loss += weight * aux_loss_i            
                 
         else:
@@ -990,7 +997,7 @@ class MMGPT(nn.Module):
             dreamer_input = torch.cat([cur_obs_latent, cur_actions, next_obs_latent], dim=-1)  # [T_in-1, B, dim_model*2 + dim_out]
             dreamer_rewards = self.dreamer_reward_head(dreamer_input).squeeze(-1)  # [T_in-1, B]
             # mask
-            valid_mask = masks[1:]  # [T_in-1, B]
+            valid_mask = masks[:-1] & masks[1:]  # [T_in-1, B]
             valid_dreamer_rewards = dreamer_rewards * valid_mask.float()  # zero out invalid positions
             self.dreamer_reward = valid_dreamer_rewards.sum() / (valid_mask.sum() + 1e-8)  # average reward over valid positions
 
