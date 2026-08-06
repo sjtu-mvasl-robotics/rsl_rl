@@ -1003,13 +1003,22 @@ class MMPPO:
                 
             if is_mmgpt:
                 aux_loss = self.actor_critic.actor_aux_loss
-                weighted_aux_loss = self.aux_loss_coef * aux_loss
-                loss = loss + weighted_aux_loss
+                # A zero coefficient is a hard gradient-off switch. Adding
+                # ``0 * aux_loss`` would still materialize zero gradients for
+                # the prediction heads; AdamW would then move those parameters
+                # through decoupled weight decay, violating a frozen-head
+                # ablation contract.
+                weighted_aux_loss = aux_loss.detach().new_zeros(())
+                if self.aux_loss_coef > 0.0:
+                    weighted_aux_loss = self.aux_loss_coef * aux_loss
+                    loss = loss + weighted_aux_loss
                 mean_aux_loss += aux_loss.item()
                 mean_weighted_aux_loss += weighted_aux_loss.item()
                 dreamer_loss = self.actor_critic.actor_dreamer_loss
-                weighted_dreamer_loss = self.dreamer_loss_coef * dreamer_loss
-                loss = loss + weighted_dreamer_loss
+                weighted_dreamer_loss = dreamer_loss.detach().new_zeros(())
+                if self.dreamer_loss_coef > 0.0:
+                    weighted_dreamer_loss = self.dreamer_loss_coef * dreamer_loss
+                    loss = loss + weighted_dreamer_loss
                 mean_dreamer_loss += dreamer_loss.item()
                 mean_weighted_dreamer_loss += weighted_dreamer_loss.item()
 

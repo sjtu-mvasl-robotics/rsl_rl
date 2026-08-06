@@ -99,6 +99,7 @@ def test_future_prediction_backbone_gradient_is_an_explicit_control(
     [
         ("backbone_only", False),
         ("backbone_and_action_head", True),
+        ("action_path_only", True),
     ],
 )
 def test_dreamer_gradient_destination_is_an_explicit_control(
@@ -112,6 +113,33 @@ def test_dreamer_gradient_destination_is_an_explicit_control(
     assert _grad_norm(_backbone_parameter(model)) > 0.0
     assert (_grad_norm(model.fc[-1].weight) > 0.0) is expect_action_head_grad
     # The prediction decoder is a fixed differentiable readout for this loss.
+    assert _grad_norm(model.aux_heads[0].weight) == 0.0
+    assert _grad_norm(model.action_film.weight) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("gradient_mode", "expect_direct_latent_grad"),
+    [
+        ("backbone_and_action_head", True),
+        ("action_path_only", False),
+    ],
+)
+def test_action_path_only_blocks_the_direct_latent_shortcut(
+    gradient_mode, expect_direct_latent_grad
+):
+    model = _make_model(dreamer_gradient_mode=gradient_mode)
+    # Remove the action-to-backbone Jacobian without removing the action-head
+    # parameter Jacobian. Any remaining backbone gradient must then have come
+    # from the predictor's direct latent input.
+    with torch.no_grad():
+        model.fc[-1].weight.zero_()
+    _forward(model)
+
+    model.dreamer_loss.backward()
+
+    has_backbone_grad = _grad_norm(_backbone_parameter(model)) > 0.0
+    assert has_backbone_grad is expect_direct_latent_grad
+    assert _grad_norm(model.fc[-1].weight) > 0.0
     assert _grad_norm(model.aux_heads[0].weight) == 0.0
     assert _grad_norm(model.action_film.weight) == 0.0
 
@@ -132,10 +160,37 @@ def test_score_prediction_stays_disabled_during_cold_start_ablation():
 def test_mmppo_scales_and_averages_both_mmgpt_losses():
     source = inspect.getsource(MMPPO.update)
 
+    assert "if self.aux_loss_coef > 0.0:" in source
     assert "weighted_aux_loss = self.aux_loss_coef * aux_loss" in source
+    assert "if self.dreamer_loss_coef > 0.0:" in source
     assert "weighted_dreamer_loss = self.dreamer_loss_coef * dreamer_loss" in source
     assert "mean_aux_loss /= num_updates" in source
     assert "mean_dreamer_loss /= num_updates" in source
+
+
+def test_a_disabled_auxiliary_loss_leaves_prediction_heads_out_of_adamw():
+    model = _make_model(dreamer_gradient_mode="action_path_only")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    frozen_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if name.startswith(("aux_heads.", "action_film."))
+    }
+    output = _forward(model)
+
+    # This is the gradient topology of PPO with both auxiliary coefficients
+    # disabled: prediction losses may be measured, but are not added to loss.
+    output.square().mean().backward()
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if name in frozen_before
+    )
+    optimizer.step()
+
+    for name, parameter in model.named_parameters():
+        if name in frozen_before:
+            assert torch.equal(parameter.detach(), frozen_before[name])
 
 
 def test_single_frame_privileged_critic_has_scalar_value_per_environment():

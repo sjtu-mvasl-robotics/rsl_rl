@@ -527,10 +527,12 @@ class MMGPT(nn.Module):
         if dreamer_gradient_mode not in {
             "backbone_only",
             "backbone_and_action_head",
+            "action_path_only",
         }:
             raise ValueError(
-                "dreamer_gradient_mode must be 'backbone_only' or "
-                f"'backbone_and_action_head', got {dreamer_gradient_mode!r}"
+                "dreamer_gradient_mode must be 'backbone_only', "
+                "'backbone_and_action_head', or 'action_path_only', "
+                f"got {dreamer_gradient_mode!r}"
             )
         self.dreamer_gradient_mode = dreamer_gradient_mode
         self.score_prediction_enabled = bool(score_prediction_enabled)
@@ -968,6 +970,12 @@ class MMGPT(nn.Module):
                 # The imagined prediction error trains the representation via
                 # cur_latent, but treats the already-decoded action as fixed.
                 cur_action = cur_action.detach()
+            elif self.dreamer_gradient_mode == "action_path_only":
+                # Keep the frozen world-model readout differentiable with
+                # respect to the decoded action, while blocking its direct
+                # latent shortcut. The loss can therefore update the policy
+                # only through action -> action head -> shared backbone.
+                cur_latent = cur_latent.detach()
             # no parameter update for aux head
             joint_pred_aux_idx = self.obs_term_names.index('joint_pos')
             film_params = {k: v.detach() for k, v in self.action_film.named_parameters()}
