@@ -8,7 +8,7 @@ import warnings
 
 from torch.distributed.checkpoint import state_dict
 from rsl_rl.modules import ActorCritic, ActorCriticMMTransformer, SwiGLUEmbedding, group_by_concat_list, HistoryEmbedding
-from rsl_rl.modules.actor_critic_mlp_v2 import FusedMultiModalMLP
+from rsl_rl.modules.actor_critic_mlp_v2 import DirectConcatMLP, FusedMultiModalMLP
 from rsl_rl.networks import Memory, RoPETransformer
 from rsl_rl.utils import resolve_nn_activation, unpad_trajectories
 import torch
@@ -464,6 +464,9 @@ class MMGPT(nn.Module):
         pred_obs_term_weights: Optional[List[float]] = None,
         aux_backbone_grad: bool = True,
         dreamer_gradient_mode: str = "backbone_only",
+        dreamer_target_term_name: str = "target_actions",
+        dreamer_target_action_offset: int = 0,
+        latest_reference_only: bool = False,
         score_prediction_enabled: bool = False,
         apply_mlp_residual = False,
         # some not pretty fix
@@ -535,6 +538,13 @@ class MMGPT(nn.Module):
                 f"got {dreamer_gradient_mode!r}"
             )
         self.dreamer_gradient_mode = dreamer_gradient_mode
+        if not dreamer_target_term_name:
+            raise ValueError("dreamer_target_term_name must be non-empty")
+        if dreamer_target_action_offset < 0:
+            raise ValueError("dreamer_target_action_offset must be non-negative")
+        self.dreamer_target_term_name = dreamer_target_term_name
+        self.dreamer_target_action_offset = dreamer_target_action_offset
+        self.latest_reference_only = bool(latest_reference_only)
         self.score_prediction_enabled = bool(score_prediction_enabled)
         if self.pred_obs_term_names is not None and len(self.pred_obs_term_names) > 0:
             assert self.pred_obs_term_weights is not None and len(self.pred_obs_term_weights) == len(self.pred_obs_term_names), "pred_obs_term_weights should be provided with the same length as pred_obs_term_names."
@@ -567,13 +577,25 @@ class MMGPT(nn.Module):
                     nn.Linear(dim_model, dim)
                 )
                 
-            if ref_term_dict is not None: # extract target_actions
-                if 'target_actions' not in ref_term_dict:
-                    raise ValueError("If you want to predict observation terms, please provide 'target_actions' term in ref observation terms for MMGPT.")
+            if ref_term_dict is not None:
+                if self.dreamer_target_term_name not in ref_term_dict:
+                    raise ValueError(
+                        "If you want to compute the MMGPT dreamer loss, "
+                        f"provide {self.dreamer_target_term_name!r} in the "
+                        "policy reference observation terms."
+                    )
                 start = 0
-                for i, (term_name, term_dim) in enumerate(ref_term_dict.items()):
-                    if term_name == 'target_actions':
-                        self.target_action_slice = (start, start + term_dim)
+                for term_name, term_dim in ref_term_dict.items():
+                    if term_name == self.dreamer_target_term_name:
+                        target_start = start + self.dreamer_target_action_offset
+                        target_end = target_start + dim_out
+                        if target_end > start + term_dim:
+                            raise ValueError(
+                                f"Dreamer target slice [{target_start}, "
+                                f"{target_end}) exceeds term "
+                                f"{term_name!r} with dimension {term_dim}."
+                            )
+                        self.target_action_slice = (target_start, target_end)
                         break
                     start += term_dim
             
@@ -691,6 +713,27 @@ class MMGPT(nn.Module):
     @staticmethod
     def unpad(padded_sequence, masks):
         return padded_sequence.permute(1, 0, 2)[masks.permute(1, 0)] # shape [valid_length, dim]
+
+    def _apply_reference_history_contract(
+        self,
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Limit reference information to the current command when requested.
+
+        SONIC combines past proprioception with one current multi-future
+        command. MMGPT normally retains both modalities over time; this
+        adapter prevents historical command tokens from silently expanding
+        the actor information set while leaving the current dreamer target
+        unchanged.
+        """
+
+        if ref_obs is None or not self.latest_reference_only:
+            return ref_obs
+        ref_tensor, ref_mask = ref_obs
+        latest_mask = torch.zeros_like(ref_mask)
+        latest_mask[-1] = ref_mask[-1]
+        aligned_ref = ref_tensor * latest_mask.unsqueeze(-1).to(ref_tensor.dtype)
+        return aligned_ref, latest_mask
     
     def generate_mask(self) -> torch.Tensor:
         """
@@ -794,6 +837,8 @@ class MMGPT(nn.Module):
             ref_mlp_obs = (ref_obs[0][-1], ref_obs[1][-1])
         else:
             ref_mlp_obs = None
+
+        ref_obs = self._apply_reference_history_contract(ref_obs)
         
         if self.apply_mlp_residual:
             mlp_output = self.mlp_bypass(obs[-1], ref_mlp_obs) # [B, dim_out]    
@@ -1036,8 +1081,12 @@ class MMGPT(nn.Module):
         
         # right here, we always maintain the reference buffer, in case we need it later
         if self.inference_buffer_ref_obs is not None:
-            self.inference_buffer_ref_obs = torch.roll(self.inference_buffer_ref_obs, shifts=-1, dims=0)
-            self.inference_buffer_ref_obs_mask = torch.roll(self.inference_buffer_ref_obs_mask, shifts=-1, dims=0)
+            if self.latest_reference_only:
+                self.inference_buffer_ref_obs.zero_()
+                self.inference_buffer_ref_obs_mask.zero_()
+            else:
+                self.inference_buffer_ref_obs = torch.roll(self.inference_buffer_ref_obs, shifts=-1, dims=0)
+                self.inference_buffer_ref_obs_mask = torch.roll(self.inference_buffer_ref_obs_mask, shifts=-1, dims=0)
             if ref_obs is not None:
                 ref_obs_tensor, ref_obs_mask = ref_obs
                 self.inference_buffer_ref_obs[-1, :, :] = ref_obs_tensor
@@ -1678,6 +1727,8 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                  max_seq_len=16,
                  mlp_hidden_dims = [128, 64],
                  init_noise_std=1.0,
+                 min_noise_std: Optional[float] = None,
+                 max_noise_std: Optional[float] = None,
                  noise_std_type: str = "scalar",
                  load_dagger=False,
                  load_dagger_path=None,
@@ -1691,9 +1742,17 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                  use_mlp_dagger: bool = False,
                  dagger_history_length: int = 8,
                  critic_history_length: int = 8,
+                 critic_hidden_dims: Optional[List[int]] = None,
+                 activation: str = "elu",
+                 use_layer_norm: bool = False,
+                 fusion_mode: str = "gated",
+                 critic_fusion_mode: Optional[str] = None,
+                 actor_hidden_dims: Optional[List[int]] = None,
+                 joint_decoder_hidden_dims: Optional[List[int]] = None,
                  **kwargs
                  ):
         nn.Module.__init__(self)
+        del actor_hidden_dims, joint_decoder_hidden_dims
         if ref_term_steps is None:
             ref_term_steps = {"policy": None, "critic": None}
         assert not load_dagger or load_dagger_path, "load_dagger and load_dagger_path must be provided if load_dagger is True"
@@ -1725,11 +1784,33 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
             self.dagger_ref_obs_lambda = (lambda ref_obs: (ref_obs[0][-dagger_history_length:], ref_obs[1][-dagger_history_length:])) if num_actor_ref_obs > 0 else None
         
         # Action noise
+        if min_noise_std is not None and min_noise_std <= 0.0:
+            raise ValueError("min_noise_std must be positive when specified")
+        if max_noise_std is not None and max_noise_std <= 0.0:
+            raise ValueError("max_noise_std must be positive when specified")
+        if (
+            min_noise_std is not None
+            and max_noise_std is not None
+            and min_noise_std > max_noise_std
+        ):
+            raise ValueError("min_noise_std cannot exceed max_noise_std")
+        self.min_noise_std = min_noise_std
+        self.max_noise_std = max_noise_std
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+            if load_dagger:
+                self.std_dagger = nn.Parameter(
+                    init_noise_std * torch.ones(num_actions),
+                    requires_grad=False,
+                )
         elif self.noise_std_type == "log":
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            if load_dagger:
+                self.log_std_dagger = nn.Parameter(
+                    torch.log(init_noise_std * torch.ones(num_actions)),
+                    requires_grad=False,
+                )
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         
@@ -1750,24 +1831,68 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
         critic_ref_term_dict = {"critic": ref_term_dict.get("critic", ref_term_dict.get("policy", {}))} if ref_term_dict else None
         
         self.critic_history_length = critic_history_length
-        
-        self.critic = FusedMultiModalMLP(
-            term_dict=critic_term_dict,
-            ref_term_dict=critic_ref_term_dict,
-            output_size=1,  # Value function outputs single value
-            hidden_dims=[512, 256, 128],
-            activation="elu",
-            history_length=self.critic_history_length,
-            encoder_latent_dim=dim_model,
-            encoder_compress_threshold=32,
-            use_layer_norm=False,
-            fusion_mode='gated',
-            name="critic",
-            reorgnize_obs=True,
-        )
-        
-        self.critic_obs_lambda = lambda obs: obs[-self.critic_history_length:, :, :]  # take last num_critic_history_length steps
-        self.critic_ref_obs_lambda = (lambda ref_obs: (ref_obs[0][-self.critic_history_length:], ref_obs[1][-self.critic_history_length:])) if num_critic_ref_obs > 0 else None
+        critic_hidden_dims = critic_hidden_dims or [512, 256, 128]
+        resolved_critic_fusion_mode = critic_fusion_mode or fusion_mode
+        self._critic_uses_direct_concat = resolved_critic_fusion_mode in {
+            "direct_concat",
+            "direct_concat_ref_first",
+        }
+        if self._critic_uses_direct_concat:
+            if self.critic_history_length != 1:
+                raise ValueError(
+                    "DirectConcatMLP consumes one already-composed critic "
+                    "sample; set critic_history_length=1."
+                )
+            self.critic = DirectConcatMLP(
+                term_dict=critic_term_dict,
+                ref_term_dict=critic_ref_term_dict,
+                output_size=1,
+                hidden_dims=critic_hidden_dims,
+                activation=activation,
+                use_layer_norm=use_layer_norm,
+                reference_first=(
+                    resolved_critic_fusion_mode
+                    == "direct_concat_ref_first"
+                ),
+            )
+            # Recurrent PPO batches are [T, B, D]. The SONIC privileged
+            # history is already flattened inside D, so select one value
+            # sample per padded trajectory instead of introducing a second
+            # temporal axis in the critic.
+            self.critic_obs_lambda = lambda obs: obs[-1, :, :]
+            self.critic_ref_obs_lambda = (
+                (lambda ref_obs: (ref_obs[0][-1, :, :], ref_obs[1][-1, :]))
+                if num_critic_ref_obs > 0
+                else None
+            )
+        else:
+            self.critic = FusedMultiModalMLP(
+                term_dict=critic_term_dict,
+                ref_term_dict=critic_ref_term_dict,
+                output_size=1,
+                hidden_dims=critic_hidden_dims,
+                activation=activation,
+                history_length=self.critic_history_length,
+                encoder_latent_dim=dim_model,
+                encoder_compress_threshold=32,
+                use_layer_norm=use_layer_norm,
+                fusion_mode=resolved_critic_fusion_mode,
+                name="critic",
+                reorgnize_obs=True,
+            )
+            self.critic_obs_lambda = (
+                lambda obs: obs[-self.critic_history_length:, :, :]
+            )
+            self.critic_ref_obs_lambda = (
+                (
+                    lambda ref_obs: (
+                        ref_obs[0][-self.critic_history_length:],
+                        ref_obs[1][-self.critic_history_length:],
+                    )
+                )
+                if num_critic_ref_obs > 0
+                else None
+            )
         
         if load_actor_path:
             self.load_actor_weights(load_actor_path)
@@ -1810,6 +1935,15 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
     def actor_dreamer_reward(self):
         return self.actor.dreamer_reward
 
+    def _clamp_action_std(self, std: torch.Tensor) -> torch.Tensor:
+        if self.min_noise_std is None and self.max_noise_std is None:
+            return std
+        return torch.clamp(
+            std,
+            min=self.min_noise_std,
+            max=self.max_noise_std,
+        )
+
     def update_distribution(self, observations, ref_observations=None, masks=None, memory=None, **kwargs):
         mean = self.actor(observations, ref_observations, masks, memory, **kwargs)
         if self.noise_std_type == "scalar":
@@ -1818,7 +1952,7 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
             std = torch.exp(self.log_std).expand_as(mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        self.distribution = Normal(mean, std)
+        self.distribution = Normal(mean, self._clamp_action_std(std))
 
     def act(self, observations, ref_observations=None, masks=None, memory=None, **kwargs):
         self.update_distribution(observations, ref_observations, masks, memory, **kwargs)
@@ -1836,7 +1970,7 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
             std = self.std_dagger.expand_as(mean)
         elif self.noise_std_type == "log":
             std = torch.exp(self.log_std_dagger).expand_as(mean)
-        self.distribution_dagger = Normal(mean, std)
+        self.distribution_dagger = Normal(mean, self._clamp_action_std(std))
 
     def act_dagger(self, observations, ref_observations=None, masks=None, memory=None, **kwargs):
         assert self.actor_dagger is not None, "actor_dagger is not initialized"

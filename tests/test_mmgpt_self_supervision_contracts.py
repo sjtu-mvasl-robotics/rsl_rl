@@ -4,8 +4,11 @@ import pytest
 import torch
 
 from rsl_rl.algorithms.mmppo import MMPPO
-from rsl_rl.modules.actor_critic_mm_gpt import MMGPT
-from rsl_rl.modules.actor_critic_mlp_v2 import FusedMultiModalMLP
+from rsl_rl.modules.actor_critic_mm_gpt import ActorCriticMMGPT, MMGPT
+from rsl_rl.modules.actor_critic_mlp_v2 import (
+    DirectConcatMLP,
+    FusedMultiModalMLP,
+)
 
 
 _TERM_DIMS = {
@@ -223,3 +226,138 @@ def test_single_frame_privileged_critic_has_scalar_value_per_environment():
 
     assert inference_values.shape == (4, 1)
     assert batch_values.shape == (4, 1)
+
+
+def test_sonic_command_can_supply_the_dreamer_action_target():
+    model = MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=643,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        num_steps_per_env=4,
+        max_seq_len=4,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"prefix": 3, "sonic_release_command": 640},
+        pred_obs_term_names=_PREDICTED_TERMS,
+        pred_obs_term_weights=[1.0, 1.0, 0.5, 0.5, 0.5],
+        default_joint_pos=torch.zeros(2),
+        dreamer_target_term_name="sonic_release_command",
+        dreamer_target_action_offset=0,
+    )
+
+    # Reference terms are concatenated in manager order. The first future q
+    # sample starts at the beginning of the SONIC command term.
+    assert model.target_action_slice == (3, 5)
+
+
+def test_sonic_alignment_keeps_only_the_current_reference_command():
+    model = _make_model()
+    model.latest_reference_only = True
+    reference = torch.randn(4, 3, 2)
+    reference_mask = torch.ones(4, 3, dtype=torch.bool)
+
+    aligned_reference, aligned_mask = model._apply_reference_history_contract(
+        (reference, reference_mask)
+    )
+
+    assert not aligned_mask[:-1].any()
+    assert aligned_mask[-1].all()
+    assert torch.count_nonzero(aligned_reference[:-1]) == 0
+    torch.testing.assert_close(aligned_reference[-1], reference[-1])
+
+    # The first inference call has nine padded proprio frames and nine masked
+    # reference tokens. It must remain numerically valid under causal RoPE.
+    first_action = model(
+        torch.randn(3, sum(_TERM_DIMS.values())),
+        (torch.randn(3, 2), torch.ones(3, dtype=torch.bool)),
+    )
+    assert torch.isfinite(first_action).all()
+
+
+def _make_actor_critic_with_sonic_critic(**overrides):
+    kwargs = dict(
+        num_actor_obs=12,
+        num_actor_ref_obs=8,
+        num_critic_obs=5,
+        num_critic_ref_obs=3,
+        num_actions=2,
+        term_dict={
+            "policy": {
+                "joint_pos": 2,
+                "joint_vel": 2,
+                "gravity_dir": 3,
+                "base_ang_vel": 3,
+                "actions": 2,
+            },
+            "critic": {"privileged_state": 5},
+        },
+        ref_term_dict={
+            "policy": {"sonic_release_command": 8},
+            "critic": {"privileged_reference": 3},
+        },
+        ref_term_steps={
+            "policy": {"sonic_release_command": 1},
+            "critic": {},
+        },
+        concatenate_term_names={"policy": [], "critic": []},
+        concatenate_ref_term_names={"policy": [], "critic": []},
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        num_steps_per_env=4,
+        max_seq_len=4,
+        init_noise_std=0.8,
+        min_noise_std=0.01,
+        max_noise_std=0.5,
+        critic_history_length=1,
+        critic_hidden_dims=[32, 16],
+        activation="silu",
+        critic_fusion_mode="direct_concat_ref_first",
+        default_joint_pos=torch.zeros(2),
+    )
+    kwargs.update(overrides)
+    return ActorCriticMMGPT(**kwargs)
+
+
+def test_mmgpt_uses_sonic_direct_privileged_critic_for_inference_and_batches():
+    model = _make_actor_critic_with_sonic_critic()
+
+    assert isinstance(model.critic, DirectConcatMLP)
+    assert model.critic.reference_first is True
+    assert model.critic.fusion_mode == "direct_concat_ref_first"
+    assert [
+        layer.out_features
+        for layer in model.critic.network
+        if isinstance(layer, torch.nn.Linear)
+    ] == [32, 16, 1]
+
+    inference_values = model.evaluate(
+        torch.randn(4, 5),
+        (torch.randn(4, 3), torch.ones(4, dtype=torch.bool)),
+    )
+    batch_values = model.evaluate(
+        torch.randn(4, 3, 5),
+        (
+            torch.randn(4, 3, 3),
+            torch.ones(4, 3, dtype=torch.bool),
+        ),
+        masks=torch.ones(4, 3, dtype=torch.bool),
+    )
+
+    assert inference_values.shape == (4, 1)
+    assert batch_values.shape == (3, 1)
+
+
+def test_mmgpt_applies_sonic_action_noise_bounds():
+    model = _make_actor_critic_with_sonic_critic()
+    with torch.no_grad():
+        model.std.fill_(2.0)
+
+    model.update_distribution(
+        torch.randn(3, 12),
+        (torch.randn(3, 8), torch.ones(3, dtype=torch.bool)),
+    )
+
+    assert torch.all(model.action_std == 0.5)
