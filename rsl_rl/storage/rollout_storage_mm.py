@@ -16,8 +16,11 @@ class RolloutStorageMM:
     class Transition:
         def __init__(self):
             self.observations = None
+            self.raw_observations = None
             self.reference_observations = None
             self.reference_observations_mask = None
+            self.dreamer_target_observations = None
+            self.dreamer_target_observations_mask = None
             self.critic_observations = None
             self.critic_reference_observations = None
             self.critic_reference_observations_mask = None
@@ -55,6 +58,8 @@ class RolloutStorageMM:
         device="cpu",
         actor_history_length=1,
         critic_history_length=1,
+        raw_obs_shape=None,
+        dreamer_target_shape=None,
     ):
         self.training_type = training_type
         self.device = device
@@ -68,6 +73,8 @@ class RolloutStorageMM:
         self.amp_cfg = amp_cfg
         self.actor_history_length = int(actor_history_length)
         self.critic_history_length = int(critic_history_length)
+        self.raw_obs_shape = raw_obs_shape
+        self.dreamer_target_shape = dreamer_target_shape
         if self.actor_history_length < 1:
             raise ValueError("actor_history_length must be at least 1")
         if self.critic_history_length < 1:
@@ -78,6 +85,31 @@ class RolloutStorageMM:
      
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        if raw_obs_shape is not None and raw_obs_shape[0] is not None:
+            self.raw_observations = torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                *raw_obs_shape,
+                device=self.device,
+            )
+        else:
+            self.raw_observations = None
+        if dreamer_target_shape is not None and dreamer_target_shape[0] is not None:
+            self.dreamer_target_observations = torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                *dreamer_target_shape,
+                device=self.device,
+            )
+            self.dreamer_target_observations_mask = torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                device=self.device,
+                dtype=torch.bool,
+            )
+        else:
+            self.dreamer_target_observations = None
+            self.dreamer_target_observations_mask = None
         if privileged_obs_shape[0] is not None:
             self.privileged_observations = torch.zeros(
                 num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device
@@ -152,6 +184,22 @@ class RolloutStorageMM:
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
         self.observations[self.step].copy_(transition.observations)
+        if self.raw_observations is not None:
+            if transition.raw_observations is None:
+                raise ValueError("raw observations are required by this rollout storage")
+            self.raw_observations[self.step].copy_(transition.raw_observations)
+        if self.dreamer_target_observations is not None:
+            if (
+                transition.dreamer_target_observations is None
+                or transition.dreamer_target_observations_mask is None
+            ):
+                raise ValueError("external Dreamer targets are required by this rollout storage")
+            self.dreamer_target_observations[self.step].copy_(
+                transition.dreamer_target_observations
+            )
+            self.dreamer_target_observations_mask[self.step].copy_(
+                transition.dreamer_target_observations_mask
+            )
         if self.privileged_observations is not None:
             self.privileged_observations[self.step].copy_(transition.critic_observations)
 
@@ -222,6 +270,9 @@ class RolloutStorageMM:
 
         self.actor_history_prefix_observations = zeros_like_sequence(
             self.observations, actor_prefix_len
+        )
+        self.actor_history_prefix_raw_observations = zeros_like_sequence(
+            self.raw_observations, actor_prefix_len
         )
         self.actor_history_prefix_reference_observations = zeros_like_sequence(
             self.reference_observations, actor_prefix_len
@@ -322,6 +373,10 @@ class RolloutStorageMM:
 
         for prefix, current in (
             (self.actor_history_prefix_observations, self.observations),
+            (
+                self.actor_history_prefix_raw_observations,
+                self.raw_observations,
+            ),
             (
                 self.actor_history_prefix_reference_observations,
                 self.reference_observations,
@@ -495,7 +550,7 @@ class RolloutStorageMM:
                 yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     None,
                     None,
-                ), None, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask
+                ), None, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask, None, None
 
     def _create_obs_buffer_slice(
         self,
@@ -731,6 +786,15 @@ class RolloutStorageMM:
             self.observations,
             actor_history_length,
         )
+        raw_actor_observation_sequence = (
+            prepend(
+                self.actor_history_prefix_raw_observations,
+                self.raw_observations,
+                actor_history_length,
+            )
+            if self.raw_observations is not None
+            else None
+        )
         actor_done_sequence = prepend(
             self.actor_history_prefix_dones,
             self.dones,
@@ -742,6 +806,11 @@ class RolloutStorageMM:
             actor_history_length,
         )
         observations = actor_observation_sequence.flatten(0, 1)
+        raw_observations = (
+            raw_actor_observation_sequence.flatten(0, 1)
+            if raw_actor_observation_sequence is not None
+            else None
+        )
         actor_dones_flat = actor_done_sequence.flatten(0, 1)
         actor_valid_flat = actor_valid_sequence.flatten(0, 1)
         actor_index_offset = (actor_history_length - 1) * self.num_envs
@@ -818,6 +887,16 @@ class RolloutStorageMM:
             amp_reference_observations_mask = None
 
         actions = self.actions.flatten(0, 1)
+        dreamer_target_observations = (
+            self.dreamer_target_observations.flatten(0, 1)
+            if self.dreamer_target_observations is not None
+            else None
+        )
+        dreamer_target_observations_mask = (
+            self.dreamer_target_observations_mask.flatten(0, 1)
+            if self.dreamer_target_observations_mask is not None
+            else None
+        )
         dagger_actions = self.dagger_actions.flatten(0, 1) if self.dagger_actions is not None else None
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
@@ -848,6 +927,15 @@ class RolloutStorageMM:
                     num_steps_per_env=actor_history_length,
                     sequence_valid=actor_valid_flat,
                 ) # shape: (num_steps_per_env, mini_batch_size, *obs_shape)
+                raw_obs_batch = (
+                    self._buffer_sample(
+                        raw_observations,
+                        clamped_indices,
+                        sample_mask,
+                    )
+                    if raw_observations is not None
+                    else None
+                )
                 # obs_batch: (num_steps_per_env, mini_batch_size, *obs_shape)
                 # ref_obs_batch = reference_observations[batch_idx] if reference_observations is not None else None
                 # ref_obs_batch, _ = self._create_obs_buffer_slice(reference_observations, batch_idx, self.dones.flatten(0, 1)) if reference_observations is not None else (None, None)
@@ -874,6 +962,14 @@ class RolloutStorageMM:
                 # critic_ref_obs_mask_batch = critic_ref_obs_mask_batch.squeeze(-1).bool() if critic_ref_obs_mask_batch is not None else None
                 critic_ref_obs_batch_rtn = (critic_ref_obs_batch, critic_ref_obs_mask_batch) if critic_ref_obs_batch is not None else None
                 actions_batch = actions[batch_idx]
+                dreamer_target_batch = (
+                    (
+                        dreamer_target_observations[batch_idx],
+                        dreamer_target_observations_mask[batch_idx],
+                    )
+                    if dreamer_target_observations is not None
+                    else None
+                )
                 dagger_actions_batch = dagger_actions[batch_idx] if dagger_actions is not None else None
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
@@ -903,7 +999,7 @@ class RolloutStorageMM:
                 yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     None,
                     None,
-                ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask
+                ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask, raw_obs_batch, dreamer_target_batch
     
     
 
@@ -1015,7 +1111,7 @@ class RolloutStorageMM:
                 yield obs_batch, ref_obs_batch_rtn, critic_obs_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
                     None,
                     None,
-                ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask
+                ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask, None, None
                 
                 first_traj = last_traj
 

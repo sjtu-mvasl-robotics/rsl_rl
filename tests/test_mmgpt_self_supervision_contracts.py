@@ -28,7 +28,12 @@ _PREDICTED_TERMS = [
 ]
 
 
-def _make_model(*, aux_backbone_grad=True, dreamer_gradient_mode="backbone_only"):
+def _make_model(
+    *,
+    aux_backbone_grad=True,
+    dreamer_gradient_mode="backbone_only",
+    **overrides,
+):
     torch.manual_seed(11)
     return MMGPT(
         obs_size=sum(_TERM_DIMS.values()),
@@ -47,6 +52,7 @@ def _make_model(*, aux_backbone_grad=True, dreamer_gradient_mode="backbone_only"
         apply_rope=False,
         aux_backbone_grad=aux_backbone_grad,
         dreamer_gradient_mode=dreamer_gradient_mode,
+        **overrides,
     )
 
 
@@ -97,6 +103,18 @@ def test_future_prediction_backbone_gradient_is_an_explicit_control(
     assert _grad_norm(model.fc[-1].weight) == 0.0
 
 
+def test_future_prediction_detach_changes_only_autograd_not_loss_values():
+    attached = _make_model(aux_backbone_grad=True).eval()
+    detached = _make_model(aux_backbone_grad=False).eval()
+
+    attached_output = _forward(attached)
+    detached_output = _forward(detached)
+
+    torch.testing.assert_close(attached_output, detached_output)
+    torch.testing.assert_close(attached.aux_loss, detached.aux_loss)
+    torch.testing.assert_close(attached.dreamer_loss, detached.dreamer_loss)
+
+
 @pytest.mark.parametrize(
     ("gradient_mode", "expect_action_head_grad"),
     [
@@ -118,6 +136,20 @@ def test_dreamer_gradient_destination_is_an_explicit_control(
     # The prediction decoder is a fixed differentiable readout for this loss.
     assert _grad_norm(model.aux_heads[0].weight) == 0.0
     assert _grad_norm(model.action_film.weight) == 0.0
+
+
+def test_dreamer_action_detach_changes_only_autograd_not_loss_values():
+    detached = _make_model(dreamer_gradient_mode="backbone_only").eval()
+    attached = _make_model(
+        dreamer_gradient_mode="backbone_and_action_head"
+    ).eval()
+
+    detached_output = _forward(detached)
+    attached_output = _forward(attached)
+
+    torch.testing.assert_close(detached_output, attached_output)
+    torch.testing.assert_close(detached.aux_loss, attached.aux_loss)
+    torch.testing.assert_close(detached.dreamer_loss, attached.dreamer_loss)
 
 
 @pytest.mark.parametrize(
@@ -150,6 +182,206 @@ def test_action_path_only_blocks_the_direct_latent_shortcut(
 def test_dreamer_gradient_mode_rejects_ambiguous_values():
     with pytest.raises(ValueError, match="dreamer_gradient_mode"):
         _make_model(dreamer_gradient_mode="action_head_only")
+
+
+class _RecordingMSE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.targets = []
+
+    def forward(self, prediction, target):
+        self.targets.append(target.detach().clone())
+        return torch.nn.functional.mse_loss(prediction, target)
+
+
+def test_future_prediction_uses_t_plus_one_targets_without_crossing_reset():
+    torch.manual_seed(23)
+    model = MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=2,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        num_steps_per_env=4,
+        max_seq_len=4,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"target_actions": 2},
+        pred_obs_term_names=["joint_pos"],
+        pred_obs_term_weights=[1.0],
+        default_joint_pos=torch.zeros(2),
+        apply_rope=False,
+        aux_backbone_grad=True,
+    ).eval()
+    recorder = _RecordingMSE()
+    model.aux_loss_fn = recorder
+
+    observations = torch.randn(4, 2, sum(_TERM_DIMS.values()))
+    joint_positions = torch.tensor(
+        [
+            [[0.0, 0.5], [1.0, 1.5]],
+            [[10.0, 10.5], [11.0, 11.5]],
+            [[20.0, 20.5], [21.0, 21.5]],
+            [[30.0, 30.5], [31.0, 31.5]],
+        ]
+    )
+    observations[..., :2] = joint_positions
+    masks = torch.tensor(
+        [
+            [False, False],
+            [False, True],
+            [True, True],
+            [True, True],
+        ]
+    )
+    reference = torch.randn(4, 2, 2)
+
+    model._forward_batch(
+        observations,
+        (reference, masks),
+        masks,
+        unpad_output=False,
+        compute_aux_loss=True,
+        compute_dreamer_loss=False,
+    )
+
+    # Valid pairs are (t=1 -> 2, env=1), then both t=2 -> 3 pairs.
+    expected = torch.stack(
+        (joint_positions[2, 1], joint_positions[3, 0], joint_positions[3, 1])
+    )
+    assert len(recorder.targets) == 1
+    torch.testing.assert_close(recorder.targets[0], expected)
+
+
+def test_future_prediction_uses_raw_state_and_resolved_action_coordinates():
+    model = _make_model().eval()
+    recorder = _RecordingMSE()
+    model.aux_loss_fn = recorder
+    film_inputs = []
+
+    def record_film_input(_module, args):
+        film_inputs.append(args[0].detach().clone())
+
+    handle = model.action_film.register_forward_pre_hook(record_film_input)
+    normalized = torch.randn(4, 2, sum(_TERM_DIMS.values()))
+    raw = normalized + 100.0
+    masks = torch.ones(4, 2, dtype=torch.bool)
+    reference = torch.randn(4, 2, 2)
+    try:
+        model._forward_batch(
+            normalized,
+            (reference, masks),
+            masks,
+            raw_observations=raw,
+            compute_aux_loss=True,
+            compute_dreamer_loss=False,
+            unpad_output=False,
+        )
+    finally:
+        handle.remove()
+
+    action_start = sum(
+        dim for name, dim in _TERM_DIMS.items() if name != "actions"
+    )
+    torch.testing.assert_close(
+        film_inputs[0],
+        raw[1:, :, action_start:action_start + _TERM_DIMS["actions"]],
+    )
+    torch.testing.assert_close(
+        recorder.targets[0],
+        raw[1:, :, :_TERM_DIMS["joint_pos"]].reshape(-1, 2),
+    )
+
+
+@pytest.mark.parametrize(
+    ("is_delta", "clip_value", "expected"),
+    [
+        (False, 1.0, [[0.5, 0.0]]),
+        (True, 1.0, [[1.0, -0.75]]),
+        (True, None, [[1.25, -0.75]]),
+    ],
+)
+def test_dreamer_action_resolution_matches_environment_contract(
+    is_delta, clip_value, expected
+):
+    model = _make_model(
+        action_is_delta=is_delta,
+        action_clip_value=clip_value,
+    )
+    previous = torch.tensor([[0.75, -0.75]])
+    policy = torch.tensor([[0.5, float("nan")]])
+
+    resolved = model._resolve_prediction_action(previous, policy)
+
+    torch.testing.assert_close(resolved, torch.tensor(expected))
+
+
+def test_external_adjacent_target_replaces_strided_reference_command():
+    model = MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=8,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        num_steps_per_env=4,
+        max_seq_len=4,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"sonic_release_command": 8},
+        pred_obs_term_names=["joint_pos"],
+        pred_obs_term_weights=[1.0],
+        default_joint_pos=torch.zeros(2),
+        dreamer_target_term_name="target_actions",
+    ).eval()
+    assert model.target_action_slice is None
+    recorder = _RecordingMSE()
+    model.aux_loss_fn = recorder
+    normalized = torch.randn(4, 3, sum(_TERM_DIMS.values()))
+    raw = normalized + 10.0
+    references = torch.randn(4, 3, 8)
+    masks = torch.ones(4, 3, dtype=torch.bool)
+    target = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    target_mask = torch.tensor([True, False, True])
+
+    model._forward_batch(
+        normalized,
+        (references, masks),
+        masks,
+        raw_observations=raw,
+        dreamer_target=(target, target_mask),
+        compute_aux_loss=False,
+        compute_dreamer_loss=True,
+        unpad_output=False,
+    )
+
+    assert len(recorder.targets) == 1
+    torch.testing.assert_close(recorder.targets[0], target[target_mask])
+
+
+def test_dreamer_mask_reduction_is_not_diluted_by_invalid_environments():
+    model = _make_model().eval()
+    torch.manual_seed(29)
+    observations = torch.randn(4, 3, sum(_TERM_DIMS.values()))
+    references = torch.randn(4, 3, 2)
+    observation_masks = torch.ones(4, 3, dtype=torch.bool)
+    reference_masks = torch.zeros(4, 3, dtype=torch.bool)
+    reference_masks[:, 0] = True
+
+    model(
+        observations,
+        (references, reference_masks),
+        observation_masks,
+    )
+    batched_loss = model.dreamer_loss.detach().clone()
+
+    model(
+        observations[:, :1],
+        (references[:, :1], reference_masks[:, :1]),
+        observation_masks[:, :1],
+    )
+    valid_only_loss = model.dreamer_loss.detach().clone()
+
+    torch.testing.assert_close(batched_loss, valid_only_loss)
 
 
 def test_score_prediction_stays_disabled_during_cold_start_ablation():

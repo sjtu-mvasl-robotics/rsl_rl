@@ -138,6 +138,13 @@ class OnPolicyRunnerMM:
 
         actor_critic_name = self.policy_cfg.pop("class_name")
         actor_critic_class = eval(actor_critic_name)  # ActorCritic
+        self._is_mmgpt = actor_critic_name == "ActorCriticMMGPT"
+        self._mmgpt_dreamer_target_term_name = self.policy_cfg.get(
+            "dreamer_target_term_name", "target_actions"
+        )
+        self._mmgpt_external_target_enabled = self._is_mmgpt and callable(
+            getattr(self.env, "get_mmgpt_self_supervision_observations", None)
+        )
         if actor_critic_name in ["ActorCriticMMTransformerV2", "ActorCriticMMGPT", "ActorCriticMLPV2", "ActorCriticMLPV2MoE"]:
             def get_term_dict(dict_names, dict_dims):
                 ret = dict(
@@ -181,6 +188,12 @@ class OnPolicyRunnerMM:
                     self.env.unwrapped.ref_observation_manager.group_ref_obs_term_cfgs,
                 )
                 actor_critic_dim["default_joint_pos"] = self.env.unwrapped.scene['robot'].data.default_joint_pos[0] # shape: (num_joints,)
+                actor_critic_dim["action_is_delta"] = bool(
+                    getattr(self.env.unwrapped, "is_delta", False)
+                )
+                actor_critic_dim["action_clip_value"] = getattr(
+                    self.env.unwrapped, "action_clip_value", None
+                )
         elif actor_critic_name == "StudentTeacherMMTransformer":
             actor_critic_dim = {
                 "num_teacher_obs": num_critic_obs,
@@ -265,6 +278,18 @@ class OnPolicyRunnerMM:
             critic_obs_shape=[num_critic_obs],
             critic_ref_obs_shape=[num_critic_ref_obs] if num_critic_ref_obs > 0 else [None],
             action_shape=[self.env.num_actions],
+            **(
+                {
+                    "store_raw_observations": self._is_mmgpt,
+                    "dreamer_target_shape": (
+                        [self.env.num_actions]
+                        if self._mmgpt_external_target_enabled
+                        else None
+                    ),
+                }
+                if self.training_type == "rl"
+                else {}
+            ),
         )
 
         # --- Planner RL setup ---
@@ -311,6 +336,51 @@ class OnPolicyRunnerMM:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+    def _get_mmgpt_self_supervision_inputs(self, observations_dict):
+        """Preserve pre-normalizer state and query a true one-step target."""
+
+        if not self._is_mmgpt:
+            return None, None
+        raw_obs_dict = observations_dict
+        dreamer_target = None
+        if self._mmgpt_external_target_enabled:
+            raw_obs_dict, dreamer_target = (
+                self.env.get_mmgpt_self_supervision_observations(
+                    observations_dict,
+                    self._mmgpt_dreamer_target_term_name,
+                )
+            )
+        if not isinstance(raw_obs_dict, dict) or "policy" not in raw_obs_dict:
+            raise RuntimeError(
+                "MMGPT self-supervision requires observations['policy'] "
+                "before empirical normalization"
+            )
+        raw_obs = raw_obs_dict["policy"]
+        if not isinstance(raw_obs, torch.Tensor) or raw_obs.ndim != 2:
+            raise ValueError(
+                "raw policy observations must have shape (num_envs, obs_dim)"
+            )
+        raw_obs = raw_obs.to(self.device).detach().clone()
+
+        if dreamer_target is None:
+            return raw_obs, None
+        target, target_mask = dreamer_target
+        if target.shape != (self.env.num_envs, self.env.num_actions):
+            raise ValueError(
+                "adjacent Dreamer target must match the controller action "
+                f"shape {(self.env.num_envs, self.env.num_actions)}, got "
+                f"{tuple(target.shape)}"
+            )
+        if target_mask.shape != (self.env.num_envs,):
+            raise ValueError(
+                "adjacent Dreamer target mask must have shape "
+                f"{(self.env.num_envs,)}, got {tuple(target_mask.shape)}"
+            )
+        return raw_obs, (
+            target.to(self.device).detach().clone(),
+            target_mask.to(self.device).bool().detach().clone(),
+        )
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = True):
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -342,6 +412,9 @@ class OnPolicyRunnerMM:
             )
         obs, extras = self.env.get_observations()
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
+        raw_obs, dreamer_target = self._get_mmgpt_self_supervision_inputs(
+            extras["observations"]
+        )
         critic_obs = extras["observations"].get("critic", obs)
         critic_ref_obs_tuple = ref_extras["ref_observations"].get("critic", ref_obs_tuple) if ref_obs_tuple is not None else None
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
@@ -451,6 +524,8 @@ class OnPolicyRunnerMM:
                         ref_obs=ref_obs_tuple,
                         critic_obs=critic_obs,
                         ref_critic_obs=critic_ref_obs_tuple,
+                        raw_obs=raw_obs,
+                        dreamer_target=dreamer_target,
                     )
                     if self.amp_cfg: # Get amp observation before step and shift into per-env ring buffer
                         amp_obs = string_to_callable(self.amp_cfg["amp_obs_extractor"])(env=self.amp_cfg["_env"])
@@ -468,6 +543,11 @@ class OnPolicyRunnerMM:
                         dones.to(self.device),
                     )
                     ref_obs_tuple = tuple(ref_obs.to(self.device) for ref_obs in ref_obs_tuple) if ref_obs_tuple is not None else None
+                    raw_obs, dreamer_target = (
+                        self._get_mmgpt_self_supervision_inputs(
+                            infos["observations"]
+                        )
+                    )
                     # ref_obss.append(ref_obs_tuple[0])
                     # perform normalization
                     obs = self.obs_normalizer(obs)

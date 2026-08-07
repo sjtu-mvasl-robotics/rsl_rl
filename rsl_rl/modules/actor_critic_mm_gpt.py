@@ -466,6 +466,8 @@ class MMGPT(nn.Module):
         dreamer_gradient_mode: str = "backbone_only",
         dreamer_target_term_name: str = "target_actions",
         dreamer_target_action_offset: int = 0,
+        action_is_delta: bool = False,
+        action_clip_value: Optional[float] = None,
         latest_reference_only: bool = False,
         score_prediction_enabled: bool = False,
         apply_mlp_residual = False,
@@ -544,6 +546,12 @@ class MMGPT(nn.Module):
             raise ValueError("dreamer_target_action_offset must be non-negative")
         self.dreamer_target_term_name = dreamer_target_term_name
         self.dreamer_target_action_offset = dreamer_target_action_offset
+        self.action_is_delta = bool(action_is_delta)
+        if action_clip_value is not None and action_clip_value <= 0.0:
+            raise ValueError("action_clip_value must be positive or None")
+        self.action_clip_value = (
+            None if action_clip_value is None else float(action_clip_value)
+        )
         self.latest_reference_only = bool(latest_reference_only)
         self.score_prediction_enabled = bool(score_prediction_enabled)
         if self.pred_obs_term_names is not None and len(self.pred_obs_term_names) > 0:
@@ -577,13 +585,11 @@ class MMGPT(nn.Module):
                     nn.Linear(dim_model, dim)
                 )
                 
-            if ref_term_dict is not None:
-                if self.dreamer_target_term_name not in ref_term_dict:
-                    raise ValueError(
-                        "If you want to compute the MMGPT dreamer loss, "
-                        f"provide {self.dreamer_target_term_name!r} in the "
-                        "policy reference observation terms."
-                    )
+            self.target_action_slice = None
+            if (
+                ref_term_dict is not None
+                and self.dreamer_target_term_name in ref_term_dict
+            ):
                 start = 0
                 for term_name, term_dim in ref_term_dict.items():
                     if term_name == self.dreamer_target_term_name:
@@ -599,8 +605,6 @@ class MMGPT(nn.Module):
                         break
                     start += term_dim
             
-            else:
-                self.target_action_slice = None
         else:
             self.action_film = None
             self.aux_heads = None
@@ -709,6 +713,87 @@ class MMGPT(nn.Module):
     @property
     def auxiliary_loss(self):
         return self.aux_loss
+
+    def _route_future_prediction_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """Apply only the configured future-prediction backbone stop-gradient."""
+
+        if self.aux_backbone_grad:
+            return latent
+        return latent.detach()
+
+    def _route_dreamer_inputs(
+        self,
+        latent: torch.Tensor,
+        action: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route Dreamer gradients without changing the forward values.
+
+        ``backbone_only`` is the action-detached cell.  The matched
+        ``backbone_and_action_head`` cell removes only that detach.  The
+        historical ``action_path_only`` control keeps the action path but
+        removes the predictor's direct latent shortcut.
+        """
+
+        if self.dreamer_gradient_mode == "backbone_only":
+            action = action.detach()
+        elif self.dreamer_gradient_mode == "action_path_only":
+            latent = latent.detach()
+        return latent, action
+
+    def _resolve_prediction_action(
+        self,
+        previous_action: torch.Tensor,
+        policy_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match the environment's raw controller-command coordinates.
+
+        The future predictor is supervised with ``last_action`` from the raw
+        observation dict.  That term is the action manager's resolved command:
+        in absolute mode it equals the finite policy output, while in delta
+        mode it is the previous resolved command plus the policy delta.  The
+        action-term scale/default offset is deliberately not applied here; it
+        is downstream of both the predictor's training action and this query.
+        """
+
+        if previous_action.shape != policy_action.shape:
+            raise ValueError(
+                "previous and policy actions must have identical shapes, got "
+                f"{tuple(previous_action.shape)} and {tuple(policy_action.shape)}"
+            )
+        finite_action = torch.where(
+            torch.isfinite(policy_action),
+            policy_action,
+            torch.zeros_like(policy_action),
+        )
+        resolved = (
+            previous_action + finite_action
+            if self.action_is_delta
+            else finite_action
+        )
+        if self.action_clip_value is not None:
+            resolved = resolved.clamp(
+                min=-self.action_clip_value,
+                max=self.action_clip_value,
+            )
+        return resolved
+
+    def _masked_prediction_mse(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Mean prediction error over valid transitions/environments only."""
+
+        valid_mask = valid_mask.bool()
+        if valid_mask.any():
+            return self.aux_loss_fn(
+                prediction[valid_mask],
+                target[valid_mask],
+            )
+        # Preserve a differentiable scalar when a batch contains no valid
+        # transition (for example, immediately after every environment reset).
+        return prediction.sum() * 0.0
         
     @staticmethod
     def unpad(padded_sequence, masks):
@@ -804,6 +889,8 @@ class MMGPT(nn.Module):
                 ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 masks: Optional[torch.Tensor] = None, # fake optional. Must be provided in batch mode
                 memory: Optional[Tuple[torch.Tensor, torch.Tensor | None]] = None, # memory token for both modalities
+                raw_observations: Optional[torch.Tensor] = None,
+                dreamer_target: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 unpad_output: bool = True,
                 upsample: bool = True,
                 compute_aux_loss: bool = False,
@@ -825,8 +912,18 @@ class MMGPT(nn.Module):
         
         T_in, B, _ = obs.shape
         device = obs.device   
+        if raw_observations is None:
+            # Backward-compatible fallback for environments/runners that do not
+            # yet expose the pre-normalizer observation path.
+            raw_observations = obs
+        if raw_observations.shape != obs.shape:
+            raise ValueError(
+                "raw_observations must match normalized observations exactly, "
+                f"got {tuple(raw_observations.shape)} and {tuple(obs.shape)}"
+            )
         if T_in > self.num_steps_per_env:
             obs=obs[-self.num_steps_per_env:, :, :]
+            raw_observations = raw_observations[-self.num_steps_per_env:, :, :]
             if masks is not None:
                 masks = masks[-self.num_steps_per_env:, :]
             if ref_obs is not None:
@@ -948,17 +1045,14 @@ class MMGPT(nn.Module):
         
         if compute_aux_loss and self.aux_heads is not None:
             self.aux_loss = 0.0
-            obs_actions = obs[:, :, self.action_slice[0]:self.action_slice[1]]  # [T_in, B, action_dim]
+            obs_actions = raw_observations[:, :, self.action_slice[0]:self.action_slice[1]]  # [T_in, B, action_dim]
             obs_actions = obs_actions[1:] # shift 1 step to ensure matching with input
             gamma, beta = self.action_film(obs_actions).chunk(2, dim=-1)  # [T_in-1, B, D] each
             for obs_term_slice, aux_head, weight in zip(self.obs_indices, self.aux_heads, self.pred_obs_term_weights):
-                target = obs[:, :, obs_term_slice[0]:obs_term_slice[1]] # [T_in, B, dim]
-                pred_in = upsampled_out[:-1]  # [T_in-1, B, D]
-                if not self.aux_backbone_grad:
-                    # Head-only control: retain supervised prediction-head
-                    # learning while preventing the future target from
-                    # shaping the shared policy representation.
-                    pred_in = pred_in.detach()
+                target = raw_observations[:, :, obs_term_slice[0]:obs_term_slice[1]] # [T_in, B, dim]
+                pred_in = self._route_future_prediction_latent(
+                    upsampled_out[:-1]
+                )  # [T_in-1, B, D]
                 # FiLM modulation
                 pred_in = gamma * pred_in + beta  # [T_in-1, B, D]
                 pred = aux_head(pred_in) # [T_in - 1, B, dim]
@@ -969,14 +1063,11 @@ class MMGPT(nn.Module):
                 # in the same unmasked trajectory segment. In particular, do
                 # not train the world-model head across an episode reset.
                 valid_mask = masks[:-1] & masks[1:] # shape: [T_in-1, B]
-                if valid_mask.any():
-                    target_valid = target_shifted[valid_mask]
-                    pred_valid = pred_shifted[valid_mask]
-                    aux_loss_i = self.aux_loss_fn(pred_valid, target_valid)
-                else:
-                    # Keep a differentiable zero instead of asking MSELoss to
-                    # reduce an empty tensor on the first frame after reset.
-                    aux_loss_i = pred_shifted.sum() * 0.0
+                aux_loss_i = self._masked_prediction_mse(
+                    pred_shifted,
+                    target_shifted,
+                    valid_mask,
+                )
                 self.aux_loss += weight * aux_loss_i            
                 
         else:
@@ -1013,21 +1104,24 @@ class MMGPT(nn.Module):
                 
                 
         
-        if compute_dreamer_loss and self.target_action_slice is not None:
+        if compute_dreamer_loss and self.aux_heads is not None and (
+            dreamer_target is not None or self.target_action_slice is not None
+        ):
             self.dreamer_loss = 0.0
             # extract target actions from ref_obs
             cur_latent = upsampled_out[-1, :, :]  # [B, dim_out]
             cur_action = pred_actions[-1, :, :]
-            if self.dreamer_gradient_mode == "backbone_only":
-                # The imagined prediction error trains the representation via
-                # cur_latent, but treats the already-decoded action as fixed.
-                cur_action = cur_action.detach()
-            elif self.dreamer_gradient_mode == "action_path_only":
-                # Keep the frozen world-model readout differentiable with
-                # respect to the decoded action, while blocking its direct
-                # latent shortcut. The loss can therefore update the policy
-                # only through action -> action head -> shared backbone.
-                cur_latent = cur_latent.detach()
+            previous_action = raw_observations[
+                -1, :, self.action_slice[0]:self.action_slice[1]
+            ]
+            cur_action = self._resolve_prediction_action(
+                previous_action,
+                cur_action,
+            )
+            cur_latent, cur_action = self._route_dreamer_inputs(
+                cur_latent,
+                cur_action,
+            )
             # no parameter update for aux head
             joint_pred_aux_idx = self.obs_term_names.index('joint_pos')
             film_params = {k: v.detach() for k, v in self.action_film.named_parameters()}
@@ -1039,12 +1133,32 @@ class MMGPT(nn.Module):
             buffers = {k: v.detach() for k, v in cur_aux_head.named_buffers()}
             pred_joint_pos = functional_call(cur_aux_head, (params, buffers), (cur_latent,))  # [B, joint_dim]
             pred_joint_pos += self.default_joint_pos.to(device)  # de-normalize
-            target_joint_pos = ref_obs[0][-1, :, self.target_action_slice[0]:self.target_action_slice[1]]  # [B, action_dim]
-            target_mask = ref_obs[1][-1, :]  # [B,]
-            pred_joint_pos_valid = pred_joint_pos * target_mask.unsqueeze(-1) # [B, joint_dim]
-            target_joint_pos_valid = target_joint_pos * target_mask.unsqueeze(-1) # [B, joint_dim]
-
-            self.dreamer_loss = self.aux_loss_fn(pred_joint_pos_valid, target_joint_pos_valid)
+            if dreamer_target is not None:
+                target_joint_pos, target_mask = dreamer_target
+            else:
+                target_joint_pos = ref_obs[0][
+                    -1,
+                    :,
+                    self.target_action_slice[0]:self.target_action_slice[1],
+                ]
+                target_mask = ref_obs[1][-1, :]
+            if target_joint_pos.shape != pred_joint_pos.shape:
+                raise ValueError(
+                    "Dreamer target must match predicted absolute joint pose, "
+                    f"got {tuple(target_joint_pos.shape)} and "
+                    f"{tuple(pred_joint_pos.shape)}"
+                )
+            if target_mask.shape != pred_joint_pos.shape[:-1]:
+                raise ValueError(
+                    "Dreamer target mask must match the prediction batch, got "
+                    f"{tuple(target_mask.shape)} and "
+                    f"{tuple(pred_joint_pos.shape[:-1])}"
+                )
+            self.dreamer_loss = self._masked_prediction_mse(
+                pred_joint_pos,
+                target_joint_pos,
+                target_mask,
+            )
                   
             
         else:
@@ -1146,7 +1260,9 @@ class MMGPT(nn.Module):
             return self._forward_batch(
                 obs,
                 ref_obs,
-                masks,
+                raw_observations=kwargs.get("raw_observations"),
+                dreamer_target=kwargs.get("dreamer_target"),
+                masks=masks,
                 memory=memory,
                 unpad_output=unpad_output,
                 compute_aux_loss=True,

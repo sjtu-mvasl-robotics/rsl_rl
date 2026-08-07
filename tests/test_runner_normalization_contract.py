@@ -44,3 +44,17 @@ def test_dataset_collection_does_not_double_normalize_policy_inputs():
     assert "policy = self.get_inference_policy" in source
     assert "obs = self.obs_normalizer(obs)" not in source
     assert "self.ref_obs_normalizer(ref_obs_tuple[0])" not in source
+
+
+def test_mmgpt_self_supervision_preserves_pre_normalizer_policy_observations():
+    extraction_source = _method_source("_get_mmgpt_self_supervision_inputs")
+    learn_source = _method_source("learn")
+
+    assert "raw_obs_dict['policy']" in extraction_source
+    assert "observations_dict," in extraction_source
+    assert "raw_obs.to(self.device).detach().clone()" in extraction_source
+    first_extract = learn_source.index("_get_mmgpt_self_supervision_inputs")
+    first_normalize = learn_source.index("self.obs_normalizer(obs)")
+    assert first_extract < first_normalize
+    assert "raw_obs=raw_obs" in learn_source
+    assert "dreamer_target=dreamer_target" in learn_source

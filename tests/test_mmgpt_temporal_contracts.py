@@ -1,3 +1,5 @@
+import copy
+
 import torch
 
 from rsl_rl.modules.actor_critic_mm_gpt import MMGPT
@@ -112,6 +114,7 @@ def _make_storage(
     obs_dim=1,
     ref_dim=1,
     action_dim=1,
+    self_supervision=False,
 ):
     return RolloutStorageMM(
         training_type="rl",
@@ -125,6 +128,8 @@ def _make_storage(
         device="cpu",
         actor_history_length=history_length,
         critic_history_length=1,
+        raw_obs_shape=(obs_dim,) if self_supervision else None,
+        dreamer_target_shape=(action_dim,) if self_supervision else None,
     )
 
 
@@ -135,6 +140,14 @@ def _add_storage_step(storage, observations, references, dones, action_mean=None
     action_dim = storage.actions.shape[-1]
     transition = RolloutStorageMM.Transition()
     transition.observations = observations
+    if storage.raw_observations is not None:
+        transition.raw_observations = observations + 10_000.0
+        transition.dreamer_target_observations = (
+            observations[:, :action_dim] + 20_000.0
+        )
+        transition.dreamer_target_observations_mask = torch.ones(
+            num_envs, dtype=torch.bool
+        )
     transition.reference_observations = references
     transition.reference_observations_mask = torch.ones(
         num_envs, dtype=torch.bool
@@ -276,6 +289,88 @@ def test_mmgpt_action_uses_valid_history_and_current_reference_only():
         assert not torch.allclose(baseline, reference_output)
 
 
+def test_mmgpt_online_inference_matches_batch_history_with_async_resets():
+    """Lock the no-cache rollout semantics before adding a KV cache."""
+
+    history_length = 4
+    num_envs = 3
+    online_model = _make_rope_mmgpt(history_length)
+    batch_model = copy.deepcopy(online_model)
+    observation_histories = [[] for _ in range(num_envs)]
+    reference_histories = [[] for _ in range(num_envs)]
+    done_schedule = (
+        torch.tensor([False, False, False]),
+        torch.tensor([True, False, False]),
+        torch.tensor([False, False, True]),
+        torch.tensor([False, False, False]),
+        torch.tensor([False, True, False]),
+        torch.tensor([False, False, False]),
+    )
+
+    torch.manual_seed(31)
+    with torch.no_grad():
+        for dones in done_schedule:
+            observations = torch.randn(
+                num_envs, sum(_TERM_DIMS.values())
+            )
+            references = torch.randn(num_envs, 2)
+            reference_mask = torch.ones(num_envs, dtype=torch.bool)
+            online_actions = online_model(
+                observations,
+                (references, reference_mask),
+            )
+
+            observation_sequence = torch.zeros(
+                history_length,
+                num_envs,
+                sum(_TERM_DIMS.values()),
+            )
+            reference_sequence = torch.zeros(
+                history_length, num_envs, 2
+            )
+            masks = torch.zeros(
+                history_length, num_envs, dtype=torch.bool
+            )
+            reference_masks = torch.zeros_like(masks)
+            for env_id in range(num_envs):
+                observation_histories[env_id].append(
+                    observations[env_id].clone()
+                )
+                reference_histories[env_id].append(
+                    references[env_id].clone()
+                )
+                observation_histories[env_id] = observation_histories[
+                    env_id
+                ][-history_length:]
+                reference_histories[env_id] = reference_histories[env_id][
+                    -history_length:
+                ]
+                valid_length = len(observation_histories[env_id])
+                observation_sequence[-valid_length:, env_id] = torch.stack(
+                    observation_histories[env_id]
+                )
+                masks[-valid_length:, env_id] = True
+                # latest_reference_only deliberately exposes only the current
+                # SONIC command, even though proprioceptive history is kept.
+                reference_sequence[-1, env_id] = reference_histories[env_id][
+                    -1
+                ]
+                reference_masks[-1, env_id] = True
+
+            batch_actions = batch_model(
+                observation_sequence,
+                (reference_sequence, reference_masks),
+                masks,
+                unpad_output=False,
+            )
+            torch.testing.assert_close(online_actions, batch_actions)
+
+            online_model.reset(dones)
+            for env_id in dones.nonzero(as_tuple=False).flatten().tolist():
+                observation_histories[env_id].clear()
+                reference_histories[env_id].clear()
+
+
 def test_rollout_update_recomputes_the_same_mmgpt_context_across_boundary():
     torch.manual_seed(23)
     num_envs = 2
@@ -324,3 +419,41 @@ def test_rollout_update_recomputes_the_same_mmgpt_context_across_boundary():
     torch.testing.assert_close(
         recomputed_mu, old_mu_batch, atol=3.0e-6, rtol=3.0e-5
     )
+
+
+def test_raw_history_and_adjacent_targets_follow_the_same_sample_indices():
+    storage = _make_storage(
+        num_envs=2,
+        rollout_steps=4,
+        history_length=3,
+        self_supervision=True,
+    )
+    for step in range(4):
+        observations = torch.tensor(
+            [[10.0 * step], [10.0 * step + 1.0]]
+        )
+        _add_storage_step(
+            storage,
+            observations,
+            observations + 1_000.0,
+            torch.zeros(2, dtype=torch.bool),
+        )
+
+    batch = next(storage.buffer_mini_batch_generator(1, 1))
+    obs_batch, old_mu_batch, masks_batch = batch[0], batch[9], batch[13]
+    raw_obs_batch, dreamer_target_batch = batch[18], batch[19]
+
+    assert raw_obs_batch is not None
+    assert dreamer_target_batch is not None
+    torch.testing.assert_close(
+        raw_obs_batch[masks_batch],
+        obs_batch[masks_batch] + 10_000.0,
+    )
+    torch.testing.assert_close(
+        raw_obs_batch[~masks_batch],
+        torch.zeros_like(raw_obs_batch[~masks_batch]),
+    )
+    torch.testing.assert_close(
+        dreamer_target_batch[0], old_mu_batch + 20_000.0
+    )
+    assert dreamer_target_batch[1].all()

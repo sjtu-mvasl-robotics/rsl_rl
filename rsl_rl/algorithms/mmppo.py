@@ -619,7 +619,20 @@ class MMPPO:
             else:
                 param_group["lr"] = self.learning_rate
 
-    def init_storage(self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, actor_ref_obs_shape, critic_obs_shape, critic_ref_obs_shape, action_shape):
+    def init_storage(
+        self,
+        training_type,
+        num_envs,
+        num_transitions_per_env,
+        actor_obs_shape,
+        actor_ref_obs_shape,
+        critic_obs_shape,
+        critic_ref_obs_shape,
+        action_shape,
+        *,
+        store_raw_observations=False,
+        dreamer_target_shape=None,
+    ):
         if self.rnd:
             rnd_state_shape = [self.rnd.num_states]
         else:
@@ -646,6 +659,8 @@ class MMPPO:
             device=self.device,
             actor_history_length=actor_history_length,
             critic_history_length=critic_history_length,
+            raw_obs_shape=actor_obs_shape if store_raw_observations else None,
+            dreamer_target_shape=dreamer_target_shape,
         )
 
         # Initialize teacher replay buffer
@@ -668,7 +683,15 @@ class MMPPO:
         if self.amp:
             self.amp.train()
 
-    def act(self, obs, ref_obs, critic_obs, ref_critic_obs):
+    def act(
+        self,
+        obs,
+        ref_obs,
+        critic_obs,
+        ref_critic_obs,
+        raw_obs=None,
+        dreamer_target=None,
+    ):
         # if self.actor_critic.is_recurrent:
         #     self.transition.hidden_states = self.actor_critic.get_hidden_states()
         
@@ -709,8 +732,15 @@ class MMPPO:
         
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
+        self.transition.raw_observations = raw_obs
         self.transition.reference_observations = ref_obs[0] if ref_obs is not None else None
         self.transition.reference_observations_mask = ref_obs[1] if ref_obs is not None else None
+        self.transition.dreamer_target_observations = (
+            dreamer_target[0] if dreamer_target is not None else None
+        )
+        self.transition.dreamer_target_observations_mask = (
+            dreamer_target[1] if dreamer_target is not None else None
+        )
         self.transition.critic_observations = critic_obs 
         self.transition.critic_reference_observations = ref_critic_obs[0] if ref_critic_obs is not None else None
         self.transition.critic_reference_observations_mask = ref_critic_obs[1] if ref_critic_obs is not None else None
@@ -868,6 +898,8 @@ class MMPPO:
             amp_obs_history,
             amp_ref_obs_history,
             amp_ref_obs_history_mask,
+            raw_obs_batch,
+            dreamer_target_batch,
         ) in generator:
 
             num_aug = 1
@@ -893,7 +925,14 @@ class MMPPO:
 
             with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
                 
-                self.actor_critic.act(obs_batch, ref_observations=ref_obs_batch, masks=masks_batch, memory=hid_states_batch)
+                self.actor_critic.act(
+                    obs_batch,
+                    ref_observations=ref_obs_batch,
+                    masks=masks_batch,
+                    memory=hid_states_batch,
+                    raw_observations=raw_obs_batch,
+                    dreamer_target=dreamer_target_batch,
+                )
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
                 value_batch = self.actor_critic.evaluate(
                     critic_obs_batch, ref_critic_observations=critic_ref_obs_batch,
