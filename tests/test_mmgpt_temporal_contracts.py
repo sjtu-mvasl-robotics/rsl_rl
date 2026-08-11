@@ -248,6 +248,168 @@ def _make_rope_mmgpt(history_length):
     return model.eval()
 
 
+def _make_streaming_rope_mmgpt(history_length, num_layers=2):
+    torch.manual_seed(17)
+    return MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=2,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=num_layers,
+        dropout=0.0,
+        num_steps_per_env=history_length,
+        max_seq_len=history_length,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"target_actions": 2},
+        pred_obs_term_names=None,
+        pred_obs_term_weights=None,
+        default_joint_pos=torch.zeros(2),
+        apply_rope=True,
+        latest_reference_only=False,
+        streaming_kv_cache=True,
+        streaming_context_steps=history_length,
+    ).eval()
+
+
+def test_streaming_kv_matches_full_local_sequence_across_async_resets():
+    history_length = 4
+    time_steps = 9
+    num_envs = 3
+    online_model = _make_streaming_rope_mmgpt(history_length)
+    batch_model = copy.deepcopy(online_model)
+
+    torch.manual_seed(41)
+    observations = torch.randn(
+        time_steps, num_envs, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(time_steps, num_envs, 2)
+    reference_masks = torch.ones(time_steps, num_envs, dtype=torch.bool)
+    masks = torch.ones_like(reference_masks)
+    dones = torch.tensor(
+        [
+            [False, False, False],
+            [True, False, False],
+            [False, False, True],
+            [False, False, False],
+            [False, True, False],
+            [False, False, False],
+            [False, False, False],
+            [False, False, True],
+            [False, False, False],
+        ]
+    )
+    episode_ids = torch.zeros(time_steps, num_envs, dtype=torch.long)
+    for step in range(1, time_steps):
+        episode_ids[step] = episode_ids[step - 1] + dones[step - 1].long()
+
+    online_actions = []
+    with torch.no_grad():
+        for step in range(time_steps):
+            online_actions.append(
+                online_model(
+                    observations[step],
+                    (references[step], reference_masks[step]),
+                )
+            )
+            online_model.reset(dones[step])
+
+        hidden, _, _ = batch_model._streaming_sequence_hidden(
+            observations,
+            (references, reference_masks),
+            masks,
+            episode_ids=episode_ids,
+        )
+        batch_actions = batch_model.fc(hidden)
+
+    torch.testing.assert_close(
+        torch.stack(online_actions), batch_actions, atol=3.0e-7, rtol=3.0e-6
+    )
+    assert online_model.inference_kv_cache["key_padding_mask"].shape[-1] == 6
+
+
+def test_streaming_history_keeps_past_reference_but_reset_removes_it():
+    model_a = _make_streaming_rope_mmgpt(history_length=4)
+    model_b = copy.deepcopy(model_a)
+    torch.manual_seed(42)
+    observations = torch.randn(2, 1, sum(_TERM_DIMS.values()))
+    references = torch.randn(2, 1, 2)
+    changed_references = references.clone()
+    changed_references[0] += 50.0
+    valid = torch.ones(2, 1, dtype=torch.bool)
+
+    with torch.no_grad():
+        hidden_a, _, _ = model_a._streaming_sequence_hidden(
+            observations, (references, valid), valid
+        )
+        hidden_b, _, _ = model_b._streaming_sequence_hidden(
+            observations, (changed_references, valid), valid
+        )
+    assert not torch.allclose(hidden_a[1], hidden_b[1])
+
+    online_a = copy.deepcopy(model_a)
+    online_b = copy.deepcopy(model_a)
+    with torch.no_grad():
+        online_a(observations[0], (references[0], valid[0]))
+        online_b(observations[0], (changed_references[0], valid[0]))
+        done = torch.ones(1, dtype=torch.bool)
+        online_a.reset(done)
+        online_b.reset(done)
+        after_reset_a = online_a(
+            observations[1], (references[1], valid[1])
+        )
+        after_reset_b = online_b(
+            observations[1], (references[1], valid[1])
+        )
+    torch.testing.assert_close(after_reset_a, after_reset_b)
+
+
+def test_streaming_kv_is_rebuilt_after_a_training_forward_changes_weights():
+    history_length = 4
+    num_envs = 2
+    model = _make_streaming_rope_mmgpt(history_length)
+    torch.manual_seed(43)
+    observations = torch.randn(
+        history_length + 1, num_envs, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(history_length + 1, num_envs, 2)
+    reference_masks = torch.ones(history_length + 1, num_envs, dtype=torch.bool)
+
+    with torch.no_grad():
+        for step in range(history_length):
+            model(observations[step], (references[step], reference_masks[step]))
+
+    # Batch mode marks rollout K/V stale because an optimizer step may follow.
+    masks = torch.ones(history_length, num_envs, dtype=torch.bool)
+    model(
+        observations[:history_length],
+        (references[:history_length], reference_masks[:history_length]),
+        masks,
+    )
+    assert model.inference_kv_cache_dirty
+    with torch.no_grad():
+        model.decoder.encoder.layers[0].self_attn.qkv_proj.weight.add_(0.01)
+        rebuilt_action = model(
+            observations[-1], (references[-1], reference_masks[-1])
+        )
+
+        replay_model = copy.deepcopy(model)
+        retained_obs = observations[-history_length:]
+        retained_ref = references[-history_length:]
+        retained_ref_mask = reference_masks[-history_length:]
+        hidden, _, _ = replay_model._streaming_sequence_hidden(
+            retained_obs,
+            (retained_ref, retained_ref_mask),
+            masks,
+        )
+        replay_action = replay_model.fc(hidden[-1])
+
+    assert not model.inference_kv_cache_dirty
+    torch.testing.assert_close(
+        rebuilt_action, replay_action, atol=3.0e-7, rtol=3.0e-6
+    )
+
+
 def test_mmgpt_action_uses_valid_history_and_current_reference_only():
     model = _make_rope_mmgpt(history_length=4)
     torch.manual_seed(19)
@@ -418,6 +580,68 @@ def test_rollout_update_recomputes_the_same_mmgpt_context_across_boundary():
 
     torch.testing.assert_close(
         recomputed_mu, old_mu_batch, atol=3.0e-6, rtol=3.0e-5
+    )
+
+
+def test_streaming_sequence_batch_recomputes_collected_policy_means():
+    torch.manual_seed(47)
+    num_envs = 2
+    rollout_steps = 4
+    history_length = 3
+    obs_dim = sum(_TERM_DIMS.values())
+    model = _make_streaming_rope_mmgpt(history_length)
+    model.streaming_sequence_training = True
+    storage = _make_storage(
+        num_envs=num_envs,
+        rollout_steps=rollout_steps,
+        history_length=history_length,
+        obs_dim=obs_dim,
+        ref_dim=2,
+        action_dim=2,
+    )
+
+    def collect(done_schedule):
+        for step in range(rollout_steps):
+            observations = torch.randn(num_envs, obs_dim)
+            references = torch.randn(num_envs, 2)
+            reference_masks = torch.ones(num_envs, dtype=torch.bool)
+            with torch.no_grad():
+                action_mean = model(
+                    observations, (references, reference_masks)
+                )
+            dones = done_schedule(step)
+            _add_storage_step(
+                storage,
+                observations,
+                references,
+                dones,
+                action_mean=action_mean,
+            )
+            model.reset(dones)
+
+    collect(lambda step: torch.tensor([step == 2, False]))
+    storage.clear()
+    # PPO changes model parameters between rollouts, so rollout inference starts
+    # by prefilling the cache from the retained raw history.
+    model.invalidate_inference_cache()
+    collect(lambda step: torch.tensor([False, step == 1]))
+
+    batch = next(storage.streaming_sequence_mini_batch_generator(1, 1))
+    obs_batch, ref_batch, old_mu_batch = batch[0], batch[1], batch[9]
+    metadata, masks_batch = batch[12], batch[13]
+    with torch.no_grad():
+        recomputed_mu = model(
+            obs_batch,
+            ref_batch,
+            masks_batch,
+            episode_ids=metadata["episode_ids"],
+            sequence_output_start=metadata["sequence_output_start"],
+        )
+
+    assert obs_batch.shape[:2] == (history_length - 1 + rollout_steps, num_envs)
+    assert recomputed_mu.shape == (rollout_steps * num_envs, 2)
+    torch.testing.assert_close(
+        recomputed_mu, old_mu_batch, atol=3.0e-7, rtol=3.0e-6
     )
 
 

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple, Literal
+from typing import Optional, Tuple, Literal, List, Dict, Any
 from rsl_rl.networks.rope import RotaryEmbedding
 
 
@@ -192,7 +192,8 @@ class RoPEMultiHeadAttention(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
-        interleave: bool = False
+        interleave: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
@@ -216,7 +217,15 @@ class RoPEMultiHeadAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         # Apply RoPE to queries and keys
-        if hasattr(self.rope, 'rotate_queries_and_keys') and getattr(self.rope, 'use_xpos', False):
+        if position_ids is not None:
+            if tuple(position_ids.shape) != (batch_size, seq_len):
+                raise ValueError(
+                    "position_ids must match attention [B, T], got "
+                    f"{tuple(position_ids.shape)} and {tuple(query.shape)}"
+                )
+            q = self.rope.rotate_queries_or_keys_at_positions(q, position_ids)
+            k = self.rope.rotate_queries_or_keys_at_positions(k, position_ids)
+        elif hasattr(self.rope, 'rotate_queries_and_keys') and getattr(self.rope, 'use_xpos', False):
             q, k = self.rope.rotate_queries_and_keys(q, k, interleave=interleave)
         else:
             q = self.rope.rotate_queries_or_keys(q, interleave=interleave)
@@ -293,6 +302,142 @@ class RoPEMultiHeadAttention(nn.Module):
             output = output.masked_fill(query_padding_mask, 0.0)
 
         return output, attn_weights
+
+    def forward_with_kv_cache(
+        self,
+        query: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_padding_mask: torch.Tensor,
+        past_key: Optional[torch.Tensor] = None,
+        past_value: Optional[torch.Tensor] = None,
+        past_key_padding_mask: Optional[torch.Tensor] = None,
+        max_cache_tokens: int = 0,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Attend new tokens to a bounded append-only KV memory.
+
+        Cached keys are stored *after* RoPE at their episode-local absolute
+        positions.  The cache implements the same semantics as a full
+        sequence with local causal attention; eviction removes keys from
+        direct attention but intentionally does not rewrite contextual hidden
+        states already stored by upper layers.
+        """
+
+        batch_size, query_len, _ = query.shape
+        if tuple(position_ids.shape) != (batch_size, query_len):
+            raise ValueError(
+                "position_ids must match query [B, T], got "
+                f"{tuple(position_ids.shape)} and {tuple(query.shape)}"
+            )
+        if tuple(token_padding_mask.shape) != (batch_size, query_len):
+            raise ValueError(
+                "token_padding_mask must match query [B, T], got "
+                f"{tuple(token_padding_mask.shape)} and {tuple(query.shape)}"
+            )
+
+        qkv = self.qkv_proj(query)
+        qkv = qkv.reshape(
+            batch_size,
+            query_len,
+            3,
+            self.num_heads,
+            self.head_dim,
+        ).permute(2, 0, 3, 1, 4)
+        q, new_key, new_value = qkv[0], qkv[1], qkv[2]
+        q = self.rope.rotate_queries_or_keys_at_positions(q, position_ids)
+        new_key = self.rope.rotate_queries_or_keys_at_positions(
+            new_key, position_ids
+        )
+
+        if past_key is None:
+            if past_value is not None or past_key_padding_mask is not None:
+                raise ValueError("partial KV cache state is not allowed")
+            key = new_key
+            value = new_value
+            key_padding_mask = token_padding_mask.bool()
+            past_len = 0
+        else:
+            if past_value is None or past_key_padding_mask is None:
+                raise ValueError("past key/value/padding must be supplied together")
+            if past_key.shape != past_value.shape:
+                raise ValueError("past key and value must have identical shapes")
+            if past_key.shape[:2] != (batch_size, self.num_heads):
+                raise ValueError(
+                    "past cache batch/head dimensions do not match attention"
+                )
+            past_len = past_key.shape[-2]
+            if tuple(past_key_padding_mask.shape) != (batch_size, past_len):
+                raise ValueError("past padding mask does not match cached keys")
+            key = torch.cat((past_key, new_key), dim=-2)
+            value = torch.cat((past_value, new_value), dim=-2)
+            key_padding_mask = torch.cat(
+                (past_key_padding_mask.bool(), token_padding_mask.bool()),
+                dim=-1,
+            )
+
+        key_len = key.shape[-2]
+        # Every cached token is in the past.  Within the new block retain the
+        # ordinary triangular order: with [ref_t, obs_t], ref_t cannot see
+        # obs_t while obs_t can see ref_t.
+        local_causal_block = torch.zeros(
+            query_len, key_len, dtype=torch.bool, device=query.device
+        )
+        local_causal_block[:, past_len:] = torch.ones(
+            query_len,
+            query_len,
+            dtype=torch.bool,
+            device=query.device,
+        ).triu(diagonal=1)
+
+        attention_bias, fully_blocked = self._build_attention_bias(
+            attn_mask=local_causal_block,
+            key_padding_mask=key_padding_mask,
+            is_causal=False,
+            batch_size=batch_size,
+            query_len=query_len,
+            key_len=key_len,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
+            attn_output = F.scaled_dot_product_attention(
+                query=q,
+                key=key,
+                value=value,
+                attn_mask=attention_bias,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False,
+            )
+        else:
+            attn_weights = torch.matmul(q, key.transpose(-2, -1)) * self.scale
+            if attention_bias is not None:
+                attn_weights = attn_weights + attention_bias
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            if fully_blocked is not None:
+                attn_weights = attn_weights.masked_fill(fully_blocked, 0.0)
+            attn_output = torch.matmul(self.dropout(attn_weights), value)
+
+        if fully_blocked is not None:
+            attn_output = attn_output.masked_fill(fully_blocked, 0.0)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
+            batch_size, query_len, self.d_model
+        )
+        output = self.out_proj(attn_output)
+        output = output.masked_fill(token_padding_mask.bool().unsqueeze(-1), 0.0)
+
+        if max_cache_tokens <= 0:
+            cached_key = key[..., :0, :]
+            cached_value = value[..., :0, :]
+            cached_padding = key_padding_mask[:, :0]
+        else:
+            cached_key = key[..., -max_cache_tokens:, :].detach()
+            cached_value = value[..., -max_cache_tokens:, :].detach()
+            cached_padding = key_padding_mask[:, -max_cache_tokens:].detach()
+        return output, cached_key, cached_value, cached_padding
 
 
 class SwiGLUFFN(nn.Module):
@@ -388,7 +533,8 @@ class RoPETransformerEncoderLayer(nn.Module):
         src_mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
-        interleave: bool = False
+        interleave: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -413,7 +559,8 @@ class RoPETransformerEncoderLayer(nn.Module):
                 attn_mask=src_mask,
                 key_padding_mask=src_key_padding_mask,
                 is_causal=is_causal,
-                interleave=interleave
+                interleave=interleave,
+                position_ids=position_ids,
             )
             src = residual + self.dropout1(attn_output)
 
@@ -427,7 +574,8 @@ class RoPETransformerEncoderLayer(nn.Module):
                 attn_mask=src_mask,
                 key_padding_mask=src_key_padding_mask,
                 is_causal=is_causal,
-                interleave=interleave
+                interleave=interleave,
+                position_ids=position_ids,
             )
             src = self.norm1(src + self.dropout1(attn_output))
             src = self.norm2(src + self.dropout2(self._ff_block(src)))
@@ -436,6 +584,63 @@ class RoPETransformerEncoderLayer(nn.Module):
             src = src.transpose(0, 1)
 
         return src
+
+    def forward_with_kv_cache(
+        self,
+        src: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_padding_mask: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_padding_mask: Optional[torch.Tensor] = None,
+        max_cache_tokens: int = 0,
+    ) -> Tuple[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor,
+    ]:
+        """Increment one encoder layer and return its bounded KV memory."""
+
+        if not self.batch_first:
+            src = src.transpose(0, 1)
+        past_key, past_value = (
+            past_key_value if past_key_value is not None else (None, None)
+        )
+
+        if self.norm_first:
+            residual = src
+            normalized = self.norm1(src)
+            attn_output, key, value, padding = (
+                self.self_attn.forward_with_kv_cache(
+                    normalized,
+                    position_ids=position_ids,
+                    token_padding_mask=token_padding_mask,
+                    past_key=past_key,
+                    past_value=past_value,
+                    past_key_padding_mask=past_key_padding_mask,
+                    max_cache_tokens=max_cache_tokens,
+                )
+            )
+            src = residual + self.dropout1(attn_output)
+            residual = src
+            src = residual + self.dropout2(self._ff_block(self.norm2(src)))
+        else:
+            attn_output, key, value, padding = (
+                self.self_attn.forward_with_kv_cache(
+                    src,
+                    position_ids=position_ids,
+                    token_padding_mask=token_padding_mask,
+                    past_key=past_key,
+                    past_value=past_value,
+                    past_key_padding_mask=past_key_padding_mask,
+                    max_cache_tokens=max_cache_tokens,
+                )
+            )
+            src = self.norm1(src + self.dropout1(attn_output))
+            src = self.norm2(src + self.dropout2(self._ff_block(src)))
+
+        if not self.batch_first:
+            src = src.transpose(0, 1)
+        return src, (key, value), padding
 
 
 class RoPETransformerEncoder(nn.Module):
@@ -461,7 +666,8 @@ class RoPETransformerEncoder(nn.Module):
         mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
-        interleave: bool = False
+        interleave: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output = src
 
@@ -471,7 +677,8 @@ class RoPETransformerEncoder(nn.Module):
                 src_mask=mask,
                 src_key_padding_mask=src_key_padding_mask,
                 is_causal=is_causal,
-                interleave=interleave
+                interleave=interleave,
+                position_ids=position_ids,
             )
 
         if self.norm is not None:
@@ -605,7 +812,8 @@ class RoPETransformer(nn.Module):
         src_mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         is_causal: bool = False,
-        interleave: bool = False
+        interleave: bool = False,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -629,13 +837,72 @@ class RoPETransformer(nn.Module):
             mask=src_mask,
             src_key_padding_mask=src_key_padding_mask,
             is_causal=is_causal,
-            interleave=interleave
+            interleave=interleave,
+            position_ids=position_ids,
         )
 
         if self.output_proj is not None:
             output = self.output_proj(output)
 
         return output
+
+    def forward_with_kv_cache(
+        self,
+        src: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_padding_mask: torch.Tensor,
+        cache: Optional[Dict[str, Any]] = None,
+        max_cache_tokens: int = 0,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Incrementally encode new tokens with one KV cache per layer."""
+
+        if self.embedding is not None:
+            src = self.embedding(src) * math.sqrt(self.d_model)
+        elif self.input_proj is not None:
+            src = self.input_proj(src)
+
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
+        past_padding = None
+        if cache is None:
+            past_key_values = None
+        else:
+            past_key_values = cache.get("key_values")
+            past_padding = cache.get("key_padding_mask")
+            if past_key_values is None or len(past_key_values) != len(
+                self.encoder.layers
+            ):
+                raise ValueError("KV cache must contain one entry per layer")
+
+        output = src
+        new_key_values = []
+        new_padding = None
+        for layer_idx, layer in enumerate(self.encoder.layers):
+            output, key_value, layer_padding = layer.forward_with_kv_cache(
+                output,
+                position_ids=position_ids,
+                token_padding_mask=token_padding_mask,
+                past_key_value=(
+                    None
+                    if past_key_values is None
+                    else past_key_values[layer_idx]
+                ),
+                past_key_padding_mask=past_padding,
+                max_cache_tokens=max_cache_tokens,
+            )
+            new_key_values.append(key_value)
+            if new_padding is None:
+                new_padding = layer_padding
+            # Every layer appends and truncates the same token positions, so
+            # the padding layout is shared. Avoid a per-layer GPU sync here.
+
+        if self.encoder.norm is not None:
+            output = self.encoder.norm(output)
+        if self.output_proj is not None:
+            output = self.output_proj(output)
+        return output, {
+            "key_values": new_key_values,
+            "key_padding_mask": new_padding,
+        }
 
 
 # Convenience functions

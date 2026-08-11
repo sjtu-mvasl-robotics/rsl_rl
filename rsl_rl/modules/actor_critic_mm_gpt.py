@@ -469,6 +469,9 @@ class MMGPT(nn.Module):
         action_is_delta: bool = False,
         action_clip_value: Optional[float] = None,
         latest_reference_only: bool = False,
+        streaming_kv_cache: bool = False,
+        streaming_sequence_training: bool = False,
+        streaming_context_steps: Optional[int] = None,
         score_prediction_enabled: bool = False,
         apply_mlp_residual = False,
         # some not pretty fix
@@ -483,6 +486,7 @@ class MMGPT(nn.Module):
         self.name = name
         self.obs_dim = obs_size
         self.ref_obs_dim = ref_obs_size
+        self.dim_model = dim_model
         self.num_steps_per_env = num_steps_per_env
         self.apply_rope = apply_rope
         self.apply_res = apply_res
@@ -553,6 +557,24 @@ class MMGPT(nn.Module):
             None if action_clip_value is None else float(action_clip_value)
         )
         self.latest_reference_only = bool(latest_reference_only)
+        self.streaming_kv_cache = bool(streaming_kv_cache)
+        self.streaming_sequence_training = bool(streaming_sequence_training)
+        if self.streaming_sequence_training and not self.streaming_kv_cache:
+            raise ValueError(
+                "streaming_sequence_training requires streaming_kv_cache=True"
+            )
+        self.streaming_context_steps = (
+            self.num_steps_per_env
+            if streaming_context_steps is None
+            else int(streaming_context_steps)
+        )
+        if self.streaming_context_steps < 1:
+            raise ValueError("streaming_context_steps must be at least 1")
+        if self.streaming_context_steps > self.num_steps_per_env:
+            raise ValueError(
+                "streaming_context_steps cannot exceed num_steps_per_env "
+                "because rollout storage retains only that raw history"
+            )
         self.score_prediction_enabled = bool(score_prediction_enabled)
         if self.pred_obs_term_names is not None and len(self.pred_obs_term_names) > 0:
             assert self.pred_obs_term_weights is not None and len(self.pred_obs_term_weights) == len(self.pred_obs_term_names), "pred_obs_term_weights should be provided with the same length as pred_obs_term_names."
@@ -659,6 +681,34 @@ class MMGPT(nn.Module):
             self.compressor = None
             self.ref_compressor = None
             self.upsampler = None
+
+        if self.streaming_kv_cache:
+            if dropout != 0.0:
+                raise ValueError(
+                    "streaming_kv_cache requires dropout=0 so rollout and PPO "
+                    "recomputation share the same policy distribution"
+                )
+            if not self.apply_rope:
+                raise ValueError("streaming_kv_cache requires apply_rope=True")
+            if self.compressor is not None:
+                raise ValueError(
+                    "streaming_kv_cache currently requires an uncompressed "
+                    "one-token-per-modality timestep sequence"
+                )
+            if self.latest_reference_only:
+                raise ValueError(
+                    "streaming_kv_cache cannot retroactively erase historical "
+                    "reference keys; set latest_reference_only=False"
+                )
+            if not self.ref_first and self.ref_obs_dim > 0:
+                raise ValueError(
+                    "streaming_kv_cache requires ref_first=True so obs_t may "
+                    "attend to ref_t without ref_t seeing obs_t"
+                )
+            if self.apply_mlp_residual:
+                raise ValueError(
+                    "streaming_kv_cache does not yet support apply_mlp_residual"
+                )
         
         self.pos_emb = nn.Embedding(self.compressed_len, dim_model) if not self.apply_rope else None # *2 for obs and ref_obs
         self.modality_emb = nn.Embedding(2, dim_model) # 0 for obs, 1 for ref_obs
@@ -692,6 +742,9 @@ class MMGPT(nn.Module):
         self.inference_buffer_ref_obs_mask = None
         self.current_timesteps = None  # Track current timesteps for each environment [B,]
         self.num_envs_cache = 0
+        self.inference_kv_cache = None
+        self.inference_position_ids = None
+        self.inference_kv_cache_dirty = False
         
         self.aux_loss = 0.0
         self.aux_loss_fn = nn.MSELoss()
@@ -853,6 +906,11 @@ class MMGPT(nn.Module):
         self.inference_buffer_obs = torch.zeros(obs_buffer_shape, device=device)
         # Initialize timestep tracking array, initially set to 0
         self.current_timesteps = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.inference_kv_cache = None
+        self.inference_position_ids = torch.zeros(
+            num_envs, dtype=torch.long, device=device
+        )
+        self.inference_kv_cache_dirty = False
         if self.ref_obs_dim > 0:
             ref_obs_buffer_shape = (self.num_steps_per_env , num_envs, self.ref_obs_dim)
             self.inference_buffer_ref_obs = torch.zeros(ref_obs_buffer_shape, device=device)
@@ -871,6 +929,10 @@ class MMGPT(nn.Module):
                     self.inference_buffer_ref_obs.fill_(0.0)
                 if self.inference_buffer_ref_obs_mask is not None:
                     self.inference_buffer_ref_obs_mask.fill_(False)
+            self.inference_kv_cache = None
+            if self.inference_position_ids is not None:
+                self.inference_position_ids.zero_()
+            self.inference_kv_cache_dirty = False
         else:
             # dones are at the environment level
             mask = (dones == 1)
@@ -883,6 +945,207 @@ class MMGPT(nn.Module):
                     self.inference_buffer_ref_obs[:, mask, :] = 0.0
                 if self.inference_buffer_ref_obs_mask is not None:
                     self.inference_buffer_ref_obs_mask[:, mask] = False
+            if self.inference_position_ids is not None:
+                self.inference_position_ids[mask] = 0
+            if self.inference_kv_cache is not None:
+                cache_padding = self.inference_kv_cache["key_padding_mask"]
+                cache_padding[mask] = True
+                for key, value in self.inference_kv_cache["key_values"]:
+                    key[mask] = 0.0
+                    value[mask] = 0.0
+
+    def invalidate_inference_cache(self):
+        """Rebuild cached K/V with current parameters on the next rollout step."""
+
+        if self.streaming_kv_cache and self.inference_buffer_obs is not None:
+            self.inference_kv_cache_dirty = True
+
+    def _streaming_token_step(
+        self,
+        obs: torch.Tensor,
+        obs_mask: torch.Tensor,
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Append one environment timestep to the bounded transformer cache."""
+
+        if self.inference_position_ids is None:
+            raise RuntimeError("streaming position counters are not initialized")
+
+        B = obs.shape[0]
+        device = obs.device
+        obs_emb = self.obs_norm(self.obs_embedding(obs.unsqueeze(0)))[0]
+        obs_emb = obs_emb + self.modality_emb(
+            torch.zeros(B, dtype=torch.long, device=device)
+        )
+
+        if self.ref_obs_dim > 0:
+            if ref_obs is None:
+                ref_tensor = torch.zeros(
+                    B, self.ref_obs_dim, dtype=obs.dtype, device=device
+                )
+                ref_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            else:
+                ref_tensor, ref_mask = ref_obs
+                ref_mask = ref_mask.bool() & obs_mask.bool()
+            ref_emb = self.ref_obs_norm(
+                self.ref_obs_embedding(ref_tensor.unsqueeze(0))
+            )[0]
+            ref_emb = ref_emb + self.modality_emb(
+                torch.ones(B, dtype=torch.long, device=device)
+            )
+            tokens = torch.stack((ref_emb, obs_emb), dim=1)
+            token_padding = ~torch.stack((ref_mask, obs_mask.bool()), dim=1)
+            obs_token_index = 1
+        else:
+            tokens = obs_emb.unsqueeze(1)
+            token_padding = ~obs_mask.bool().unsqueeze(1)
+            obs_token_index = 0
+
+        tokens_per_step = tokens.shape[1]
+        position_ids = self.inference_position_ids.unsqueeze(1).expand(
+            -1, tokens_per_step
+        )
+        hidden, self.inference_kv_cache = self.decoder.forward_with_kv_cache(
+            tokens,
+            position_ids=position_ids,
+            token_padding_mask=token_padding,
+            cache=self.inference_kv_cache,
+            max_cache_tokens=(
+                (self.streaming_context_steps - 1) * tokens_per_step
+            ),
+        )
+        self.inference_position_ids = self.inference_position_ids + obs_mask.long()
+        return hidden[:, obs_token_index]
+
+    def _rebuild_streaming_cache(self) -> torch.Tensor:
+        """Prefill cache from the reset-safe raw history retained by rollout."""
+
+        self.inference_kv_cache = None
+        self.inference_position_ids.zero_()
+        masks = self.generate_mask()
+        hidden = None
+        for step in range(self.num_steps_per_env):
+            ref_step = None
+            if self.ref_obs_dim > 0:
+                ref_step = (
+                    self.inference_buffer_ref_obs[step],
+                    self.inference_buffer_ref_obs_mask[step],
+                )
+            hidden = self._streaming_token_step(
+                self.inference_buffer_obs[step], masks[step], ref_step
+            )
+        self.inference_kv_cache_dirty = False
+        if hidden is None:
+            raise RuntimeError("cannot rebuild an empty streaming context")
+        return hidden
+
+    def _streaming_sequence_hidden(
+        self,
+        obs: torch.Tensor,
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        masks: torch.Tensor,
+        episode_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Encode a full sequence with the same local semantics as KV rollout.
+
+        This differentiable path is the training reference for the inference
+        cache. ``episode_ids`` prevents attention across resets inside one
+        contiguous rollout batch; padding alone cannot express that boundary.
+        """
+
+        T, B, _ = obs.shape
+        if tuple(masks.shape) != (T, B):
+            raise ValueError(
+                f"masks must have shape {(T, B)}, got {tuple(masks.shape)}"
+            )
+        if episode_ids is None:
+            episode_ids = torch.zeros_like(masks, dtype=torch.long)
+        elif tuple(episode_ids.shape) != (T, B):
+            raise ValueError(
+                "episode_ids must match masks, got "
+                f"{tuple(episode_ids.shape)} and {tuple(masks.shape)}"
+            )
+
+        device = obs.device
+        obs_emb = self.obs_norm(self.obs_embedding(obs))
+        res_obs_emb = obs_emb
+        obs_emb = obs_emb + self.modality_emb(
+            torch.zeros(T, B, dtype=torch.long, device=device)
+        )
+
+        has_ref = ref_obs is not None and self.ref_obs_dim > 0
+        res_ref_obs_emb = None
+        if has_ref:
+            ref_tensor, ref_mask = ref_obs
+            if tuple(ref_tensor.shape[:2]) != (T, B):
+                raise ValueError("reference sequence must match observation T/B")
+            ref_mask = ref_mask.bool() & masks.bool()
+            ref_emb = self.ref_obs_norm(self.ref_obs_embedding(ref_tensor))
+            res_ref_obs_emb = ref_emb
+            ref_emb = ref_emb + self.modality_emb(
+                torch.ones(T, B, dtype=torch.long, device=device)
+            )
+            combined_seq = torch.stack((ref_emb, obs_emb), dim=1).reshape(
+                2 * T, B, -1
+            )
+            combined_masks = torch.stack(
+                (ref_mask, masks.bool()), dim=1
+            ).reshape(2 * T, B)
+            tokens_per_step = 2
+            obs_token_index = 1
+        else:
+            combined_seq = obs_emb
+            combined_masks = masks.bool()
+            tokens_per_step = 1
+            obs_token_index = 0
+
+        # Episode-local positions are computed per environment. Padded tokens
+        # keep position zero and are removed by the key padding mask.
+        positions = torch.zeros(T, B, dtype=torch.long, device=device)
+        for step in range(1, T):
+            same_episode = episode_ids[step] == episode_ids[step - 1]
+            positions[step] = torch.where(
+                same_episode & masks[step] & masks[step - 1],
+                positions[step - 1] + 1,
+                torch.zeros_like(positions[step - 1]),
+            )
+
+        token_steps = torch.arange(T, device=device).repeat_interleave(
+            tokens_per_step
+        )
+        query_step = token_steps.unsqueeze(1)
+        key_step = token_steps.unsqueeze(0)
+        token_count = T * tokens_per_step
+        local_blocked = torch.ones(
+            token_count, token_count, dtype=torch.bool, device=device
+        ).triu(diagonal=1)
+        local_blocked = local_blocked | (
+            key_step
+            < query_step - self.streaming_context_steps + 1
+        )
+        token_episode_ids = episode_ids.repeat_interleave(
+            tokens_per_step, dim=0
+        ).T
+        segment_blocked = (
+            token_episode_ids.unsqueeze(2)
+            != token_episode_ids.unsqueeze(1)
+        )
+        attention_mask = local_blocked.unsqueeze(0) | segment_blocked
+        token_positions = positions.repeat_interleave(
+            tokens_per_step, dim=0
+        ).T
+
+        hidden = self.decoder(
+            combined_seq.permute(1, 0, 2),
+            src_mask=attention_mask,
+            src_key_padding_mask=~combined_masks.T,
+            position_ids=token_positions,
+        ).permute(1, 0, 2)
+        return (
+            hidden[obs_token_index::tokens_per_step],
+            res_obs_emb,
+            res_ref_obs_emb,
+        )
 
     def _forward_batch(self, 
                 obs: torch.Tensor,
@@ -896,10 +1159,17 @@ class MMGPT(nn.Module):
                 compute_aux_loss: bool = False,
                 compute_dreamer_loss: bool = False,
                 compute_dreamer_reward: bool = False,
+                episode_ids: Optional[torch.Tensor] = None,
+                sequence_output_start: Optional[int] = None,
                 ):
         """
         Forward pass for the multi-modality transformer in batch mode.
         """
+        # A PPO batch forward is followed by an optimizer update. Any K/V made
+        # with the previous parameters must therefore be prefetched again
+        # before the next rollout; the raw reset-safe history is retained for
+        # exactly that purpose.
+        self.invalidate_inference_cache()
         
         ##########################################################################################
         # T_x meanings:
@@ -912,6 +1182,15 @@ class MMGPT(nn.Module):
         
         T_in, B, _ = obs.shape
         device = obs.device   
+        if sequence_output_start is not None:
+            if not self.streaming_kv_cache:
+                raise ValueError(
+                    "sequence_output_start is available only for streaming training"
+                )
+            if not 0 <= sequence_output_start < T_in:
+                raise ValueError(
+                    "sequence_output_start must index the input sequence"
+                )
         if raw_observations is None:
             # Backward-compatible fallback for environments/runners that do not
             # yet expose the pre-normalizer observation path.
@@ -921,11 +1200,13 @@ class MMGPT(nn.Module):
                 "raw_observations must match normalized observations exactly, "
                 f"got {tuple(raw_observations.shape)} and {tuple(obs.shape)}"
             )
-        if T_in > self.num_steps_per_env:
+        if T_in > self.num_steps_per_env and not self.streaming_kv_cache:
             obs=obs[-self.num_steps_per_env:, :, :]
             raw_observations = raw_observations[-self.num_steps_per_env:, :, :]
             if masks is not None:
                 masks = masks[-self.num_steps_per_env:, :]
+            if episode_ids is not None:
+                episode_ids = episode_ids[-self.num_steps_per_env:, :]
             if ref_obs is not None:
                 ref_obs = (ref_obs[0][-self.num_steps_per_env:, :, :], ref_obs[1][-self.num_steps_per_env:, :])   
             T_in = self.num_steps_per_env
@@ -941,91 +1222,103 @@ class MMGPT(nn.Module):
             mlp_output = self.mlp_bypass(obs[-1], ref_mlp_obs) # [B, dim_out]    
         else:
             mlp_output = None 
-        obs_emb = self.obs_embedding(obs) # [T_in, B, D]
-        res_obs_emb = obs_emb
-        # Compress OBS
-        if self.compressor is not None:
-            obs_emb, new_masks = self.compressor(obs_emb, masks)
-            T_c = obs_emb.shape[0]
-        else:
-            new_masks = masks
-            T_c = T_in
-        obs_emb = self.obs_norm(obs_emb)
-        # Modality embedding
-        obs_emb = obs_emb + self.modality_emb(torch.zeros(T_c, B, dtype=torch.long, device=device))
-        
-        # Process second modality if available
         has_ref = ref_obs is not None and self.ref_obs_dim > 0
-        if has_ref:
-            ref_obs_tensor, ref_obs_mask = ref_obs
-            # ref_obs_mask shape: [T, B]
-            ref_T_in, ref_B, _ = ref_obs_tensor.shape
-            assert ref_B == B, "Batch size of obs and ref_obs must match"
-            assert ref_T_in == T_in, "Sequence length of obs and ref_obs must match"
-            ref_obs_emb = self.ref_obs_embedding(ref_obs_tensor) # [ref_T_in, B, D]
-            res_ref_obs_emb = ref_obs_emb
-            # Merge masks
-            ref_obs_mask = ref_obs_mask * masks
-            # Compress ref_obs
-            if self.ref_compressor is not None:
-                ref_obs_emb, new_ref_masks = self.ref_compressor(ref_obs_emb, ref_obs_mask)
+        if self.streaming_kv_cache:
+            obs_out_seq, res_obs_emb, res_ref_obs_emb = (
+                self._streaming_sequence_hidden(
+                    obs, ref_obs, masks, episode_ids=episode_ids
+                )
+            )
+            T_c = T_in
+            if has_ref:
+                ref_obs_tensor, ref_obs_mask = ref_obs
+                ref_obs_mask = ref_obs_mask.bool() & masks.bool()
+        else:
+            obs_emb = self.obs_embedding(obs) # [T_in, B, D]
+            res_obs_emb = obs_emb
+            # Compress OBS
+            if self.compressor is not None:
+                obs_emb, new_masks = self.compressor(obs_emb, masks)
+                T_c = obs_emb.shape[0]
             else:
-                new_ref_masks = ref_obs_mask
-
-            ref_obs_emb = self.ref_obs_norm(ref_obs_emb)
+                new_masks = masks
+                T_c = T_in
+            obs_emb = self.obs_norm(obs_emb)
             # Modality embedding
-            ref_obs_emb = ref_obs_emb + self.modality_emb(torch.ones(T_c, B, dtype=torch.long, device=device))
-            
-            # Sequence merging. [obs0, ref_obs0, obs1, ref_obs1, ...]
-            if not self.ref_first:
-                combined_seq = torch.stack([obs_emb, ref_obs_emb], dim=1)
-            else:
-                combined_seq = torch.stack([ref_obs_emb, obs_emb], dim=1) 
-            combined_seq = combined_seq.reshape(2 * T_c, B, -1) # [2*T_c, B, D]
-            T_combined = combined_seq.shape[0]
-            # Merge masks
-            if not self.ref_first:
-                combined_masks = torch.stack([new_masks, new_ref_masks], dim=1) # [T_c, 2, B]
-            else:
-                combined_masks = torch.stack([new_ref_masks, new_masks], dim=1) # [T_c, 2, B]
-            combined_masks = combined_masks.reshape(T_combined, B) # [2*T_c, B]
-        else:
-            combined_seq = obs_emb # [T_c, B, D]
-            T_combined = combined_seq.shape[0]
-            combined_masks = new_masks # [T_c, B]
-        combined_masks = combined_masks.bool()
+            obs_emb = obs_emb + self.modality_emb(torch.zeros(T_c, B, dtype=torch.long, device=device))
 
-        src_key_padding_mask = ~combined_masks.T # [B, T], True for padding positions
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(T_combined, device=device,dtype=torch.bool)
-        
-        #with torch.nn.attention.sdpa_kernel(SDPBackend.MATH):
-        if not self.apply_rope:
-            pos = torch.arange(T_c, device=device).unsqueeze(1).expand(T_c, B)
-            if has_ref: # T_combined == 2 * T_c, then we need to repeat interleavely the pos (Original [0, 1, 2], new [0,0,1,1,2,2])
-                pos = pos.repeat_interleave(2, dim=0)
-            src = combined_seq + self.pos_emb(pos) # [T_combined, B, D]
-            
-            gpt_out = self.decoder(
-                src.permute(1, 0, 2), # [B, T, D]
-                mask=causal_mask,
-                src_key_padding_mask=src_key_padding_mask,
-                # is_causal=True,
-            )
-        else:
-            gpt_out = self.decoder(
-                combined_seq.permute(1, 0, 2), # [B, T, D]
-                src_mask=causal_mask,
-                src_key_padding_mask=src_key_padding_mask,
-                # is_causal=True,
-                interleave=has_ref,
-            )
-    
-        # Sample obs out seq
-        if not self.ref_first:
-            obs_indices = torch.arange(0, T_combined, 2, device=device) if has_ref else torch.arange(0, T_combined, 1, device=device) # obs are at even positions or all positions
-        else: # obs at odd positions
-            obs_indices = torch.arange(1, T_combined, 2, device=device) if has_ref else torch.arange(0, T_combined, 1, device=device) # obs are at odd positions or all positions
-        obs_out_seq = gpt_out.permute(1, 0, 2)[obs_indices, :, :] # [T_c, B, D]
+            # Process second modality if available
+            if has_ref:
+                ref_obs_tensor, ref_obs_mask = ref_obs
+                # ref_obs_mask shape: [T, B]
+                ref_T_in, ref_B, _ = ref_obs_tensor.shape
+                assert ref_B == B, "Batch size of obs and ref_obs must match"
+                assert ref_T_in == T_in, "Sequence length of obs and ref_obs must match"
+                ref_obs_emb = self.ref_obs_embedding(ref_obs_tensor) # [ref_T_in, B, D]
+                res_ref_obs_emb = ref_obs_emb
+                # Merge masks
+                ref_obs_mask = ref_obs_mask * masks
+                # Compress ref_obs
+                if self.ref_compressor is not None:
+                    ref_obs_emb, new_ref_masks = self.ref_compressor(ref_obs_emb, ref_obs_mask)
+                else:
+                    new_ref_masks = ref_obs_mask
+
+                ref_obs_emb = self.ref_obs_norm(ref_obs_emb)
+                # Modality embedding
+                ref_obs_emb = ref_obs_emb + self.modality_emb(torch.ones(T_c, B, dtype=torch.long, device=device))
+
+                # Sequence merging. [obs0, ref_obs0, obs1, ref_obs1, ...]
+                if not self.ref_first:
+                    combined_seq = torch.stack([obs_emb, ref_obs_emb], dim=1)
+                else:
+                    combined_seq = torch.stack([ref_obs_emb, obs_emb], dim=1)
+                combined_seq = combined_seq.reshape(2 * T_c, B, -1) # [2*T_c, B, D]
+                T_combined = combined_seq.shape[0]
+                # Merge masks
+                if not self.ref_first:
+                    combined_masks = torch.stack([new_masks, new_ref_masks], dim=1) # [T_c, 2, B]
+                else:
+                    combined_masks = torch.stack([new_ref_masks, new_masks], dim=1) # [T_c, 2, B]
+                combined_masks = combined_masks.reshape(T_combined, B) # [2*T_c, B]
+            else:
+                res_ref_obs_emb = None
+                combined_seq = obs_emb # [T_c, B, D]
+                T_combined = combined_seq.shape[0]
+                combined_masks = new_masks # [T_c, B]
+            combined_masks = combined_masks.bool()
+
+            src_key_padding_mask = ~combined_masks.T # [B, T], True for padding positions
+            causal_mask = nn.Transformer.generate_square_subsequent_mask(T_combined, device=device,dtype=torch.bool)
+
+            #with torch.nn.attention.sdpa_kernel(SDPBackend.MATH):
+            if not self.apply_rope:
+                pos = torch.arange(T_c, device=device).unsqueeze(1).expand(T_c, B)
+                if has_ref: # T_combined == 2 * T_c, then we need to repeat interleavely the pos (Original [0, 1, 2], new [0,0,1,1,2,2])
+                    pos = pos.repeat_interleave(2, dim=0)
+                src = combined_seq + self.pos_emb(pos) # [T_combined, B, D]
+
+                gpt_out = self.decoder(
+                    src.permute(1, 0, 2), # [B, T, D]
+                    mask=causal_mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                    # is_causal=True,
+                )
+            else:
+                gpt_out = self.decoder(
+                    combined_seq.permute(1, 0, 2), # [B, T, D]
+                    src_mask=causal_mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                    # is_causal=True,
+                    interleave=has_ref,
+                )
+
+            # Sample obs out seq
+            if not self.ref_first:
+                obs_indices = torch.arange(0, T_combined, 2, device=device) if has_ref else torch.arange(0, T_combined, 1, device=device) # obs are at even positions or all positions
+            else: # obs at odd positions
+                obs_indices = torch.arange(1, T_combined, 2, device=device) if has_ref else torch.arange(0, T_combined, 1, device=device) # obs are at odd positions or all positions
+            obs_out_seq = gpt_out.permute(1, 0, 2)[obs_indices, :, :] # [T_c, B, D]
         
 
         if self.upsampler is not None and upsample:
@@ -1041,7 +1334,12 @@ class MMGPT(nn.Module):
         #         upsampled_out = upsampled_out + res_ref_obs_emb * ref_obs_mask.unsqueeze(-1).float()
         
         # Cache hidden state before projection (for DAgger training)
-        self.last_hidden_state = upsampled_out[-1, :, :] if not unpad_output else upsampled_out  # [B, D] or [T_in, B, D]
+        if sequence_output_start is not None:
+            self.last_hidden_state = upsampled_out[
+                sequence_output_start:
+            ].flatten(0, 1)
+        else:
+            self.last_hidden_state = upsampled_out[-1, :, :] if not unpad_output else upsampled_out  # [B, D] or [T_in, B, D]
         
         if compute_aux_loss and self.aux_heads is not None:
             self.aux_loss = 0.0
@@ -1063,6 +1361,17 @@ class MMGPT(nn.Module):
                 # in the same unmasked trajectory segment. In particular, do
                 # not train the world-model head across an episode reset.
                 valid_mask = masks[:-1] & masks[1:] # shape: [T_in-1, B]
+                if episode_ids is not None:
+                    valid_mask = valid_mask & (
+                        episode_ids[:-1] == episode_ids[1:]
+                    )
+                if sequence_output_start is not None:
+                    loss_steps = torch.arange(
+                        T_in - 1, device=device
+                    ).unsqueeze(1)
+                    valid_mask = valid_mask & (
+                        loss_steps >= sequence_output_start - 1
+                    )
                 aux_loss_i = self._masked_prediction_mse(
                     pred_shifted,
                     target_shifted,
@@ -1109,11 +1418,24 @@ class MMGPT(nn.Module):
         ):
             self.dreamer_loss = 0.0
             # extract target actions from ref_obs
-            cur_latent = upsampled_out[-1, :, :]  # [B, dim_out]
-            cur_action = pred_actions[-1, :, :]
-            previous_action = raw_observations[
-                -1, :, self.action_slice[0]:self.action_slice[1]
-            ]
+            if sequence_output_start is None:
+                cur_latent = upsampled_out[-1, :, :]  # [B, dim_out]
+                cur_action = pred_actions[-1, :, :]
+                previous_action = raw_observations[
+                    -1, :, self.action_slice[0]:self.action_slice[1]
+                ]
+            else:
+                cur_latent = upsampled_out[
+                    sequence_output_start:
+                ].flatten(0, 1)
+                cur_action = pred_actions[
+                    sequence_output_start:
+                ].flatten(0, 1)
+                previous_action = raw_observations[
+                    sequence_output_start:,
+                    :,
+                    self.action_slice[0]:self.action_slice[1],
+                ].flatten(0, 1)
             cur_action = self._resolve_prediction_action(
                 previous_action,
                 cur_action,
@@ -1136,12 +1458,22 @@ class MMGPT(nn.Module):
             if dreamer_target is not None:
                 target_joint_pos, target_mask = dreamer_target
             else:
-                target_joint_pos = ref_obs[0][
-                    -1,
-                    :,
-                    self.target_action_slice[0]:self.target_action_slice[1],
-                ]
-                target_mask = ref_obs[1][-1, :]
+                if sequence_output_start is None:
+                    target_joint_pos = ref_obs[0][
+                        -1,
+                        :,
+                        self.target_action_slice[0]:self.target_action_slice[1],
+                    ]
+                    target_mask = ref_obs[1][-1, :]
+                else:
+                    target_joint_pos = ref_obs[0][
+                        sequence_output_start:,
+                        :,
+                        self.target_action_slice[0]:self.target_action_slice[1],
+                    ].flatten(0, 1)
+                    target_mask = ref_obs[1][
+                        sequence_output_start:
+                    ].flatten(0, 1)
             if target_joint_pos.shape != pred_joint_pos.shape:
                 raise ValueError(
                     "Dreamer target must match predicted absolute joint pose, "
@@ -1165,7 +1497,9 @@ class MMGPT(nn.Module):
             self.dreamer_loss = 0.0
         
 
-        if unpad_output:
+        if sequence_output_start is not None:
+            res = pred_actions[sequence_output_start:].flatten(0, 1)
+        elif unpad_output:
             res = self.unpad(pred_actions, masks).view(self.num_steps_per_env, -1, pred_actions.shape[-1])[-1, :, :] # [valid_length, dim_out] -> [num_steps_per_env, num_envs (B), dim_out] -> [B, dim_out]
         else: # return output last timestep
             res = pred_actions[-1, :, :] # [B, dim_out]
@@ -1217,6 +1551,24 @@ class MMGPT(nn.Module):
                 self.inference_buffer_ref_obs[-1, :, :].fill_(0.0)
                 self.inference_buffer_ref_obs_mask[-1, :].fill_(False)
             
+        if self.streaming_kv_cache:
+            if self.inference_kv_cache_dirty:
+                hidden = self._rebuild_streaming_cache()
+            else:
+                ref_step = None
+                if self.ref_obs_dim > 0:
+                    ref_step = (
+                        self.inference_buffer_ref_obs[-1],
+                        self.inference_buffer_ref_obs_mask[-1],
+                    )
+                hidden = self._streaming_token_step(
+                    obs,
+                    torch.ones(B, dtype=torch.bool, device=device),
+                    ref_step,
+                )
+            self.last_hidden_state = hidden
+            return self.fc(hidden)
+
         obs_seq = self.inference_buffer_obs # [T_in, B, dim_in]
         masks = self.generate_mask() # [T_in, B]    
         if self.ref_obs_embedding is not None:
@@ -1268,6 +1620,8 @@ class MMGPT(nn.Module):
                 compute_aux_loss=True,
                 compute_dreamer_loss=True,
                 compute_dreamer_reward=self.score_prediction_enabled,
+                episode_ids=kwargs.get("episode_ids"),
+                sequence_output_start=kwargs.get("sequence_output_start"),
             )
         else:
             return self._forward_inference(obs, ref_obs)

@@ -281,6 +281,14 @@ class MMPPO:
             print("[MMPPO] Fixing action std (sigma) during training.")
         self.device = device
         self.actor_critic = actor_critic  # Set early for detection logic
+        self.streaming_sequence_training = bool(
+            isinstance(self.actor_critic, ActorCriticMMGPT)
+            and getattr(
+                self.actor_critic.actor,
+                "streaming_sequence_training",
+                False,
+            )
+        )
 
         # Teacher replay buffer
         self.replay_buffer_size = replay_buffer_size
@@ -638,6 +646,27 @@ class MMPPO:
         else:
             rnd_state_shape = None
         is_mmgpt = isinstance(self.actor_critic, ActorCriticMMGPT)
+        streaming_sequence_training = self.streaming_sequence_training
+        if streaming_sequence_training:
+            unsupported = []
+            if self.teacher_coef is not None:
+                unsupported.append("DAgger teacher")
+            if self.symmetry is not None:
+                unsupported.append("symmetry augmentation")
+            if self.rnd is not None:
+                unsupported.append("RND")
+            if self.amp is not None:
+                unsupported.append("AMP")
+            if not getattr(
+                self.actor_critic, "_critic_uses_direct_concat", False
+            ):
+                unsupported.append("history-encoded critic")
+            if unsupported:
+                raise ValueError(
+                    "streaming MMGPT sequence training currently requires "
+                    "pure PPO with DirectConcatMLP critic; unsupported: "
+                    + ", ".join(unsupported)
+                )
         actor_history_length = (
             self.actor_critic.actor.num_steps_per_env if is_mmgpt else 1
         )
@@ -835,6 +864,7 @@ class MMPPO:
             self.current_stage = 3  # Student stage
             
         is_mmgpt = isinstance(self.actor_critic, ActorCriticMMGPT)
+        streaming_sequence_training = self.streaming_sequence_training
             
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
@@ -871,8 +901,15 @@ class MMPPO:
 
         
         if self.actor_critic.is_recurrent:
-            # generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
-            generator = self.storage.buffer_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            if streaming_sequence_training:
+                generator = self.storage.streaming_sequence_mini_batch_generator(
+                    self.num_mini_batches,
+                    self.num_learning_epochs,
+                    num_steps_per_env=self.actor_critic.actor.streaming_context_steps,
+                )
+            else:
+                # generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+                generator = self.storage.buffer_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             assert self.actor_critic.is_recurrent == False, "MM-PPO does not support recurrent actor-critic networks."
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -904,7 +941,11 @@ class MMPPO:
 
             num_aug = 1
 
-            original_batch_size = obs_batch.shape[-2]
+            original_batch_size = (
+                actions_batch.shape[0]
+                if streaming_sequence_training
+                else obs_batch.shape[-2]
+            )
 
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
@@ -924,7 +965,20 @@ class MMPPO:
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
             with torch.amp.autocast(device_type="cuda", enabled=self.auto_mix_precision):
-                
+                streaming_kwargs = {}
+                if streaming_sequence_training:
+                    if not isinstance(hid_states_batch, dict) or not (
+                        hid_states_batch.get("streaming_sequence", False)
+                    ):
+                        raise RuntimeError(
+                            "streaming sequence generator metadata is missing"
+                        )
+                    streaming_kwargs = {
+                        "episode_ids": hid_states_batch["episode_ids"],
+                        "sequence_output_start": hid_states_batch[
+                            "sequence_output_start"
+                        ],
+                    }
                 self.actor_critic.act(
                     obs_batch,
                     ref_observations=ref_obs_batch,
@@ -932,12 +986,19 @@ class MMPPO:
                     memory=hid_states_batch,
                     raw_observations=raw_obs_batch,
                     dreamer_target=dreamer_target_batch,
+                    **streaming_kwargs,
                 )
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
-                value_batch = self.actor_critic.evaluate(
-                    critic_obs_batch, ref_critic_observations=critic_ref_obs_batch,
-                    masks=masks_batch, memory=hid_states_batch
-                )
+                if streaming_sequence_training:
+                    value_batch = self.actor_critic.evaluate(
+                        critic_obs_batch,
+                        ref_critic_observations=critic_ref_obs_batch,
+                    )
+                else:
+                    value_batch = self.actor_critic.evaluate(
+                        critic_obs_batch, ref_critic_observations=critic_ref_obs_batch,
+                        masks=masks_batch, memory=hid_states_batch
+                    )
 
             mu_batch = self.actor_critic.action_mean[:original_batch_size]
             sigma_batch = self.actor_critic.action_std[:original_batch_size]
@@ -1057,6 +1118,10 @@ class MMPPO:
                 
             if is_mmgpt:
                 aux_loss = self.actor_critic.actor_aux_loss
+                if not torch.is_tensor(aux_loss):
+                    aux_loss = torch.as_tensor(
+                        aux_loss, dtype=loss.dtype, device=self.device
+                    )
                 # A zero coefficient is a hard gradient-off switch. Adding
                 # ``0 * aux_loss`` would still materialize zero gradients for
                 # the prediction heads; AdamW would then move those parameters
@@ -1069,6 +1134,10 @@ class MMPPO:
                 mean_aux_loss += aux_loss.item()
                 mean_weighted_aux_loss += weighted_aux_loss.item()
                 dreamer_loss = self.actor_critic.actor_dreamer_loss
+                if not torch.is_tensor(dreamer_loss):
+                    dreamer_loss = torch.as_tensor(
+                        dreamer_loss, dtype=loss.dtype, device=self.device
+                    )
                 weighted_dreamer_loss = dreamer_loss.detach().new_zeros(())
                 if self.dreamer_loss_coef > 0.0:
                     weighted_dreamer_loss = self.dreamer_loss_coef * dreamer_loss

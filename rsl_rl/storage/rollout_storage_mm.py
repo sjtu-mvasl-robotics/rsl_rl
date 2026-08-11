@@ -1000,6 +1000,210 @@ class RolloutStorageMM:
                     None,
                     None,
                 ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask, raw_obs_batch, dreamer_target_batch
+
+    def streaming_sequence_mini_batch_generator(
+        self,
+        num_mini_batches,
+        num_epochs=8,
+        num_steps_per_env=None,
+    ):
+        """Yield contiguous env trajectories for streaming-local MMGPT PPO.
+
+        The legacy buffer generator constructs one H-frame window for every
+        rollout transition. This generator instead prepends H-1 retained raw
+        frames once and encodes the full rollout once per environment. PPO
+        targets remain restricted to the current rollout portion.
+        """
+
+        if self.training_type != "rl":
+            raise ValueError("streaming sequence batches require RL storage")
+        if self.amp_cfg is not None:
+            raise ValueError("streaming MMGPT sequence batches do not support AMP")
+        if self.dagger_actions is not None:
+            raise ValueError(
+                "streaming MMGPT sequence batches currently require pure RL "
+                "without a DAgger teacher"
+            )
+        history_length = (
+            self.actor_history_length
+            if num_steps_per_env is None
+            else int(num_steps_per_env)
+        )
+        if not 1 <= history_length <= self.actor_history_length:
+            raise ValueError(
+                "requested streaming history length must be between 1 and "
+                f"{self.actor_history_length}, got {history_length}"
+            )
+        if self.num_envs % num_mini_batches != 0:
+            raise ValueError(
+                "num_envs must be divisible by num_mini_batches for streaming "
+                f"sequence training, got {self.num_envs} and {num_mini_batches}"
+            )
+
+        prefix_length = history_length - 1
+
+        def prepend(prefix, current):
+            if prefix_length == 0:
+                return current
+            if prefix is None or prefix.shape[0] < prefix_length:
+                raise RuntimeError(
+                    f"missing {prefix_length}-step streaming rollout prefix"
+                )
+            return torch.cat((prefix[-prefix_length:], current), dim=0)
+
+        current_valid = torch.ones(
+            self.num_transitions_per_env,
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        obs_sequence = prepend(
+            self.actor_history_prefix_observations, self.observations
+        )
+        masks_sequence = prepend(
+            self.actor_history_prefix_valid, current_valid
+        ).bool()
+        dones_sequence = prepend(
+            self.actor_history_prefix_dones, self.dones
+        ).squeeze(-1).bool()
+        raw_obs_sequence = (
+            prepend(
+                self.actor_history_prefix_raw_observations,
+                self.raw_observations,
+            )
+            if self.raw_observations is not None
+            else None
+        )
+        ref_sequence = (
+            prepend(
+                self.actor_history_prefix_reference_observations,
+                self.reference_observations,
+            )
+            if self.reference_observations is not None
+            else None
+        )
+        ref_mask_sequence = (
+            prepend(
+                self.actor_history_prefix_reference_masks,
+                self.reference_observations_mask,
+            ).bool()
+            if self.reference_observations_mask is not None
+            else None
+        )
+
+        # Preserve the data contract even for an uninitialized first-rollout
+        # prefix: masked frames must not leak through observation embeddings.
+        expand_dims = (1,) * (obs_sequence.dim() - 2)
+        obs_sequence = obs_sequence * masks_sequence.reshape(
+            masks_sequence.shape + expand_dims
+        ).to(obs_sequence.dtype)
+        if raw_obs_sequence is not None:
+            raw_obs_sequence = raw_obs_sequence * masks_sequence.reshape(
+                masks_sequence.shape + (1,) * (raw_obs_sequence.dim() - 2)
+            ).to(raw_obs_sequence.dtype)
+        if ref_sequence is not None:
+            effective_ref_mask = ref_mask_sequence & masks_sequence
+            ref_sequence = ref_sequence * effective_ref_mask.unsqueeze(-1).to(
+                ref_sequence.dtype
+            )
+            ref_mask_sequence = effective_ref_mask
+
+        episode_ids = torch.zeros_like(dones_sequence, dtype=torch.long)
+        if episode_ids.shape[0] > 1:
+            episode_ids[1:] = torch.cumsum(dones_sequence[:-1].long(), dim=0)
+
+        critic_observations = (
+            self.privileged_observations
+            if self.privileged_observations is not None
+            else self.observations
+        )
+        critic_reference_observations = (
+            self.privileged_reference_observations
+            if self.privileged_reference_observations is not None
+            else self.reference_observations
+        )
+        critic_reference_masks = (
+            self.privileged_reference_observations_mask
+            if self.privileged_reference_observations_mask is not None
+            else self.reference_observations_mask
+        )
+        envs_per_batch = self.num_envs // num_mini_batches
+
+        for _ in range(num_epochs):
+            env_order = torch.randperm(self.num_envs, device=self.device)
+            for batch_id in range(num_mini_batches):
+                env_idx = env_order[
+                    batch_id * envs_per_batch:(batch_id + 1) * envs_per_batch
+                ]
+
+                def current_flat(sequence):
+                    return sequence[:, env_idx].flatten(0, 1)
+
+                obs_batch = obs_sequence[:, env_idx]
+                masks_batch = masks_sequence[:, env_idx]
+                ref_obs_batch = (
+                    (
+                        ref_sequence[:, env_idx],
+                        ref_mask_sequence[:, env_idx],
+                    )
+                    if ref_sequence is not None
+                    else None
+                )
+                critic_obs_batch = current_flat(critic_observations)
+                critic_ref_obs_batch = (
+                    (
+                        current_flat(critic_reference_observations),
+                        current_flat(critic_reference_masks),
+                    )
+                    if critic_reference_observations is not None
+                    else None
+                )
+                raw_obs_batch = (
+                    raw_obs_sequence[:, env_idx]
+                    if raw_obs_sequence is not None
+                    else None
+                )
+                dreamer_target_batch = (
+                    (
+                        current_flat(self.dreamer_target_observations),
+                        current_flat(self.dreamer_target_observations_mask),
+                    )
+                    if self.dreamer_target_observations is not None
+                    else None
+                )
+                rnd_state_batch = (
+                    current_flat(self.rnd_state)
+                    if self.rnd_state_shape is not None
+                    else None
+                )
+                sequence_metadata = {
+                    "streaming_sequence": True,
+                    "episode_ids": episode_ids[:, env_idx],
+                    "sequence_output_start": prefix_length,
+                }
+
+                yield (
+                    obs_batch,
+                    ref_obs_batch,
+                    critic_obs_batch,
+                    critic_ref_obs_batch,
+                    current_flat(self.actions),
+                    current_flat(self.values),
+                    current_flat(self.advantages),
+                    current_flat(self.returns),
+                    current_flat(self.actions_log_prob),
+                    current_flat(self.mu),
+                    current_flat(self.sigma),
+                    None,
+                    sequence_metadata,
+                    masks_batch,
+                    rnd_state_batch,
+                    None,
+                    None,
+                    None,
+                    raw_obs_batch,
+                    dreamer_target_batch,
+                )
     
     
 

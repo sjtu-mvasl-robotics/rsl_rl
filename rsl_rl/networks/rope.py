@@ -206,6 +206,58 @@ class RotaryEmbedding(Module):
 
         return apply_rotary_emb(freqs, t, scale = default(scale, 1.), seq_dim = seq_dim)
 
+    def rotate_queries_or_keys_at_positions(
+        self,
+        t: Tensor,
+        position_ids: Tensor,
+        seq_dim: int = -2,
+        scale = None,
+    ) -> Tensor:
+        """Rotate batched queries/keys at explicit positions.
+
+        Incremental decoding cannot assume that every environment has the
+        same position: asynchronous resets give each environment its own
+        episode-local counter.  ``position_ids`` is therefore ``[B, T]``
+        while attention tensors are ``[B, H, T, D]``.
+
+        This path intentionally bypasses the contiguous frequency cache.  The
+        sequence passed to incremental attention is tiny (normally two
+        tokens), and explicit positions are the source of truth.
+        """
+
+        if self.use_xpos:
+            raise NotImplementedError(
+                "explicit-position RoPE does not yet support XPos"
+            )
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+        if position_ids.dim() != 2:
+            raise ValueError(
+                "position_ids must have shape [B, T], got "
+                f"{tuple(position_ids.shape)}"
+            )
+        if t.dim() != 4:
+            raise ValueError(
+                "explicit-position RoPE expects [B, H, T, D], got "
+                f"{tuple(t.shape)}"
+            )
+        if tuple(position_ids.shape) != (t.shape[0], t.shape[seq_dim]):
+            raise ValueError(
+                "position_ids must match attention batch/sequence axes, got "
+                f"{tuple(position_ids.shape)} for {tuple(t.shape)}"
+            )
+
+        positions = position_ids.to(device=t.device, dtype=self.freqs.dtype)
+        freqs = self.forward(positions)
+        freqs = freqs.unsqueeze(1)  # [B, 1, T, D]
+        return apply_rotary_emb(
+            freqs,
+            t,
+            scale=default(scale, 1.),
+            seq_dim=seq_dim,
+            freqs_seq_dim=-2,
+        )
+
     def rotate_queries_with_cached_keys(self, q, k, seq_dim = None, offset = 0):
         dtype, device, seq_dim = q.dtype, q.device, default(seq_dim, self.default_seq_dim)
 

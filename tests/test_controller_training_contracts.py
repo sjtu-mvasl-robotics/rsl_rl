@@ -6,6 +6,7 @@ from torch import nn
 from torch.distributions import Normal
 
 from rsl_rl.algorithms.mmppo import MMPPO, _actor_ppo_enabled
+from rsl_rl.modules.actor_critic_mm_gpt import ActorCriticMMGPT
 from rsl_rl.runners.on_policy_runner_mm import (
     OnPolicyRunnerMM,
     _amp_reward_enabled,
@@ -240,6 +241,123 @@ def test_plain_ppo_first_update_changes_actor_with_cold_critic():
     assert metrics["actor_ppo_update_fraction"] == 1.0
     assert metrics["mean_actor_grad_norm"] > 0.0
     assert all(changed)
+
+
+def test_streaming_mmgpt_first_ppo_update_changes_backbone(capsys):
+    torch.manual_seed(11)
+    terms = {
+        "joint_pos": 2,
+        "joint_vel": 2,
+        "projected_gravity": 3,
+        "base_lin_vel": 3,
+        "base_ang_vel": 3,
+        "actions": 2,
+    }
+    reference_terms = {"target_actions": 2}
+    actor_critic = ActorCriticMMGPT(
+        num_actor_obs=sum(terms.values()),
+        num_actor_ref_obs=2,
+        num_critic_obs=sum(terms.values()),
+        num_critic_ref_obs=2,
+        num_actions=2,
+        term_dict={"policy": terms, "critic": terms},
+        ref_term_dict={
+            "policy": reference_terms,
+            "critic": reference_terms,
+        },
+        ref_term_steps={"policy": None, "critic": None},
+        concatenate_term_names={"policy": None, "critic": None},
+        concatenate_ref_term_names={"policy": None, "critic": None},
+        pred_obs_term_names=["joint_pos"],
+        pred_obs_term_weights=[1.0],
+        dim_model=16,
+        num_heads=2,
+        num_layers=2,
+        num_steps_per_env=3,
+        max_seq_len=3,
+        critic_history_length=1,
+        critic_hidden_dims=[32, 16],
+        critic_fusion_mode="direct_concat",
+        apply_rope=True,
+        latest_reference_only=False,
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=3,
+        default_joint_pos=torch.zeros(2),
+    )
+    algorithm = MMPPO(
+        actor_critic,
+        num_learning_epochs=1,
+        num_mini_batches=2,
+        learning_rate=1.0e-3,
+        schedule="fixed",
+        teacher_coef=None,
+        teacher_loss_coef=None,
+        normalize_advantage_per_mini_batch=True,
+        aux_loss_coef=1.0,
+        dreamer_loss_coef=0.1,
+        device="cpu",
+    )
+    num_envs, rollout_steps = 4, 4
+    obs_dim = sum(terms.values())
+    algorithm.init_storage(
+        "rl",
+        num_envs=num_envs,
+        num_transitions_per_env=rollout_steps,
+        actor_obs_shape=(obs_dim,),
+        actor_ref_obs_shape=(2,),
+        critic_obs_shape=(obs_dim,),
+        critic_ref_obs_shape=(2,),
+        action_shape=(2,),
+        store_raw_observations=True,
+        dreamer_target_shape=(2,),
+    )
+
+    observations = torch.randn(num_envs, obs_dim)
+    for step in range(rollout_steps):
+        references = torch.randn(num_envs, 2)
+        reference_masks = torch.ones(num_envs, dtype=torch.bool)
+        actions = algorithm.act(
+            observations,
+            (references, reference_masks),
+            observations,
+            (references, reference_masks),
+            raw_obs=observations,
+            dreamer_target=(
+                torch.randn(num_envs, 2),
+                torch.ones(num_envs, dtype=torch.bool),
+            ),
+        )
+        rewards = -torch.square(actions - 0.1).sum(dim=-1)
+        dones = torch.zeros(num_envs, dtype=torch.bool)
+        dones[0] = step == 1
+        algorithm.process_env_step(rewards, dones, {})
+        actor_critic.reset(dones)
+        observations = torch.randn_like(observations)
+    final_references = torch.randn(num_envs, 2)
+    algorithm.compute_returns(
+        observations,
+        (final_references, torch.ones(num_envs, dtype=torch.bool)),
+    )
+
+    backbone_before = [
+        parameter.detach().clone()
+        for parameter in actor_critic.actor.decoder.parameters()
+    ]
+    metrics = algorithm.update(epoch=0)
+    backbone_changed = any(
+        not torch.equal(old, new.detach())
+        for old, new in zip(
+            backbone_before, actor_critic.actor.decoder.parameters()
+        )
+    )
+    capsys.readouterr()
+
+    assert metrics["actor_ppo_update_fraction"] == 1.0
+    assert metrics["mean_actor_grad_norm"] > 0.0
+    assert metrics["mean_aux_loss"] > 0.0
+    assert metrics["mean_dreamer_loss"] > 0.0
+    assert backbone_changed
 
 
 def test_composed_amp_reward_precedes_timeout_bootstrap_in_storage():
