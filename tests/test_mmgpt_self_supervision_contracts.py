@@ -103,6 +103,42 @@ def test_future_prediction_backbone_gradient_is_an_explicit_control(
     assert _grad_norm(model.fc[-1].weight) == 0.0
 
 
+def test_prediction_heads_and_weights_follow_config_term_order():
+    term_dict = {
+        "gravity_dir": 3,
+        "base_ang_vel": 3,
+        "joint_pos": 2,
+        "joint_vel": 2,
+        "actions": 2,
+    }
+    prediction_order = [
+        "joint_pos",
+        "joint_vel",
+        "gravity_dir",
+        "base_ang_vel",
+    ]
+    model = MMGPT(
+        obs_size=sum(term_dict.values()),
+        ref_obs_size=2,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        num_steps_per_env=4,
+        max_seq_len=4,
+        term_dict=term_dict,
+        ref_term_dict={"target_actions": 2},
+        pred_obs_term_names=prediction_order,
+        pred_obs_term_weights=[1.0, 0.8, 0.5, 0.25],
+        default_joint_pos=torch.zeros(2),
+    )
+
+    assert model.obs_term_names == prediction_order
+    assert model.obs_dims == [2, 2, 3, 3]
+    assert [head.out_features for head in model.aux_heads] == [2, 2, 3, 3]
+    assert model.pred_obs_term_weights == [1.0, 0.8, 0.5, 0.25]
+
+
 def test_future_prediction_detach_changes_only_autograd_not_loss_values():
     attached = _make_model(aux_backbone_grad=True).eval()
     detached = _make_model(aux_backbone_grad=False).eval()

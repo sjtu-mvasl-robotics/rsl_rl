@@ -592,14 +592,35 @@ class MMGPT(nn.Module):
             nn.init.constant_(self.action_film.bias[:dim_model], 0.5)
             nn.init.constant_(self.action_film.bias[dim_model:], 0.5)
             
+            term_slices = {}
             for term_name, term_dim in term_dict.items():
-                if term_name in self.pred_obs_term_names:
-                    self.obs_indices.append((start, start + term_dim))
-                    self.obs_dims.append(term_dim)
-                    self.obs_term_names.append(term_name)
+                term_slices[term_name] = (start, start + term_dim)
                 start += term_dim
-            if len(self.obs_indices) != len(self.pred_obs_term_names):
-                raise ValueError("Some pred_obs_term_names are not found in term_dict. Expected names: {}, but got: {}.".format(list(term_dict.keys()), self.pred_obs_term_names))
+            if len(set(self.pred_obs_term_names)) != len(self.pred_obs_term_names):
+                raise ValueError(
+                    "pred_obs_term_names must not contain duplicates, got "
+                    f"{self.pred_obs_term_names}."
+                )
+            missing_terms = [
+                term_name
+                for term_name in self.pred_obs_term_names
+                if term_name not in term_slices
+            ]
+            if missing_terms:
+                raise ValueError(
+                    "Some pred_obs_term_names are not found in term_dict. "
+                    f"Missing {missing_terms}; available names: "
+                    f"{list(term_dict.keys())}."
+                )
+            # Prediction heads and their weights are a positional config
+            # contract.  Preserve pred_obs_term_names order rather than the
+            # observation-dict order, which may be different (as it is for the
+            # SONIC actor).
+            for term_name in self.pred_obs_term_names:
+                term_start, term_end = term_slices[term_name]
+                self.obs_indices.append((term_start, term_end))
+                self.obs_dims.append(term_end - term_start)
+                self.obs_term_names.append(term_name)
             
             self.aux_heads = nn.ModuleList()
             for dim in self.obs_dims:
