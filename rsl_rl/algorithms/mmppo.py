@@ -668,7 +668,7 @@ class MMPPO:
                     + ", ".join(unsupported)
                 )
         actor_history_length = (
-            self.actor_critic.actor.num_steps_per_env if is_mmgpt else 1
+            self.actor_critic.actor.rollout_history_frames if is_mmgpt else 1
         )
         critic_history_length = (
             self.actor_critic.critic_history_length if is_mmgpt else 1
@@ -690,6 +690,10 @@ class MMPPO:
             critic_history_length=critic_history_length,
             raw_obs_shape=actor_obs_shape if store_raw_observations else None,
             dreamer_target_shape=dreamer_target_shape,
+            store_actor_temporal_phases=(
+                is_mmgpt
+                and self.actor_critic.actor.temporal_chunk_enabled
+            ),
         )
 
         # Initialize teacher replay buffer
@@ -731,6 +735,16 @@ class MMPPO:
         # Compute student actions - always store student actions for training
         student_actions = self.actor_critic.act(obs, ref_observations=ref_obs).detach()
         self.transition.actions = student_actions  # Always use student actions for training
+        if (
+            isinstance(self.actor_critic, ActorCriticMMGPT)
+            and self.actor_critic.actor.temporal_chunk_enabled
+        ):
+            phase = self.actor_critic.actor.last_inference_temporal_phase
+            if phase is None:
+                raise RuntimeError(
+                    "chunked MMGPT did not expose its rollout temporal phase"
+                )
+            self.transition.actor_temporal_phase = phase.detach().clone()
         
         # Compute values and other metrics based on student
         self.transition.values = self.actor_critic.evaluate(critic_obs, ref_critic_observations=ref_critic_obs).detach()
@@ -905,7 +919,7 @@ class MMPPO:
                 generator = self.storage.streaming_sequence_mini_batch_generator(
                     self.num_mini_batches,
                     self.num_learning_epochs,
-                    num_steps_per_env=self.actor_critic.actor.streaming_context_steps,
+                    num_steps_per_env=self.actor_critic.actor.rollout_history_frames,
                 )
             else:
                 # generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -979,6 +993,10 @@ class MMPPO:
                             "sequence_output_start"
                         ],
                     }
+                    if "temporal_phases" in hid_states_batch:
+                        streaming_kwargs["temporal_phases"] = (
+                            hid_states_batch["temporal_phases"]
+                        )
                 self.actor_critic.act(
                     obs_batch,
                     ref_observations=ref_obs_batch,

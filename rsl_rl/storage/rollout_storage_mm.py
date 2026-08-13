@@ -37,6 +37,7 @@ class RolloutStorageMM:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
+            self.actor_temporal_phase = None
             self.rnd_state = None
 
         def clear(self):
@@ -60,6 +61,7 @@ class RolloutStorageMM:
         critic_history_length=1,
         raw_obs_shape=None,
         dreamer_target_shape=None,
+        store_actor_temporal_phases=False,
     ):
         self.training_type = training_type
         self.device = device
@@ -75,6 +77,7 @@ class RolloutStorageMM:
         self.critic_history_length = int(critic_history_length)
         self.raw_obs_shape = raw_obs_shape
         self.dreamer_target_shape = dreamer_target_shape
+        self.store_actor_temporal_phases = bool(store_actor_temporal_phases)
         if self.actor_history_length < 1:
             raise ValueError("actor_history_length must be at least 1")
         if self.critic_history_length < 1:
@@ -85,6 +88,16 @@ class RolloutStorageMM:
      
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        self.actor_temporal_phases = (
+            torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                dtype=torch.long,
+                device=self.device,
+            )
+            if self.store_actor_temporal_phases
+            else None
+        )
         if raw_obs_shape is not None and raw_obs_shape[0] is not None:
             self.raw_observations = torch.zeros(
                 num_transitions_per_env,
@@ -184,6 +197,14 @@ class RolloutStorageMM:
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
         self.observations[self.step].copy_(transition.observations)
+        if self.actor_temporal_phases is not None:
+            if transition.actor_temporal_phase is None:
+                raise ValueError(
+                    "actor temporal phase is required by chunked rollout storage"
+                )
+            self.actor_temporal_phases[self.step].copy_(
+                transition.actor_temporal_phase
+            )
         if self.raw_observations is not None:
             if transition.raw_observations is None:
                 raise ValueError("raw observations are required by this rollout storage")
@@ -295,6 +316,11 @@ class RolloutStorageMM:
             if actor_prefix_len > 0
             else None
         )
+        self.actor_history_prefix_temporal_phases = zeros_like_sequence(
+            self.actor_temporal_phases,
+            actor_prefix_len,
+            dtype=torch.long,
+        )
 
         critic_observations = (
             self.privileged_observations
@@ -387,6 +413,10 @@ class RolloutStorageMM:
             ),
             (self.actor_history_prefix_dones, self.dones),
             (self.actor_history_prefix_valid, current_valid),
+            (
+                self.actor_history_prefix_temporal_phases,
+                self.actor_temporal_phases,
+            ),
             (self.critic_history_prefix_observations, critic_observations),
             (
                 self.critic_history_prefix_reference_observations,
@@ -1074,6 +1104,14 @@ class RolloutStorageMM:
             if self.raw_observations is not None
             else None
         )
+        temporal_phase_sequence = (
+            prepend(
+                self.actor_history_prefix_temporal_phases,
+                self.actor_temporal_phases,
+            )
+            if self.actor_temporal_phases is not None
+            else None
+        )
         ref_sequence = (
             prepend(
                 self.actor_history_prefix_reference_observations,
@@ -1181,6 +1219,10 @@ class RolloutStorageMM:
                     "episode_ids": episode_ids[:, env_idx],
                     "sequence_output_start": prefix_length,
                 }
+                if temporal_phase_sequence is not None:
+                    sequence_metadata["temporal_phases"] = (
+                        temporal_phase_sequence[:, env_idx]
+                    )
 
                 yield (
                     obs_batch,

@@ -115,6 +115,7 @@ def _make_storage(
     ref_dim=1,
     action_dim=1,
     self_supervision=False,
+    store_temporal_phases=False,
 ):
     return RolloutStorageMM(
         training_type="rl",
@@ -130,10 +131,18 @@ def _make_storage(
         critic_history_length=1,
         raw_obs_shape=(obs_dim,) if self_supervision else None,
         dreamer_target_shape=(action_dim,) if self_supervision else None,
+        store_actor_temporal_phases=store_temporal_phases,
     )
 
 
-def _add_storage_step(storage, observations, references, dones, action_mean=None):
+def _add_storage_step(
+    storage,
+    observations,
+    references,
+    dones,
+    action_mean=None,
+    temporal_phase=None,
+):
     num_envs = observations.shape[0]
     if action_mean is None:
         action_mean = observations[:, :1]
@@ -165,6 +174,10 @@ def _add_storage_step(storage, observations, references, dones, action_mean=None
     transition.action_mean = action_mean
     transition.action_sigma = torch.ones(num_envs, action_dim)
     transition.hidden_states = None
+    if storage.actor_temporal_phases is not None:
+        if temporal_phase is None:
+            raise ValueError("test transition requires an explicit temporal phase")
+        transition.actor_temporal_phase = temporal_phase
     storage.add_transitions(transition)
 
 
@@ -213,6 +226,52 @@ def test_rollout_prefix_is_visible_and_done_cuts_only_the_previous_episode():
     )
     assert masks_batch[:, env1_first].all()
     assert critic_obs_batch.shape[0] == 1
+
+
+def test_streaming_storage_carries_episode_local_chunk_phase_across_rollouts():
+    storage = _make_storage(
+        num_envs=2,
+        rollout_steps=4,
+        history_length=6,
+        store_temporal_phases=True,
+    )
+    for step in range(4):
+        observations = torch.full((2, 1), float(step))
+        _add_storage_step(
+            storage,
+            observations,
+            observations + 100.0,
+            torch.zeros(2, dtype=torch.bool),
+            temporal_phase=torch.full((2,), step, dtype=torch.long),
+        )
+    storage.clear()
+
+    second_rollout_phases = (4, 0, 1, 2)
+    for step, phase in enumerate(second_rollout_phases):
+        observations = torch.full((2, 1), float(10 + step))
+        _add_storage_step(
+            storage,
+            observations,
+            observations + 100.0,
+            torch.zeros(2, dtype=torch.bool),
+            temporal_phase=torch.full((2,), phase, dtype=torch.long),
+        )
+
+    batch = next(
+        storage.streaming_sequence_mini_batch_generator(
+            num_mini_batches=1,
+            num_epochs=1,
+            num_steps_per_env=6,
+        )
+    )
+    metadata = batch[12]
+    phases = metadata["temporal_phases"]
+    masks = batch[13]
+    torch.testing.assert_close(
+        phases[:, 0], torch.tensor([0, 0, 1, 2, 3, 4, 0, 1, 2])
+    )
+    assert not masks[0].any()
+    assert masks[1:].all()
 
 
 _TERM_DIMS = {
@@ -270,6 +329,277 @@ def _make_streaming_rope_mmgpt(history_length, num_layers=2):
         streaming_kv_cache=True,
         streaming_context_steps=history_length,
     ).eval()
+
+
+def _make_chunked_streaming_mmgpt(history_length=10, num_layers=2):
+    torch.manual_seed(17)
+    return MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=2,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=num_layers,
+        dropout=0.0,
+        num_steps_per_env=history_length,
+        max_seq_len=history_length,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"target_actions": 2},
+        pred_obs_term_names=None,
+        pred_obs_term_weights=None,
+        default_joint_pos=torch.zeros(2),
+        apply_rope=True,
+        latest_reference_only=False,
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=history_length,
+        temporal_chunk_size=5,
+    ).eval()
+
+
+def _episode_ids_from_dones(dones):
+    episode_ids = torch.zeros_like(dones, dtype=torch.long)
+    if dones.shape[0] > 1:
+        episode_ids[1:] = torch.cumsum(dones[:-1].long(), dim=0)
+    return episode_ids
+
+
+def test_chunk5_emits_actions_each_frame_but_caches_only_completed_chunks():
+    model = _make_chunked_streaming_mmgpt()
+    torch.manual_seed(101)
+    observations = torch.randn(6, 2, sum(_TERM_DIMS.values()))
+    references = torch.randn(6, 2, 2)
+    ref_masks = torch.ones(6, 2, dtype=torch.bool)
+
+    outputs = []
+    phases = []
+    with torch.no_grad():
+        for step in range(4):
+            outputs.append(
+                model(observations[step], (references[step], ref_masks[step]))
+            )
+            phases.append(model.last_inference_temporal_phase.clone())
+            assert model.inference_kv_cache is None
+        outputs.append(model(observations[4], (references[4], ref_masks[4])))
+        phases.append(model.last_inference_temporal_phase.clone())
+
+    assert torch.isfinite(torch.stack(outputs)).all()
+    torch.testing.assert_close(
+        torch.stack(phases)[:, 0], torch.arange(5, dtype=torch.long)
+    )
+    assert model.inference_kv_cache["key_padding_mask"].shape == (2, 1)
+    assert not model.inference_kv_cache["key_padding_mask"].any()
+    assert model.inference_chunk_phase.tolist() == [0, 0]
+
+
+def test_chunk5_streaming_matches_batch_across_async_resets():
+    time_steps = 17
+    num_envs = 3
+    online_model = _make_chunked_streaming_mmgpt()
+    batch_model = copy.deepcopy(online_model)
+    torch.manual_seed(103)
+    observations = torch.randn(
+        time_steps, num_envs, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(time_steps, num_envs, 2)
+    ref_masks = torch.ones(time_steps, num_envs, dtype=torch.bool)
+    masks = torch.ones_like(ref_masks)
+    dones = torch.zeros_like(ref_masks)
+    dones[2, 0] = True
+    dones[6, 1] = True
+    dones[10, 2] = True
+    dones[12, 0] = True
+    episode_ids = _episode_ids_from_dones(dones)
+
+    online_outputs = []
+    temporal_phases = []
+    with torch.no_grad():
+        for step in range(time_steps):
+            online_outputs.append(
+                online_model(
+                    observations[step],
+                    (references[step], ref_masks[step]),
+                )
+            )
+            temporal_phases.append(
+                online_model.last_inference_temporal_phase.clone()
+            )
+            online_model.reset(dones[step])
+
+        hidden, _, _ = batch_model._chunked_streaming_sequence_hidden(
+            observations,
+            (references, ref_masks),
+            masks,
+            episode_ids=episode_ids,
+            temporal_phases=torch.stack(temporal_phases),
+        )
+        batch_outputs = batch_model.fc(hidden)
+
+    torch.testing.assert_close(
+        torch.stack(online_outputs),
+        batch_outputs,
+        atol=3.0e-7,
+        rtol=3.0e-6,
+    )
+
+
+def test_chunk5_partial_tokens_are_causal_and_use_seen_frames_in_chunk():
+    model = _make_chunked_streaming_mmgpt()
+    torch.manual_seed(107)
+    observations = torch.randn(10, 1, sum(_TERM_DIMS.values()))
+    references = torch.randn(10, 1, 2)
+    masks = torch.ones(10, 1, dtype=torch.bool)
+    phases = torch.arange(10).remainder(5).view(10, 1)
+    episode_ids = torch.zeros_like(phases)
+
+    with torch.no_grad():
+        baseline, _, _ = model._chunked_streaming_sequence_hidden(
+            observations,
+            (references, masks),
+            masks,
+            episode_ids=episode_ids,
+            temporal_phases=phases,
+        )
+        future_observations = observations.clone()
+        future_references = references.clone()
+        future_observations[7:] += 50.0
+        future_references[7:] -= 50.0
+        future_changed, _, _ = model._chunked_streaming_sequence_hidden(
+            future_observations,
+            (future_references, masks),
+            masks,
+            episode_ids=episode_ids,
+            temporal_phases=phases,
+        )
+        torch.testing.assert_close(baseline[:7], future_changed[:7])
+
+        seen_observations = observations.clone()
+        seen_observations[0] += 50.0
+        seen_changed, _, _ = model._chunked_streaming_sequence_hidden(
+            seen_observations,
+            (references, masks),
+            masks,
+            episode_ids=episode_ids,
+            temporal_phases=phases,
+        )
+    assert not torch.allclose(baseline[2], seen_changed[2])
+
+
+def test_chunk5_cache_rebuild_discards_only_the_unrecoverable_prefix_chunk():
+    model = _make_chunked_streaming_mmgpt()
+    torch.manual_seed(109)
+    num_envs = 2
+    observations = torch.randn(25, num_envs, sum(_TERM_DIMS.values()))
+    references = torch.randn(25, num_envs, 2)
+    ref_masks = torch.ones(25, num_envs, dtype=torch.bool)
+
+    with torch.no_grad():
+        for step in range(24):
+            model(observations[step], (references[step], ref_masks[step]))
+
+        train_masks = torch.ones(10, num_envs, dtype=torch.bool)
+        train_phases = torch.arange(10).remainder(5).view(10, 1).expand(-1, 2)
+        model(
+            observations[:10],
+            (references[:10], ref_masks[:10]),
+            train_masks,
+            episode_ids=torch.zeros_like(train_masks, dtype=torch.long),
+            temporal_phases=train_phases,
+        )
+        model.decoder.encoder.layers[0].self_attn.qkv_proj.weight.add_(0.01)
+        rebuilt_output = model(
+            observations[24], (references[24], ref_masks[24])
+        )
+
+        replay_model = copy.deepcopy(model)
+        replay_masks = model.generate_mask()
+        end_position = model.inference_position_ids[0].item()
+        valid_length = replay_masks[:, 0].long().sum().item()
+        start_position = end_position - valid_length
+        replay_phases = torch.arange(
+            start_position, end_position
+        ).remainder(5).view(-1, 1).expand(-1, num_envs)
+        replay_hidden, _, _ = replay_model._chunked_streaming_sequence_hidden(
+            model.inference_buffer_obs,
+            (
+                model.inference_buffer_ref_obs,
+                model.inference_buffer_ref_obs_mask,
+            ),
+            replay_masks,
+            episode_ids=torch.zeros_like(replay_masks, dtype=torch.long),
+            temporal_phases=replay_phases,
+        )
+        replay_output = replay_model.fc(replay_hidden[-1])
+
+    assert not model.inference_kv_cache_dirty
+    torch.testing.assert_close(
+        rebuilt_output, replay_output, atol=3.0e-7, rtol=3.0e-6
+    )
+
+
+def test_chunk5_rollout_update_recomputes_means_across_rollout_boundary():
+    torch.manual_seed(113)
+    model = _make_chunked_streaming_mmgpt()
+    num_envs = 2
+    rollout_steps = 6
+    obs_dim = sum(_TERM_DIMS.values())
+    storage = _make_storage(
+        num_envs=num_envs,
+        rollout_steps=rollout_steps,
+        history_length=model.rollout_history_frames,
+        obs_dim=obs_dim,
+        ref_dim=2,
+        action_dim=2,
+        store_temporal_phases=True,
+    )
+
+    def collect_rollout(done_schedule):
+        for step in range(rollout_steps):
+            observations = torch.randn(num_envs, obs_dim)
+            references = torch.randn(num_envs, 2)
+            reference_masks = torch.ones(num_envs, dtype=torch.bool)
+            with torch.no_grad():
+                action_mean = model(
+                    observations, (references, reference_masks)
+                )
+            phase = model.last_inference_temporal_phase.clone()
+            dones = done_schedule(step)
+            _add_storage_step(
+                storage,
+                observations,
+                references,
+                dones,
+                action_mean=action_mean,
+                temporal_phase=phase,
+            )
+            model.reset(dones)
+
+    collect_rollout(lambda step: torch.tensor([step == 2, False]))
+    storage.clear()
+    collect_rollout(lambda step: torch.tensor([False, step == 3]))
+
+    batch = next(
+        storage.streaming_sequence_mini_batch_generator(
+            num_mini_batches=1,
+            num_epochs=1,
+            num_steps_per_env=model.rollout_history_frames,
+        )
+    )
+    obs_batch, ref_batch = batch[0], batch[1]
+    old_mu_batch, metadata, masks_batch = batch[9], batch[12], batch[13]
+    with torch.no_grad():
+        recomputed_mu = model(
+            obs_batch,
+            ref_batch,
+            masks_batch,
+            episode_ids=metadata["episode_ids"],
+            temporal_phases=metadata["temporal_phases"],
+            sequence_output_start=metadata["sequence_output_start"],
+        )
+
+    torch.testing.assert_close(
+        recomputed_mu, old_mu_batch, atol=3.0e-6, rtol=3.0e-5
+    )
 
 
 def test_streaming_kv_matches_full_local_sequence_across_async_resets():

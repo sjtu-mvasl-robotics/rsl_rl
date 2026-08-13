@@ -99,6 +99,102 @@ class MLPEmbedding(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.projector(x)
 
+
+class SonicTemporalChunkEncoder(nn.Module):
+    """Compress one causal, non-overlapping frame chunk into one token.
+
+    SONIC's released motion encoder flattens a fixed temporal axis before an
+    MLP maps it to a smaller token axis.  This module adapts that contract to
+    online policy history: observations and references are first fused per
+    frame, then up to ``chunk_size`` episode-local frames are flattened into a
+    single token.  ``slot_mask`` makes partial chunks explicit so inference can
+    still produce a 50 Hz action before a five-frame chunk is complete.
+
+    This is deliberately a continuous token encoder, not SONIC's FSQ action
+    tokenizer.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        chunk_size: int,
+        has_reference: bool,
+    ):
+        super().__init__()
+        if chunk_size < 2:
+            raise ValueError("temporal chunk size must be at least 2")
+        self.d_model = int(d_model)
+        self.chunk_size = int(chunk_size)
+        self.has_reference = bool(has_reference)
+
+        frame_input_dim = d_model
+        if self.has_reference:
+            frame_input_dim += d_model + 1
+        self.frame_encoder = nn.Sequential(
+            nn.Linear(frame_input_dim, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.chunk_encoder = nn.Sequential(
+            nn.Linear(chunk_size * d_model + chunk_size, 2 * d_model),
+            nn.SiLU(),
+            nn.Linear(2 * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def encode_frames(
+        self,
+        obs_embedding: torch.Tensor,
+        obs_mask: torch.Tensor,
+        ref_embedding: Optional[torch.Tensor] = None,
+        ref_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Fuse modalities independently at every physical control frame."""
+
+        features = [obs_embedding]
+        if self.has_reference:
+            if ref_embedding is None or ref_mask is None:
+                raise ValueError("chunked reference encoding requires tensor and mask")
+            ref_mask = ref_mask.bool() & obs_mask.bool()
+            features.extend(
+                (
+                    ref_embedding * ref_mask.unsqueeze(-1).to(ref_embedding.dtype),
+                    ref_mask.unsqueeze(-1).to(obs_embedding.dtype),
+                )
+            )
+        frame_features = self.frame_encoder(torch.cat(features, dim=-1))
+        return frame_features * obs_mask.unsqueeze(-1).to(frame_features.dtype)
+
+    def encode_windows(
+        self,
+        frame_windows: torch.Tensor,
+        slot_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode ``[..., K, D]`` causal windows, including partial chunks."""
+
+        if frame_windows.shape[-2:] != (self.chunk_size, self.d_model):
+            raise ValueError(
+                "frame windows must end in "
+                f"({self.chunk_size}, {self.d_model}), got "
+                f"{tuple(frame_windows.shape)}"
+            )
+        if slot_mask.shape != frame_windows.shape[:-1]:
+            raise ValueError("slot mask must match frame-window leading axes")
+        slot_mask = slot_mask.bool()
+        masked_windows = frame_windows * slot_mask.unsqueeze(-1).to(
+            frame_windows.dtype
+        )
+        encoder_input = torch.cat(
+            (
+                masked_windows.flatten(start_dim=-2),
+                slot_mask.to(frame_windows.dtype),
+            ),
+            dim=-1,
+        )
+        token = self.chunk_encoder(encoder_input)
+        return token * slot_mask.any(dim=-1, keepdim=True).to(token.dtype)
+
 # Compressor using Conv1d
 class Conv1dCompressor(nn.Module):
     def __init__(self, d_model: int, stride: int, kernel_size: int):
@@ -472,6 +568,7 @@ class MMGPT(nn.Module):
         streaming_kv_cache: bool = False,
         streaming_sequence_training: bool = False,
         streaming_context_steps: Optional[int] = None,
+        temporal_chunk_size: int = 1,
         score_prediction_enabled: bool = False,
         apply_mlp_residual = False,
         # some not pretty fix
@@ -492,11 +589,26 @@ class MMGPT(nn.Module):
         self.apply_res = apply_res
         self.ref_first = ref_first
         self.default_joint_pos = default_joint_pos
+        self.temporal_chunk_size = int(temporal_chunk_size)
+        if self.temporal_chunk_size < 1:
+            raise ValueError("temporal_chunk_size must be at least 1")
+        self.temporal_chunk_enabled = self.temporal_chunk_size > 1
         if kwargs:
             print(
                 f"MMGPT {self.name}.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
             )
-        self.stride = math.ceil(num_steps_per_env / max_seq_len) if num_steps_per_env > max_seq_len else 1
+        # The legacy compressor derives an implicit stride from max_seq_len.
+        # Chunked streaming has an explicit physical-frame/token contract and
+        # must not silently instantiate that second compressor.
+        self.stride = (
+            1
+            if self.temporal_chunk_enabled
+            else (
+                math.ceil(num_steps_per_env / max_seq_len)
+                if num_steps_per_env > max_seq_len
+                else 1
+            )
+        )
         # self.obs_embedding = ObservationSeqEmbeddingV2(dim_model, term_dict, concatenate_term_names, nheads=num_heads)
         # self.ref_obs_embedding = ObservationSeqEmbeddingV2(dim_model, ref_term_dict, concatenate_ref_term_names,term_steps=ref_term_steps, nheads=num_heads) if ref_obs_size > 0 else None
         self.obs_embedding = ObservationSeqEmbeddingV3(dim_model, term_dict, concatenate_term_names, nheads=num_heads)
@@ -575,6 +687,18 @@ class MMGPT(nn.Module):
                 "streaming_context_steps cannot exceed num_steps_per_env "
                 "because rollout storage retains only that raw history"
             )
+        self.streaming_context_tokens = math.ceil(
+            self.streaming_context_steps / self.temporal_chunk_size
+        )
+        # Rebuilding an episode-aligned K-frame cache from a rolling raw
+        # window can start in the middle of a chunk.  K-1 extra frames ensure
+        # that, after discarding that first incomplete chunk, the full context
+        # can still be reconstructed under updated parameters.
+        self.rollout_history_frames = (
+            self.streaming_context_steps + self.temporal_chunk_size - 1
+            if self.temporal_chunk_enabled
+            else self.num_steps_per_env
+        )
         self.score_prediction_enabled = bool(score_prediction_enabled)
         if self.pred_obs_term_names is not None and len(self.pred_obs_term_names) > 0:
             assert self.pred_obs_term_weights is not None and len(self.pred_obs_term_weights) == len(self.pred_obs_term_names), "pred_obs_term_weights should be provided with the same length as pred_obs_term_names."
@@ -730,6 +854,41 @@ class MMGPT(nn.Module):
                 raise ValueError(
                     "streaming_kv_cache does not yet support apply_mlp_residual"
                 )
+
+        if self.temporal_chunk_enabled:
+            if not self.streaming_kv_cache:
+                raise ValueError(
+                    "temporal chunking requires streaming_kv_cache=True"
+                )
+            if not self.streaming_sequence_training:
+                raise ValueError(
+                    "temporal chunking requires "
+                    "streaming_sequence_training=True so PPO receives the "
+                    "episode-local chunk phase"
+                )
+            if self.streaming_context_steps % self.temporal_chunk_size != 0:
+                raise ValueError(
+                    "streaming_context_steps must be divisible by "
+                    "temporal_chunk_size for an exact physical horizon"
+                )
+            self.temporal_chunk_encoder = SonicTemporalChunkEncoder(
+                dim_model,
+                self.temporal_chunk_size,
+                has_reference=ref_obs_size > 0,
+            )
+            # The partial chunk is the 50 Hz path; the last completed slow
+            # token contributes context through one feature fusion module.
+            # There remains only one action decoder (self.fc).
+            self.temporal_context_fusion = nn.Sequential(
+                nn.Linear(2 * dim_model + 1, 2 * dim_model),
+                nn.SiLU(),
+                nn.Linear(2 * dim_model, dim_model),
+            )
+            self.temporal_output_norm = nn.LayerNorm(dim_model)
+        else:
+            self.temporal_chunk_encoder = None
+            self.temporal_context_fusion = None
+            self.temporal_output_norm = None
         
         self.pos_emb = nn.Embedding(self.compressed_len, dim_model) if not self.apply_rope else None # *2 for obs and ref_obs
         self.modality_emb = nn.Embedding(2, dim_model) # 0 for obs, 1 for ref_obs
@@ -766,6 +925,12 @@ class MMGPT(nn.Module):
         self.inference_kv_cache = None
         self.inference_position_ids = None
         self.inference_kv_cache_dirty = False
+        self.inference_chunk_frame_buffer = None
+        self.inference_chunk_slot_mask = None
+        self.inference_chunk_phase = None
+        self.inference_slow_hidden = None
+        self.inference_slow_valid = None
+        self.last_inference_temporal_phase = None
         
         self.aux_loss = 0.0
         self.aux_loss_fn = nn.MSELoss()
@@ -907,7 +1072,7 @@ class MMGPT(nn.Module):
         if self.current_timesteps is None:
             raise RuntimeError("current_timesteps not initialized. Call _init_inference_buffer first.")
         
-        T_in = self.num_steps_per_env
+        T_in = self.inference_buffer_obs.shape[0]
         B = self.current_timesteps.shape[0]
         device = self.current_timesteps.device
         
@@ -923,7 +1088,7 @@ class MMGPT(nn.Module):
 
     def _init_inference_buffer(self, num_envs, device):
         self.num_envs_cache = num_envs
-        obs_buffer_shape = (self.num_steps_per_env, num_envs, self.obs_dim)
+        obs_buffer_shape = (self.rollout_history_frames, num_envs, self.obs_dim)
         self.inference_buffer_obs = torch.zeros(obs_buffer_shape, device=device)
         # Initialize timestep tracking array, initially set to 0
         self.current_timesteps = torch.zeros(num_envs, dtype=torch.long, device=device)
@@ -933,9 +1098,34 @@ class MMGPT(nn.Module):
         )
         self.inference_kv_cache_dirty = False
         if self.ref_obs_dim > 0:
-            ref_obs_buffer_shape = (self.num_steps_per_env , num_envs, self.ref_obs_dim)
+            ref_obs_buffer_shape = (self.rollout_history_frames, num_envs, self.ref_obs_dim)
             self.inference_buffer_ref_obs = torch.zeros(ref_obs_buffer_shape, device=device)
-            self.inference_buffer_ref_obs_mask = torch.zeros((self.num_steps_per_env, num_envs), dtype=torch.bool, device=device)
+            self.inference_buffer_ref_obs_mask = torch.zeros((self.rollout_history_frames, num_envs), dtype=torch.bool, device=device)
+        if self.temporal_chunk_enabled:
+            self.inference_chunk_frame_buffer = torch.zeros(
+                self.temporal_chunk_size,
+                num_envs,
+                self.dim_model,
+                device=device,
+            )
+            self.inference_chunk_slot_mask = torch.zeros(
+                self.temporal_chunk_size,
+                num_envs,
+                dtype=torch.bool,
+                device=device,
+            )
+            self.inference_chunk_phase = torch.zeros(
+                num_envs, dtype=torch.long, device=device
+            )
+            self.inference_slow_hidden = torch.zeros(
+                num_envs, self.dim_model, device=device
+            )
+            self.inference_slow_valid = torch.zeros(
+                num_envs, dtype=torch.bool, device=device
+            )
+            self.last_inference_temporal_phase = torch.zeros(
+                num_envs, dtype=torch.long, device=device
+            )
             
     def reset(self, dones=None):
         if self.inference_buffer_obs is None:
@@ -954,6 +1144,13 @@ class MMGPT(nn.Module):
             if self.inference_position_ids is not None:
                 self.inference_position_ids.zero_()
             self.inference_kv_cache_dirty = False
+            if self.temporal_chunk_enabled:
+                self.inference_chunk_frame_buffer.zero_()
+                self.inference_chunk_slot_mask.zero_()
+                self.inference_chunk_phase.zero_()
+                self.inference_slow_hidden.zero_()
+                self.inference_slow_valid.zero_()
+                self.last_inference_temporal_phase.zero_()
         else:
             # dones are at the environment level
             mask = (dones == 1)
@@ -974,12 +1171,245 @@ class MMGPT(nn.Module):
                 for key, value in self.inference_kv_cache["key_values"]:
                     key[mask] = 0.0
                     value[mask] = 0.0
+            if self.temporal_chunk_enabled:
+                self.inference_chunk_frame_buffer[:, mask] = 0.0
+                self.inference_chunk_slot_mask[:, mask] = False
+                self.inference_chunk_phase[mask] = 0
+                self.inference_slow_hidden[mask] = 0.0
+                self.inference_slow_valid[mask] = False
+                self.last_inference_temporal_phase[mask] = 0
 
     def invalidate_inference_cache(self):
         """Rebuild cached K/V with current parameters on the next rollout step."""
 
         if self.streaming_kv_cache and self.inference_buffer_obs is not None:
             self.inference_kv_cache_dirty = True
+
+    @staticmethod
+    def _select_kv_cache(
+        cache: Optional[Dict[str, object]],
+        env_indices: torch.Tensor,
+    ) -> Optional[Dict[str, object]]:
+        if cache is None:
+            return None
+        return {
+            "key_values": [
+                (key[env_indices], value[env_indices])
+                for key, value in cache["key_values"]
+            ],
+            "key_padding_mask": cache["key_padding_mask"][env_indices],
+        }
+
+    def _merge_kv_cache_subset(
+        self,
+        subset_cache: Dict[str, object],
+        env_indices: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Scatter caches for asynchronously completed chunks back by env."""
+
+        subset_padding = subset_cache["key_padding_mask"]
+        new_length = subset_padding.shape[1]
+        if self.inference_kv_cache is None:
+            full_key_values = []
+            for key, value in subset_cache["key_values"]:
+                key_shape = (batch_size, *key.shape[1:])
+                value_shape = (batch_size, *value.shape[1:])
+                full_key_values.append(
+                    (torch.zeros(key_shape, dtype=key.dtype, device=key.device),
+                     torch.zeros(value_shape, dtype=value.dtype, device=value.device))
+                )
+            full_padding = torch.ones(
+                batch_size,
+                new_length,
+                dtype=torch.bool,
+                device=subset_padding.device,
+            )
+            self.inference_kv_cache = {
+                "key_values": full_key_values,
+                "key_padding_mask": full_padding,
+            }
+        else:
+            old_length = self.inference_kv_cache["key_padding_mask"].shape[1]
+            if new_length < old_length:
+                raise RuntimeError("subset KV cache unexpectedly shrank")
+            if new_length > old_length:
+                if new_length != old_length + 1:
+                    raise RuntimeError("subset KV cache grew by more than one token")
+                expanded_key_values = []
+                for key, value in self.inference_kv_cache["key_values"]:
+                    expanded_key_values.append(
+                        (
+                            # Keep each asynchronous environment right-aligned;
+                            # append-only attention then drops left padding
+                            # before it can evict a valid completed token.
+                            F.pad(key, (0, 0, 1, 0)),
+                            F.pad(value, (0, 0, 1, 0)),
+                        )
+                    )
+                self.inference_kv_cache["key_values"] = expanded_key_values
+                self.inference_kv_cache["key_padding_mask"] = F.pad(
+                    self.inference_kv_cache["key_padding_mask"],
+                    (1, 0),
+                    value=True,
+                )
+
+        for layer_index, (subset_key, subset_value) in enumerate(
+            subset_cache["key_values"]
+        ):
+            full_key, full_value = self.inference_kv_cache["key_values"][
+                layer_index
+            ]
+            full_key[env_indices] = subset_key
+            full_value[env_indices] = subset_value
+        self.inference_kv_cache["key_padding_mask"][env_indices] = subset_padding
+
+    def _streaming_chunk_step(
+        self,
+        obs: torch.Tensor,
+        obs_mask: torch.Tensor,
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        cache_write_allowed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Advance the partial chunk and append only newly completed tokens."""
+
+        required_state = (
+            self.inference_chunk_frame_buffer,
+            self.inference_chunk_slot_mask,
+            self.inference_chunk_phase,
+            self.inference_slow_hidden,
+            self.inference_slow_valid,
+            self.inference_position_ids,
+        )
+        if any(state is None for state in required_state):
+            raise RuntimeError("chunked streaming state is not initialized")
+        B = obs.shape[0]
+        device = obs.device
+        obs_mask = obs_mask.bool()
+        phase = self.inference_chunk_phase.clone()
+        self.last_inference_temporal_phase = phase.clone()
+
+        obs_embedding = self.obs_norm(self.obs_embedding(obs.unsqueeze(0)))[0]
+        ref_embedding = None
+        ref_mask = None
+        if self.ref_obs_dim > 0:
+            if ref_obs is None:
+                ref_tensor = torch.zeros(
+                    B, self.ref_obs_dim, dtype=obs.dtype, device=device
+                )
+                ref_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            else:
+                ref_tensor, ref_mask = ref_obs
+                ref_mask = ref_mask.bool() & obs_mask
+            ref_embedding = self.ref_obs_norm(
+                self.ref_obs_embedding(ref_tensor.unsqueeze(0))
+            )[0]
+        frame_features = self.temporal_chunk_encoder.encode_frames(
+            obs_embedding,
+            obs_mask,
+            ref_embedding,
+            ref_mask,
+        )
+
+        valid_envs = torch.nonzero(obs_mask, as_tuple=False).flatten()
+        if valid_envs.numel() > 0:
+            valid_slots = phase[valid_envs]
+            self.inference_chunk_frame_buffer[valid_slots, valid_envs] = (
+                frame_features[valid_envs]
+            )
+            self.inference_chunk_slot_mask[valid_slots, valid_envs] = True
+        windows = self.inference_chunk_frame_buffer.permute(1, 0, 2)
+        slot_mask = self.inference_chunk_slot_mask.T
+        partial_token = self.temporal_chunk_encoder.encode_windows(
+            windows, slot_mask
+        )
+        closes_chunk = obs_mask & (phase == self.temporal_chunk_size - 1)
+        completed = closes_chunk & slot_mask.all(dim=-1)
+        write_mask = completed
+        if cache_write_allowed is not None:
+            if tuple(cache_write_allowed.shape) != (B,):
+                raise ValueError("cache_write_allowed must have shape [B]")
+            write_mask = write_mask & cache_write_allowed.bool()
+        write_envs = torch.nonzero(write_mask, as_tuple=False).flatten()
+        if write_envs.numel() > 0:
+            subset_cache = self._select_kv_cache(
+                self.inference_kv_cache, write_envs
+            )
+            slow_hidden, subset_cache = self.decoder.forward_with_kv_cache(
+                partial_token[write_envs].unsqueeze(1),
+                position_ids=self.inference_position_ids[write_envs].unsqueeze(1),
+                token_padding_mask=torch.zeros(
+                    write_envs.numel(), 1, dtype=torch.bool, device=device
+                ),
+                cache=subset_cache,
+                max_cache_tokens=self.streaming_context_tokens,
+            )
+            self._merge_kv_cache_subset(subset_cache, write_envs, B)
+            self.inference_slow_hidden[write_envs] = slow_hidden[:, 0]
+            self.inference_slow_valid[write_envs] = True
+
+        hidden = self._fuse_partial_and_slow_context(
+            partial_token,
+            self.inference_slow_hidden,
+            self.inference_slow_valid,
+            obs_mask,
+        )
+        closing_envs = torch.nonzero(closes_chunk, as_tuple=False).flatten()
+        if closing_envs.numel() > 0:
+            self.inference_chunk_frame_buffer[:, closing_envs] = 0.0
+            self.inference_chunk_slot_mask[:, closing_envs] = False
+        self.inference_chunk_phase = torch.where(
+            obs_mask,
+            torch.where(closes_chunk, torch.zeros_like(phase), phase + 1),
+            phase,
+        )
+        self.inference_position_ids = self.inference_position_ids + obs_mask.long()
+        return hidden
+
+    def _rebuild_chunked_streaming_cache(self) -> torch.Tensor:
+        """Rebuild completed-token KV and the current partial chunk from raw frames."""
+
+        masks = self.generate_mask()
+        valid_counts = masks.long().sum(dim=0)
+        # The current observation has already entered the raw rolling buffer,
+        # but its position has not yet been consumed by _streaming_chunk_step.
+        target_next_position = self.inference_position_ids + 1
+        start_position = target_next_position - valid_counts
+
+        self.inference_kv_cache = None
+        self.inference_chunk_frame_buffer.zero_()
+        self.inference_chunk_slot_mask.zero_()
+        self.inference_slow_hidden.zero_()
+        self.inference_slow_valid.zero_()
+        self.inference_position_ids = start_position.clone()
+        self.inference_chunk_phase = torch.remainder(
+            start_position, self.temporal_chunk_size
+        )
+        cache_eligible = self.inference_chunk_phase == 0
+        hidden = None
+        for step in range(self.inference_buffer_obs.shape[0]):
+            step_mask = masks[step]
+            completes_visible_chunk = (
+                step_mask
+                & (self.inference_chunk_phase == self.temporal_chunk_size - 1)
+            )
+            ref_step = None
+            if self.ref_obs_dim > 0:
+                ref_step = (
+                    self.inference_buffer_ref_obs[step],
+                    self.inference_buffer_ref_obs_mask[step],
+                )
+            hidden = self._streaming_chunk_step(
+                self.inference_buffer_obs[step],
+                step_mask,
+                ref_step,
+                cache_write_allowed=cache_eligible,
+            )
+            cache_eligible = cache_eligible | completes_visible_chunk
+        self.inference_kv_cache_dirty = False
+        if hidden is None:
+            raise RuntimeError("cannot rebuild an empty chunked context")
+        return hidden
 
     def _streaming_token_step(
         self,
@@ -1059,6 +1489,285 @@ class MMGPT(nn.Module):
         if hidden is None:
             raise RuntimeError("cannot rebuild an empty streaming context")
         return hidden
+
+    def _infer_temporal_phases(
+        self,
+        masks: torch.Tensor,
+        episode_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Infer phases only when a sequence begins at an episode boundary.
+
+        PPO supplies stored phases for rolling prefixes.  This fallback keeps
+        direct unit-level calls convenient, but deliberately treats the first
+        valid frame in each visible segment as phase zero.
+        """
+
+        T, B = masks.shape
+        phases = torch.zeros(T, B, dtype=torch.long, device=masks.device)
+        for step in range(1, T):
+            continues = (
+                masks[step]
+                & masks[step - 1]
+                & (episode_ids[step] == episode_ids[step - 1])
+            )
+            phases[step] = torch.where(
+                continues,
+                (phases[step - 1] + 1) % self.temporal_chunk_size,
+                torch.zeros_like(phases[step - 1]),
+            )
+        return phases
+
+    def _build_partial_chunk_tokens(
+        self,
+        frame_features: torch.Tensor,
+        masks: torch.Tensor,
+        episode_ids: torch.Tensor,
+        temporal_phases: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build one strictly causal partial token for every physical frame."""
+
+        if self.temporal_chunk_encoder is None:
+            raise RuntimeError("temporal chunk encoder is not initialized")
+        T, B, D = frame_features.shape
+        if tuple(temporal_phases.shape) != (T, B):
+            raise ValueError(
+                "temporal_phases must match masks, got "
+                f"{tuple(temporal_phases.shape)} and {(T, B)}"
+            )
+        temporal_phases = temporal_phases.long()
+
+        chunk_size = self.temporal_chunk_size
+        time_index = torch.arange(T, device=frame_features.device).view(T, 1, 1)
+        slot_index = torch.arange(chunk_size, device=frame_features.device).view(
+            1, 1, chunk_size
+        )
+        source_index = (
+            time_index - temporal_phases.unsqueeze(-1) + slot_index
+        )
+        in_bounds = (source_index >= 0) & (source_index < T)
+        clamped_source = source_index.clamp(0, max(T - 1, 0))
+        source_bt = clamped_source.permute(1, 0, 2)
+
+        expanded_features = frame_features.permute(1, 0, 2).unsqueeze(2).expand(
+            B, T, chunk_size, D
+        )
+        gather_index = source_bt.unsqueeze(-1).expand(B, T, chunk_size, D)
+        windows = torch.gather(expanded_features, 1, gather_index).permute(
+            1, 0, 2, 3
+        )
+
+        flat_source = source_bt.reshape(B, -1)
+        source_masks = torch.gather(masks.T, 1, flat_source).reshape(
+            B, T, chunk_size
+        ).permute(1, 0, 2).bool()
+        source_episodes = torch.gather(
+            episode_ids.T, 1, flat_source
+        ).reshape(B, T, chunk_size).permute(1, 0, 2)
+        expected_slots = slot_index <= temporal_phases.unsqueeze(-1)
+        slot_mask = (
+            in_bounds
+            & expected_slots
+            & masks.bool().unsqueeze(-1)
+            & source_masks
+            & (source_episodes == episode_ids.unsqueeze(-1))
+        )
+        partial_tokens = self.temporal_chunk_encoder.encode_windows(
+            windows, slot_mask
+        )
+        full_chunk_mask = (
+            masks.bool()
+            & (temporal_phases == chunk_size - 1)
+            & slot_mask.all(dim=-1)
+        )
+
+        # Absolute offsets are unnecessary for RoPE; preserving the physical
+        # 50 Hz differences and the episode-local phase is sufficient.
+        positions = torch.zeros(T, B, dtype=torch.long, device=masks.device)
+        if T > 0:
+            positions[0] = torch.where(
+                masks[0], temporal_phases[0], torch.zeros_like(temporal_phases[0])
+            )
+        for step in range(1, T):
+            continues = (
+                masks[step]
+                & masks[step - 1]
+                & (episode_ids[step] == episode_ids[step - 1])
+            )
+            positions[step] = torch.where(
+                continues,
+                positions[step - 1] + 1,
+                torch.where(
+                    masks[step],
+                    temporal_phases[step],
+                    torch.zeros_like(positions[step - 1]),
+                ),
+            )
+        return partial_tokens, full_chunk_mask, positions
+
+    def _completed_chunk_context(
+        self,
+        partial_tokens: torch.Tensor,
+        full_chunk_mask: torch.Tensor,
+        masks: torch.Tensor,
+        episode_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the slow transformer only on completed episode-local chunks."""
+
+        T, B, D = partial_tokens.shape
+        max_chunks = max(1, math.ceil(T / self.temporal_chunk_size))
+        chunk_rank = torch.cumsum(full_chunk_mask.long(), dim=0) - 1
+        assignment = F.one_hot(
+            chunk_rank.clamp(min=0, max=max_chunks - 1),
+            num_classes=max_chunks,
+        ).bool() & full_chunk_mask.unsqueeze(-1)
+        assignment_float = assignment.to(partial_tokens.dtype)
+        packed_tokens = torch.einsum(
+            "tbc,tbd->cbd", assignment_float, partial_tokens
+        )
+        packed_mask = assignment.any(dim=0)  # [B, C]
+        packed_positions = (
+            assignment.long() * positions.unsqueeze(-1)
+        ).sum(dim=0)
+        packed_episode_ids = (
+            assignment.long() * episode_ids.unsqueeze(-1)
+        ).sum(dim=0)
+
+        query_index = torch.arange(
+            max_chunks, device=partial_tokens.device
+        ).view(max_chunks, 1)
+        key_index = torch.arange(
+            max_chunks, device=partial_tokens.device
+        ).view(1, max_chunks)
+        blocked = key_index > query_index
+        blocked = blocked | (
+            key_index
+            < query_index - self.streaming_context_tokens + 1
+        )
+        segment_blocked = (
+            packed_episode_ids.unsqueeze(2)
+            != packed_episode_ids.unsqueeze(1)
+        )
+        attention_mask = blocked.unsqueeze(0) | segment_blocked
+        slow_output = self.decoder(
+            packed_tokens.permute(1, 0, 2),
+            src_mask=attention_mask,
+            src_key_padding_mask=~packed_mask,
+            position_ids=packed_positions,
+        )
+
+        latest_rank = torch.full(
+            (B,), -1, dtype=torch.long, device=partial_tokens.device
+        )
+        latest_by_frame = []
+        for step in range(T):
+            if step == 0:
+                starts_segment = masks[step]
+            else:
+                starts_segment = masks[step] & (
+                    ~masks[step - 1]
+                    | (episode_ids[step] != episode_ids[step - 1])
+                )
+            latest_rank = torch.where(
+                starts_segment,
+                torch.full_like(latest_rank, -1),
+                latest_rank,
+            )
+            latest_rank = torch.where(
+                full_chunk_mask[step], chunk_rank[step], latest_rank
+            )
+            latest_by_frame.append(latest_rank.clone())
+        latest_by_frame = torch.stack(latest_by_frame, dim=0)
+        has_context = (latest_by_frame >= 0) & masks.bool()
+        gather_rank = latest_by_frame.clamp(min=0, max=max_chunks - 1).T
+        gathered = torch.gather(
+            slow_output,
+            1,
+            gather_rank.unsqueeze(-1).expand(B, T, D),
+        ).permute(1, 0, 2)
+        gathered = gathered * has_context.unsqueeze(-1).to(gathered.dtype)
+        return gathered, has_context
+
+    def _fuse_partial_and_slow_context(
+        self,
+        partial_tokens: torch.Tensor,
+        slow_context: torch.Tensor,
+        has_context: torch.Tensor,
+        masks: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.temporal_context_fusion is None or self.temporal_output_norm is None:
+            raise RuntimeError("temporal context fusion is not initialized")
+        fusion_input = torch.cat(
+            (
+                partial_tokens,
+                slow_context,
+                has_context.unsqueeze(-1).to(partial_tokens.dtype),
+            ),
+            dim=-1,
+        )
+        context_delta = self.temporal_context_fusion(fusion_input)
+        fused = self.temporal_output_norm(
+            partial_tokens
+            + context_delta * has_context.unsqueeze(-1).to(context_delta.dtype)
+        )
+        return fused * masks.unsqueeze(-1).to(fused.dtype)
+
+    def _chunked_streaming_sequence_hidden(
+        self,
+        obs: torch.Tensor,
+        ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        masks: torch.Tensor,
+        episode_ids: Optional[torch.Tensor] = None,
+        temporal_phases: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Differentiable PPO path for the 5-frame/one-token variant."""
+
+        T, B, _ = obs.shape
+        if episode_ids is None:
+            episode_ids = torch.zeros_like(masks, dtype=torch.long)
+        if temporal_phases is None:
+            temporal_phases = self._infer_temporal_phases(masks, episode_ids)
+
+        obs_embedding = self.obs_norm(self.obs_embedding(obs))
+        has_ref = ref_obs is not None and self.ref_obs_dim > 0
+        ref_embedding = None
+        ref_mask = None
+        if self.ref_obs_dim > 0:
+            if ref_obs is None:
+                ref_tensor = torch.zeros(
+                    T, B, self.ref_obs_dim, dtype=obs.dtype, device=obs.device
+                )
+                ref_mask = torch.zeros(T, B, dtype=torch.bool, device=obs.device)
+            else:
+                ref_tensor, ref_mask = ref_obs
+                ref_mask = ref_mask.bool() & masks.bool()
+            ref_embedding = self.ref_obs_norm(self.ref_obs_embedding(ref_tensor))
+
+        frame_features = self.temporal_chunk_encoder.encode_frames(
+            obs_embedding,
+            masks.bool(),
+            ref_embedding,
+            ref_mask,
+        )
+        partial_tokens, full_chunk_mask, positions = (
+            self._build_partial_chunk_tokens(
+                frame_features,
+                masks.bool(),
+                episode_ids,
+                temporal_phases,
+            )
+        )
+        slow_context, has_context = self._completed_chunk_context(
+            partial_tokens,
+            full_chunk_mask,
+            masks.bool(),
+            episode_ids,
+            positions,
+        )
+        hidden = self._fuse_partial_and_slow_context(
+            partial_tokens, slow_context, has_context, masks.bool()
+        )
+        return hidden, obs_embedding, ref_embedding if has_ref else None
 
     def _streaming_sequence_hidden(
         self,
@@ -1181,6 +1890,7 @@ class MMGPT(nn.Module):
                 compute_dreamer_loss: bool = False,
                 compute_dreamer_reward: bool = False,
                 episode_ids: Optional[torch.Tensor] = None,
+                temporal_phases: Optional[torch.Tensor] = None,
                 sequence_output_start: Optional[int] = None,
                 ):
         """
@@ -1211,6 +1921,10 @@ class MMGPT(nn.Module):
             if not 0 <= sequence_output_start < T_in:
                 raise ValueError(
                     "sequence_output_start must index the input sequence"
+                )
+            if self.temporal_chunk_enabled and temporal_phases is None:
+                raise ValueError(
+                    "chunked streaming PPO requires stored temporal_phases"
                 )
         if raw_observations is None:
             # Backward-compatible fallback for environments/runners that do not
@@ -1245,11 +1959,22 @@ class MMGPT(nn.Module):
             mlp_output = None 
         has_ref = ref_obs is not None and self.ref_obs_dim > 0
         if self.streaming_kv_cache:
-            obs_out_seq, res_obs_emb, res_ref_obs_emb = (
-                self._streaming_sequence_hidden(
-                    obs, ref_obs, masks, episode_ids=episode_ids
+            if self.temporal_chunk_enabled:
+                obs_out_seq, res_obs_emb, res_ref_obs_emb = (
+                    self._chunked_streaming_sequence_hidden(
+                        obs,
+                        ref_obs,
+                        masks,
+                        episode_ids=episode_ids,
+                        temporal_phases=temporal_phases,
+                    )
                 )
-            )
+            else:
+                obs_out_seq, res_obs_emb, res_ref_obs_emb = (
+                    self._streaming_sequence_hidden(
+                        obs, ref_obs, masks, episode_ids=episode_ids
+                    )
+                )
             T_c = T_in
             if has_ref:
                 ref_obs_tensor, ref_obs_mask = ref_obs
@@ -1553,7 +2278,10 @@ class MMGPT(nn.Module):
         
         # For each new action, increment the corresponding environment's timestep by 1 (but not exceeding T_in)
         if self.current_timesteps is not None:
-            self.current_timesteps = torch.clamp(self.current_timesteps + 1, max=self.num_steps_per_env)
+            self.current_timesteps = torch.clamp(
+                self.current_timesteps + 1,
+                max=self.inference_buffer_obs.shape[0],
+            )
         
         # right here, we always maintain the reference buffer, in case we need it later
         if self.inference_buffer_ref_obs is not None:
@@ -1573,20 +2301,36 @@ class MMGPT(nn.Module):
                 self.inference_buffer_ref_obs_mask[-1, :].fill_(False)
             
         if self.streaming_kv_cache:
-            if self.inference_kv_cache_dirty:
-                hidden = self._rebuild_streaming_cache()
-            else:
-                ref_step = None
-                if self.ref_obs_dim > 0:
-                    ref_step = (
-                        self.inference_buffer_ref_obs[-1],
-                        self.inference_buffer_ref_obs_mask[-1],
+            if self.temporal_chunk_enabled:
+                if self.inference_kv_cache_dirty:
+                    hidden = self._rebuild_chunked_streaming_cache()
+                else:
+                    ref_step = None
+                    if self.ref_obs_dim > 0:
+                        ref_step = (
+                            self.inference_buffer_ref_obs[-1],
+                            self.inference_buffer_ref_obs_mask[-1],
+                        )
+                    hidden = self._streaming_chunk_step(
+                        obs,
+                        torch.ones(B, dtype=torch.bool, device=device),
+                        ref_step,
                     )
-                hidden = self._streaming_token_step(
-                    obs,
-                    torch.ones(B, dtype=torch.bool, device=device),
-                    ref_step,
-                )
+            else:
+                if self.inference_kv_cache_dirty:
+                    hidden = self._rebuild_streaming_cache()
+                else:
+                    ref_step = None
+                    if self.ref_obs_dim > 0:
+                        ref_step = (
+                            self.inference_buffer_ref_obs[-1],
+                            self.inference_buffer_ref_obs_mask[-1],
+                        )
+                    hidden = self._streaming_token_step(
+                        obs,
+                        torch.ones(B, dtype=torch.bool, device=device),
+                        ref_step,
+                    )
             self.last_hidden_state = hidden
             return self.fc(hidden)
 
@@ -1642,6 +2386,7 @@ class MMGPT(nn.Module):
                 compute_dreamer_loss=True,
                 compute_dreamer_reward=self.score_prediction_enabled,
                 episode_ids=kwargs.get("episode_ids"),
+                temporal_phases=kwargs.get("temporal_phases"),
                 sequence_output_start=kwargs.get("sequence_output_start"),
             )
         else:

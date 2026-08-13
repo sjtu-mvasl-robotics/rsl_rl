@@ -85,6 +85,64 @@ def test_policy_action_path_updates_mmgpt_backbone_and_action_head():
     assert _grad_norm(model.fc[-1].weight) > 0.0
 
 
+def test_chunk5_partial_frame_policy_aux_and_dreamer_share_trainable_latent():
+    torch.manual_seed(13)
+    model = MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=2,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        dropout=0.0,
+        num_steps_per_env=10,
+        max_seq_len=10,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"target_actions": 2},
+        pred_obs_term_names=_PREDICTED_TERMS,
+        pred_obs_term_weights=[1.0, 1.0, 0.5, 0.5, 0.5],
+        default_joint_pos=torch.zeros(2),
+        apply_rope=True,
+        aux_backbone_grad=True,
+        dreamer_gradient_mode="backbone_only",
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=10,
+        temporal_chunk_size=5,
+    )
+    time_steps = 9  # ends at phase 3: the current chunk is intentionally open
+    batch_size = 2
+    observations = torch.randn(
+        time_steps, batch_size, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(time_steps, batch_size, 2)
+    masks = torch.ones(time_steps, batch_size, dtype=torch.bool)
+    phases = torch.arange(time_steps).remainder(5).view(-1, 1).expand(-1, 2)
+    output = model(
+        observations,
+        (references, masks),
+        masks,
+        raw_observations=observations,
+        dreamer_target=(
+            torch.randn(batch_size, 2),
+            torch.ones(batch_size, dtype=torch.bool),
+        ),
+        episode_ids=torch.zeros_like(masks, dtype=torch.long),
+        temporal_phases=phases,
+    )
+
+    total_loss = output.square().mean() + model.aux_loss + model.dreamer_loss
+    total_loss.backward()
+
+    assert _grad_norm(model.temporal_chunk_encoder.chunk_encoder[0].weight) > 0.0
+    assert _grad_norm(model.temporal_chunk_encoder.frame_encoder[0].weight) > 0.0
+    assert _grad_norm(
+        model.decoder.encoder.layers[0].self_attn.qkv_proj.weight
+    ) > 0.0
+    assert _grad_norm(model.fc[-1].weight) > 0.0
+    assert _grad_norm(model.aux_heads[0].weight) > 0.0
+
+
 @pytest.mark.parametrize(
     ("aux_backbone_grad", "expect_backbone_grad"),
     [(True, True), (False, False)],
