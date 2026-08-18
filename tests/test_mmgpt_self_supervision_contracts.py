@@ -3,8 +3,13 @@ import inspect
 import pytest
 import torch
 
+from rsl_rl.algorithms import chunk_q_bootstrap_target
 from rsl_rl.algorithms.mmppo import MMPPO
-from rsl_rl.modules.actor_critic_mm_gpt import ActorCriticMMGPT, MMGPT
+from rsl_rl.modules import PrivilegedChunkQ
+from rsl_rl.modules.actor_critic_mm_gpt import (
+    ActorCriticMMGPT,
+    MMGPT,
+)
 from rsl_rl.modules.actor_critic_mlp_v2 import (
     DirectConcatMLP,
     FusedMultiModalMLP,
@@ -141,6 +146,67 @@ def test_chunk5_partial_frame_policy_aux_and_dreamer_share_trainable_latent():
     ) > 0.0
     assert _grad_norm(model.fc[-1].weight) > 0.0
     assert _grad_norm(model.aux_heads[0].weight) > 0.0
+
+
+def test_fast_slow_dreamer_control_uses_only_the_non_detached_action_path():
+    torch.manual_seed(14)
+    model = MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=2,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        dropout=0.0,
+        num_steps_per_env=10,
+        max_seq_len=10,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"target_actions": 2},
+        pred_obs_term_names=_PREDICTED_TERMS,
+        pred_obs_term_weights=[1.0, 1.0, 0.5, 0.5, 0.5],
+        default_joint_pos=torch.zeros(2),
+        apply_rope=True,
+        aux_backbone_grad=True,
+        dreamer_gradient_mode="action_path_only",
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=10,
+        temporal_chunk_size=5,
+        temporal_fast_slow_enabled=True,
+    )
+    time_steps = 9
+    batch_size = 2
+    observations = torch.randn(
+        time_steps, batch_size, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(time_steps, batch_size, 2)
+    masks = torch.ones(time_steps, batch_size, dtype=torch.bool)
+    phases = torch.arange(time_steps).remainder(5).view(-1, 1).expand(-1, 2)
+
+    model(
+        observations,
+        (references, masks),
+        masks,
+        raw_observations=observations,
+        dreamer_target=(
+            torch.randn(batch_size, 2),
+            torch.ones(batch_size, dtype=torch.bool),
+        ),
+        episode_ids=torch.zeros_like(masks, dtype=torch.long),
+        temporal_phases=phases,
+    )
+    model.dreamer_loss.backward()
+
+    # The frozen dynamics readout transmits control gradients through the
+    # resolved policy action into both rates of the actor.
+    assert _grad_norm(model.temporal_plan_head[-1].weight) > 0.0
+    assert _grad_norm(model.temporal_fast_controller[-1].weight) > 0.0
+    assert _grad_norm(
+        model.decoder.encoder.layers[0].self_attn.qkv_proj.weight
+    ) > 0.0
+    # Dreamer control must not refit the supervised dynamics readout itself.
+    assert _grad_norm(model.aux_heads[0].weight) == 0.0
+    assert _grad_norm(model.action_film.weight) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -554,6 +620,70 @@ def test_single_frame_privileged_critic_has_scalar_value_per_environment():
     assert batch_values.shape == (4, 1)
 
 
+def test_chunk_q_bootstrap_stops_after_terminal_transition():
+    rewards = torch.tensor(
+        [
+            [1.0, 1.0],
+            [2.0, 2.0],
+            [4.0, 4.0],
+            [8.0, 8.0],
+            [16.0, 16.0],
+        ]
+    )
+    dones = torch.zeros_like(rewards, dtype=torch.bool)
+    dones[1, 0] = True
+    bootstrap = torch.tensor([100.0, 100.0])
+
+    target = chunk_q_bootstrap_target(rewards, dones, bootstrap, gamma=0.5)
+
+    expected_terminal = 1.0 + 0.5 * 2.0
+    expected_continuing = (
+        1.0
+        + 0.5 * 2.0
+        + 0.25 * 4.0
+        + 0.125 * 8.0
+        + 0.0625 * 16.0
+        + 0.03125 * 100.0
+    )
+    torch.testing.assert_close(
+        target, torch.tensor([expected_terminal, expected_continuing])
+    )
+
+
+def test_privileged_chunk_q_masks_reference_and_has_scalar_output():
+    torch.manual_seed(31)
+    chunk_q = PrivilegedChunkQ(
+        critic_obs_dim=5,
+        critic_ref_obs_dim=3,
+        action_dim=2,
+        chunk_size=5,
+        hidden_dims=[16, 8],
+        reference_first=True,
+    )
+    states = torch.randn(4, 5)
+    action_chunks = torch.randn(4, 5, 2)
+    references = torch.randn(4, 3)
+    reference_mask = torch.tensor([True, False, True, False])
+
+    baseline = chunk_q(
+        states,
+        action_chunks,
+        (references, reference_mask),
+    )
+    changed_reference = references.clone()
+    changed_reference[~reference_mask] += 1000.0
+    masked_change = chunk_q(
+        states,
+        action_chunks,
+        (changed_reference, reference_mask),
+    )
+    torch.testing.assert_close(baseline, masked_change)
+    assert baseline.shape == (4, 1)
+
+    baseline.square().mean().backward()
+    assert any(parameter.grad is not None for parameter in chunk_q.parameters())
+
+
 def test_sonic_command_can_supply_the_dreamer_action_target():
     model = MMGPT(
         obs_size=sum(_TERM_DIMS.values()),
@@ -645,6 +775,31 @@ def _make_actor_critic_with_sonic_critic(**overrides):
     )
     kwargs.update(overrides)
     return ActorCriticMMGPT(**kwargs)
+
+
+def test_chunk_q_calibration_gradient_is_separate_from_actor_and_value_critic():
+    model = _make_actor_critic_with_sonic_critic(
+        num_steps_per_env=5,
+        max_seq_len=5,
+        apply_rope=True,
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=5,
+        temporal_chunk_size=5,
+        chunk_q_enabled=True,
+        chunk_q_hidden_dims=[16, 8],
+    )
+    chunk_values = model.evaluate_chunk_q(
+        torch.randn(4, 5),
+        torch.randn(4, 5, 2),
+        (torch.randn(4, 3), torch.ones(4, dtype=torch.bool)),
+    )
+
+    chunk_values.square().mean().backward()
+
+    assert any(parameter.grad is not None for parameter in model.chunk_q.parameters())
+    assert all(parameter.grad is None for parameter in model.actor.parameters())
+    assert all(parameter.grad is None for parameter in model.critic.parameters())
 
 
 def test_mmgpt_uses_sonic_direct_privileged_critic_for_inference_and_batches():

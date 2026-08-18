@@ -51,6 +51,42 @@ def _actor_ppo_enabled(
     return epoch >= teacher_only_interval and critic_ready
 
 
+def chunk_q_bootstrap_target(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    bootstrap_value: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    """Return a reset-safe discounted target for one realized action chunk.
+
+    ``rewards`` and ``dones`` use the physical-step axis first.  A terminal
+    transition contributes its own reward, then masks all later rewards and the
+    value bootstrap.  This utility is deliberately independent of PPO update
+    wiring so the chunk-Q assignment can be calibrated before it affects the
+    actor or state-value critic.
+    """
+
+    if rewards.shape != dones.shape:
+        raise ValueError("chunk-Q rewards and dones must have identical shapes")
+    if rewards.ndim < 1:
+        raise ValueError("chunk-Q rewards require a physical-step axis")
+    if bootstrap_value.shape != rewards.shape[1:]:
+        raise ValueError(
+            "chunk-Q bootstrap shape must match the non-time reward axes"
+        )
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError("chunk-Q gamma must lie in [0, 1]")
+
+    target = torch.zeros_like(bootstrap_value, dtype=rewards.dtype)
+    discount = torch.ones_like(target)
+    for step in range(rewards.shape[0]):
+        target = target + discount * rewards[step]
+        discount = discount * float(gamma) * (~dones[step].bool()).to(
+            rewards.dtype
+        )
+    return target + discount * bootstrap_value.to(rewards.dtype)
+
+
 class DebugHook:
     def __init__(self, name):
         self.name = name

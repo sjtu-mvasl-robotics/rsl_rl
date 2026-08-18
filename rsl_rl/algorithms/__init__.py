@@ -7,8 +7,15 @@
 
 from .distillation import Distillation
 from .ppo import PPO
-from .mmppo import MMPPO
+from .mmppo import MMPPO, chunk_q_bootstrap_target
 from .mmdistillation import MMDistillation
 from .ppo_mimic import PPOMimic
 
-__all__ = ["PPO", "Distillation", "MMPPO", "MMDistillation", "PPOMimic"]
+__all__ = [
+    "PPO",
+    "Distillation",
+    "MMPPO",
+    "MMDistillation",
+    "PPOMimic",
+    "chunk_q_bootstrap_target",
+]

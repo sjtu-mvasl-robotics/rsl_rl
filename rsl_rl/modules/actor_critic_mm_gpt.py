@@ -569,6 +569,8 @@ class MMGPT(nn.Module):
         streaming_sequence_training: bool = False,
         streaming_context_steps: Optional[int] = None,
         temporal_chunk_size: int = 1,
+        temporal_fast_slow_enabled: bool = False,
+        temporal_fast_residual_scale: float = 1.0,
         score_prediction_enabled: bool = False,
         apply_mlp_residual = False,
         # some not pretty fix
@@ -583,6 +585,7 @@ class MMGPT(nn.Module):
         self.name = name
         self.obs_dim = obs_size
         self.ref_obs_dim = ref_obs_size
+        self.dim_out = dim_out
         self.dim_model = dim_model
         self.num_steps_per_env = num_steps_per_env
         self.apply_rope = apply_rope
@@ -593,6 +596,14 @@ class MMGPT(nn.Module):
         if self.temporal_chunk_size < 1:
             raise ValueError("temporal_chunk_size must be at least 1")
         self.temporal_chunk_enabled = self.temporal_chunk_size > 1
+        self.temporal_fast_slow_enabled = bool(temporal_fast_slow_enabled)
+        self.temporal_fast_residual_scale = float(temporal_fast_residual_scale)
+        if self.temporal_fast_residual_scale < 0.0:
+            raise ValueError("temporal_fast_residual_scale must be non-negative")
+        if self.temporal_fast_slow_enabled and not self.temporal_chunk_enabled:
+            raise ValueError(
+                "temporal_fast_slow_enabled requires temporal_chunk_size > 1"
+            )
         if kwargs:
             print(
                 f"MMGPT {self.name}.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
@@ -885,10 +896,51 @@ class MMGPT(nn.Module):
                 nn.Linear(2 * dim_model, dim_model),
             )
             self.temporal_output_norm = nn.LayerNorm(dim_model)
+            if self.temporal_fast_slow_enabled:
+                # The slow path proposes one nominal action for every physical
+                # frame in the chunk.  A plan is sampled only at phase zero and
+                # is held fixed until the next chunk boundary.
+                self.temporal_plan_head = nn.Sequential(
+                    nn.LayerNorm(dim_model),
+                    nn.Linear(dim_model, 2 * dim_model),
+                    nn.SiLU(),
+                    nn.Linear(
+                        2 * dim_model,
+                        self.temporal_chunk_size * dim_out,
+                    ),
+                )
+                nn.init.uniform_(
+                    self.temporal_plan_head[-1].weight, -0.003, 0.003
+                )
+                nn.init.constant_(self.temporal_plan_head[-1].bias, 0.0)
+
+                # The 50 Hz correction path has an explicit current-observation
+                # bypass.  It does not need to wait for the K-frame chunk token
+                # and therefore preserves feedback inside a slow plan.
+                fast_input_dim = dim_model + dim_out + self.temporal_chunk_size
+                if ref_obs_size > 0:
+                    fast_input_dim += dim_model + 1
+                self.temporal_fast_controller = nn.Sequential(
+                    nn.Linear(fast_input_dim, 2 * dim_model),
+                    nn.SiLU(),
+                    nn.Linear(2 * dim_model, dim_model),
+                    nn.SiLU(),
+                    nn.Linear(dim_model, dim_out),
+                )
+                # Start from the coherent nominal plan.  PPO/BC must learn how
+                # much high-frequency correction is useful rather than being
+                # forced through a random residual at initialization.
+                nn.init.zeros_(self.temporal_fast_controller[-1].weight)
+                nn.init.zeros_(self.temporal_fast_controller[-1].bias)
+            else:
+                self.temporal_plan_head = None
+                self.temporal_fast_controller = None
         else:
             self.temporal_chunk_encoder = None
             self.temporal_context_fusion = None
             self.temporal_output_norm = None
+            self.temporal_plan_head = None
+            self.temporal_fast_controller = None
         
         self.pos_emb = nn.Embedding(self.compressed_len, dim_model) if not self.apply_rope else None # *2 for obs and ref_obs
         self.modality_emb = nn.Embedding(2, dim_model) # 0 for obs, 1 for ref_obs
@@ -930,6 +982,8 @@ class MMGPT(nn.Module):
         self.inference_chunk_phase = None
         self.inference_slow_hidden = None
         self.inference_slow_valid = None
+        self.inference_chunk_plan = None
+        self.inference_chunk_plan_valid = None
         self.last_inference_temporal_phase = None
         
         self.aux_loss = 0.0
@@ -1123,6 +1177,16 @@ class MMGPT(nn.Module):
             self.inference_slow_valid = torch.zeros(
                 num_envs, dtype=torch.bool, device=device
             )
+            if self.temporal_fast_slow_enabled:
+                self.inference_chunk_plan = torch.zeros(
+                    num_envs,
+                    self.temporal_chunk_size,
+                    self.dim_out,
+                    device=device,
+                )
+                self.inference_chunk_plan_valid = torch.zeros(
+                    num_envs, dtype=torch.bool, device=device
+                )
             self.last_inference_temporal_phase = torch.zeros(
                 num_envs, dtype=torch.long, device=device
             )
@@ -1150,6 +1214,10 @@ class MMGPT(nn.Module):
                 self.inference_chunk_phase.zero_()
                 self.inference_slow_hidden.zero_()
                 self.inference_slow_valid.zero_()
+                if self.inference_chunk_plan is not None:
+                    self.inference_chunk_plan.zero_()
+                if self.inference_chunk_plan_valid is not None:
+                    self.inference_chunk_plan_valid.zero_()
                 self.last_inference_temporal_phase.zero_()
         else:
             # dones are at the environment level
@@ -1177,6 +1245,10 @@ class MMGPT(nn.Module):
                 self.inference_chunk_phase[mask] = 0
                 self.inference_slow_hidden[mask] = 0.0
                 self.inference_slow_valid[mask] = False
+                if self.inference_chunk_plan is not None:
+                    self.inference_chunk_plan[mask] = 0.0
+                if self.inference_chunk_plan_valid is not None:
+                    self.inference_chunk_plan_valid[mask] = False
                 self.last_inference_temporal_phase[mask] = 0
 
     def invalidate_inference_cache(self):
@@ -1270,7 +1342,13 @@ class MMGPT(nn.Module):
         obs_mask: torch.Tensor,
         ref_obs: Optional[Tuple[torch.Tensor, torch.Tensor]],
         cache_write_allowed: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        torch.Tensor,
+    ]:
         """Advance the partial chunk and append only newly completed tokens."""
 
         required_state = (
@@ -1364,9 +1442,15 @@ class MMGPT(nn.Module):
             phase,
         )
         self.inference_position_ids = self.inference_position_ids + obs_mask.long()
-        return hidden
+        return hidden, obs_embedding, ref_embedding, ref_mask, phase
 
-    def _rebuild_chunked_streaming_cache(self) -> torch.Tensor:
+    def _rebuild_chunked_streaming_cache(self) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        torch.Tensor,
+    ]:
         """Rebuild completed-token KV and the current partial chunk from raw frames."""
 
         masks = self.generate_mask()
@@ -1381,12 +1465,16 @@ class MMGPT(nn.Module):
         self.inference_chunk_slot_mask.zero_()
         self.inference_slow_hidden.zero_()
         self.inference_slow_valid.zero_()
+        if self.inference_chunk_plan is not None:
+            self.inference_chunk_plan.zero_()
+        if self.inference_chunk_plan_valid is not None:
+            self.inference_chunk_plan_valid.zero_()
         self.inference_position_ids = start_position.clone()
         self.inference_chunk_phase = torch.remainder(
             start_position, self.temporal_chunk_size
         )
         cache_eligible = self.inference_chunk_phase == 0
-        hidden = None
+        step_features = None
         for step in range(self.inference_buffer_obs.shape[0]):
             step_mask = masks[step]
             completes_visible_chunk = (
@@ -1399,17 +1487,22 @@ class MMGPT(nn.Module):
                     self.inference_buffer_ref_obs[step],
                     self.inference_buffer_ref_obs_mask[step],
                 )
-            hidden = self._streaming_chunk_step(
+            step_features = self._streaming_chunk_step(
                 self.inference_buffer_obs[step],
                 step_mask,
                 ref_step,
                 cache_write_allowed=cache_eligible,
             )
+            if self.temporal_fast_slow_enabled:
+                hidden, _, _, _, temporal_phase = step_features
+                self._update_inference_chunk_plan(
+                    hidden, temporal_phase, step_mask
+                )
             cache_eligible = cache_eligible | completes_visible_chunk
         self.inference_kv_cache_dirty = False
-        if hidden is None:
+        if step_features is None:
             raise RuntimeError("cannot rebuild an empty chunked context")
-        return hidden
+        return step_features
 
     def _streaming_token_step(
         self,
@@ -1712,6 +1805,209 @@ class MMGPT(nn.Module):
         )
         return fused * masks.unsqueeze(-1).to(fused.dtype)
 
+    def _temporal_plan_candidates(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Decode one K-action proposal from every candidate plan state."""
+
+        if self.temporal_plan_head is None:
+            raise RuntimeError("fast/slow temporal plan head is not initialized")
+        flat_plan = self.temporal_plan_head(hidden)
+        return flat_plan.unflatten(
+            -1, (self.temporal_chunk_size, self.dim_out)
+        )
+
+    def _persistent_chunk_plan_sequence(
+        self,
+        hidden: torch.Tensor,
+        masks: torch.Tensor,
+        episode_ids: torch.Tensor,
+        temporal_phases: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Hold the phase-zero plan fixed for every visible chunk.
+
+        Streaming PPO includes a reset-safe history prefix.  Therefore every
+        optimized step has its true phase-zero source in this sequence.  Direct
+        diagnostic calls may begin in the middle of a chunk; those unrecoverable
+        prefix frames use their local candidate and are marked invalid so they
+        cannot be mistaken for a calibrated chunk plan.
+        """
+
+        T, B, _ = hidden.shape
+        if tuple(masks.shape) != (T, B):
+            raise ValueError("plan masks must match the hidden sequence")
+        if tuple(episode_ids.shape) != (T, B):
+            raise ValueError("plan episode_ids must match the hidden sequence")
+        if tuple(temporal_phases.shape) != (T, B):
+            raise ValueError("plan phases must match the hidden sequence")
+        if ((temporal_phases < 0) | (
+            temporal_phases >= self.temporal_chunk_size
+        )).any():
+            raise ValueError("temporal phases must lie inside the chunk")
+
+        time_index = torch.arange(T, device=hidden.device).view(T, 1)
+        source_index = time_index - temporal_phases.long()
+        in_bounds = source_index >= 0
+        source_index = source_index.clamp(0, max(T - 1, 0))
+        source_bt = source_index.T
+
+        source_mask = torch.gather(masks.T, 1, source_bt).T.bool()
+        source_episode = torch.gather(episode_ids.T, 1, source_bt).T
+        source_phase = torch.gather(temporal_phases.T, 1, source_bt).T
+        valid_source = (
+            in_bounds
+            & masks.bool()
+            & source_mask
+            & (source_episode == episode_ids)
+            & (source_phase == 0)
+        )
+
+        # Decode plans only where a new chunk starts.  A local fallback is
+        # required solely for diagnostic prefixes whose true phase-zero frame
+        # lies outside the supplied sequence.  This keeps the slow plan head
+        # off the 50-Hz path during normal rollout/PPO recomputation.
+        needs_candidate = masks.bool() & (
+            (temporal_phases == 0) | ~valid_source
+        )
+        candidates = hidden.new_zeros(
+            T,
+            B,
+            self.temporal_chunk_size,
+            self.dim_out,
+        )
+        if needs_candidate.any():
+            candidates[needs_candidate] = self._temporal_plan_candidates(
+                hidden[needs_candidate]
+            )
+        candidates_bt = candidates.permute(1, 0, 2, 3)
+        gathered_plan = torch.gather(
+            candidates_bt,
+            1,
+            source_bt.unsqueeze(-1).unsqueeze(-1).expand(
+                B,
+                T,
+                self.temporal_chunk_size,
+                self.dim_out,
+            ),
+        ).permute(1, 0, 2, 3)
+        plans = torch.where(
+            valid_source.unsqueeze(-1).unsqueeze(-1),
+            gathered_plan,
+            candidates,
+        )
+        plans = plans * masks.unsqueeze(-1).unsqueeze(-1).to(plans.dtype)
+        return plans, valid_source
+
+    def _compose_temporal_fast_action(
+        self,
+        obs_embedding: torch.Tensor,
+        nominal_action: torch.Tensor,
+        temporal_phases: torch.Tensor,
+        ref_embedding: Optional[torch.Tensor] = None,
+        ref_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply 50-Hz feedback around one slot of a persistent slow plan."""
+
+        if self.temporal_fast_controller is None:
+            raise RuntimeError("fast temporal controller is not initialized")
+        if obs_embedding.shape[:-1] != nominal_action.shape[:-1]:
+            raise ValueError("fast observation and nominal action axes must match")
+        if temporal_phases.shape != nominal_action.shape[:-1]:
+            raise ValueError("fast temporal phases must match action batch axes")
+
+        features = [obs_embedding]
+        if self.ref_obs_dim > 0:
+            if ref_embedding is None or ref_mask is None:
+                ref_embedding = torch.zeros_like(obs_embedding)
+                ref_mask = torch.zeros_like(temporal_phases, dtype=torch.bool)
+            ref_mask = ref_mask.bool()
+            features.extend(
+                (
+                    ref_embedding
+                    * ref_mask.unsqueeze(-1).to(ref_embedding.dtype),
+                    ref_mask.unsqueeze(-1).to(obs_embedding.dtype),
+                )
+            )
+        phase_one_hot = F.one_hot(
+            temporal_phases.long(), num_classes=self.temporal_chunk_size
+        ).to(obs_embedding.dtype)
+        features.extend((nominal_action, phase_one_hot))
+        correction = torch.tanh(
+            self.temporal_fast_controller(torch.cat(features, dim=-1))
+        )
+        action = (
+            nominal_action
+            + self.temporal_fast_residual_scale * correction
+        )
+        return action, correction
+
+    def _decode_temporal_sequence_actions(
+        self,
+        hidden: torch.Tensor,
+        obs_embedding: torch.Tensor,
+        masks: torch.Tensor,
+        episode_ids: torch.Tensor,
+        temporal_phases: torch.Tensor,
+        ref_embedding: Optional[torch.Tensor] = None,
+        ref_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        plans, _ = self._persistent_chunk_plan_sequence(
+            hidden, masks, episode_ids, temporal_phases
+        )
+        nominal_action = torch.gather(
+            plans,
+            2,
+            temporal_phases.long().unsqueeze(-1).unsqueeze(-1).expand(
+                *temporal_phases.shape, 1, self.dim_out
+            ),
+        ).squeeze(2)
+        actions, _ = self._compose_temporal_fast_action(
+            obs_embedding,
+            nominal_action,
+            temporal_phases,
+            ref_embedding,
+            ref_mask,
+        )
+        return actions * masks.unsqueeze(-1).to(actions.dtype)
+
+    def _update_inference_chunk_plan(
+        self,
+        hidden: torch.Tensor,
+        temporal_phase: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> None:
+        if self.inference_chunk_plan is None or self.inference_chunk_plan_valid is None:
+            raise RuntimeError("inference chunk plan state is not initialized")
+        starts_plan = valid_mask.bool() & (
+            (temporal_phase == 0) | ~self.inference_chunk_plan_valid
+        )
+        if starts_plan.any():
+            self.inference_chunk_plan[starts_plan] = (
+                self._temporal_plan_candidates(hidden[starts_plan])
+            )
+            self.inference_chunk_plan_valid[starts_plan] = True
+
+    def _decode_temporal_inference_action(
+        self,
+        hidden: torch.Tensor,
+        obs_embedding: torch.Tensor,
+        temporal_phase: torch.Tensor,
+        valid_mask: torch.Tensor,
+        ref_embedding: Optional[torch.Tensor] = None,
+        ref_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        self._update_inference_chunk_plan(hidden, temporal_phase, valid_mask)
+        env_index = torch.arange(hidden.shape[0], device=hidden.device)
+        nominal_action = self.inference_chunk_plan[
+            env_index, temporal_phase.long()
+        ]
+        actions, _ = self._compose_temporal_fast_action(
+            obs_embedding,
+            nominal_action,
+            temporal_phase,
+            ref_embedding,
+            ref_mask,
+        )
+        return actions * valid_mask.unsqueeze(-1).to(actions.dtype)
+
     def _chunked_streaming_sequence_hidden(
         self,
         obs: torch.Tensor,
@@ -1958,15 +2254,25 @@ class MMGPT(nn.Module):
         else:
             mlp_output = None 
         has_ref = ref_obs is not None and self.ref_obs_dim > 0
+        resolved_episode_ids = episode_ids
+        resolved_temporal_phases = temporal_phases
         if self.streaming_kv_cache:
             if self.temporal_chunk_enabled:
+                if resolved_episode_ids is None:
+                    resolved_episode_ids = torch.zeros_like(
+                        masks, dtype=torch.long
+                    )
+                if resolved_temporal_phases is None:
+                    resolved_temporal_phases = self._infer_temporal_phases(
+                        masks, resolved_episode_ids
+                    )
                 obs_out_seq, res_obs_emb, res_ref_obs_emb = (
                     self._chunked_streaming_sequence_hidden(
                         obs,
                         ref_obs,
                         masks,
-                        episode_ids=episode_ids,
-                        temporal_phases=temporal_phases,
+                        episode_ids=resolved_episode_ids,
+                        temporal_phases=resolved_temporal_phases,
                     )
                 )
             else:
@@ -2131,7 +2437,18 @@ class MMGPT(nn.Module):
         # PPO must reach both the action decoder and the shared MMGPT
         # backbone.  Auxiliary gradient routing is controlled independently
         # above and must never detach the policy path.
-        pred_actions = self.fc(upsampled_out) # [T_in, B, dim_out]
+        if self.temporal_fast_slow_enabled:
+            pred_actions = self._decode_temporal_sequence_actions(
+                upsampled_out,
+                res_obs_emb,
+                masks,
+                resolved_episode_ids,
+                resolved_temporal_phases,
+                res_ref_obs_emb,
+                ref_obs_mask if has_ref else None,
+            )
+        else:
+            pred_actions = self.fc(upsampled_out) # [T_in, B, dim_out]
         
         if compute_dreamer_reward:
             # dreamer reward computation
@@ -2303,7 +2620,7 @@ class MMGPT(nn.Module):
         if self.streaming_kv_cache:
             if self.temporal_chunk_enabled:
                 if self.inference_kv_cache_dirty:
-                    hidden = self._rebuild_chunked_streaming_cache()
+                    chunk_step = self._rebuild_chunked_streaming_cache()
                 else:
                     ref_step = None
                     if self.ref_obs_dim > 0:
@@ -2311,10 +2628,27 @@ class MMGPT(nn.Module):
                             self.inference_buffer_ref_obs[-1],
                             self.inference_buffer_ref_obs_mask[-1],
                         )
-                    hidden = self._streaming_chunk_step(
+                    chunk_step = self._streaming_chunk_step(
                         obs,
                         torch.ones(B, dtype=torch.bool, device=device),
                         ref_step,
+                    )
+                (
+                    hidden,
+                    obs_embedding,
+                    ref_embedding,
+                    ref_mask,
+                    temporal_phase,
+                ) = chunk_step
+                if self.temporal_fast_slow_enabled:
+                    self.last_hidden_state = hidden
+                    return self._decode_temporal_inference_action(
+                        hidden,
+                        obs_embedding,
+                        temporal_phase,
+                        torch.ones(B, dtype=torch.bool, device=device),
+                        ref_embedding,
+                        ref_mask,
                     )
             else:
                 if self.inference_kv_cache_dirty:
@@ -2393,6 +2727,99 @@ class MMGPT(nn.Module):
             return self._forward_inference(obs, ref_obs)
         
         
+class PrivilegedChunkQ(nn.Module):
+    """Calibration-only value head for a complete nominal action plan.
+
+    This module is intentionally separate from the PPO state-value critic.  It
+    may consume privileged state during training, but no output or input from
+    this head is routed into the actor unless a later algorithm phase adds an
+    explicit, frozen-Q actor objective.
+    """
+
+    def __init__(
+        self,
+        critic_obs_dim: int,
+        critic_ref_obs_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        hidden_dims: Optional[List[int]] = None,
+        reference_first: bool = True,
+    ):
+        super().__init__()
+        if chunk_size < 2:
+            raise ValueError("chunk Q requires a temporally extended action")
+        self.critic_obs_dim = int(critic_obs_dim)
+        self.critic_ref_obs_dim = int(critic_ref_obs_dim)
+        self.action_dim = int(action_dim)
+        self.chunk_size = int(chunk_size)
+        self.reference_first = bool(reference_first)
+
+        input_dim = (
+            self.critic_obs_dim
+            + self.critic_ref_obs_dim
+            + self.chunk_size * self.action_dim
+        )
+        hidden_dims = list(hidden_dims or [512, 256, 128])
+        layers = []
+        previous_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.extend((nn.Linear(previous_dim, hidden_dim), nn.SiLU()))
+            previous_dim = hidden_dim
+        layers.append(nn.Linear(previous_dim, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        critic_observations: torch.Tensor,
+        action_chunk: torch.Tensor,
+        ref_critic_observations: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
+    ) -> torch.Tensor:
+        if critic_observations.shape[-1] != self.critic_obs_dim:
+            raise ValueError(
+                "chunk-Q critic observation dimension mismatch, got "
+                f"{critic_observations.shape[-1]} and {self.critic_obs_dim}"
+            )
+        expected_action_shape = (self.chunk_size, self.action_dim)
+        if action_chunk.shape[-2:] != expected_action_shape:
+            raise ValueError(
+                "chunk-Q action must end in "
+                f"{expected_action_shape}, got {tuple(action_chunk.shape)}"
+            )
+        if action_chunk.shape[:-2] != critic_observations.shape[:-1]:
+            raise ValueError("chunk-Q state and action batch axes must match")
+
+        components = []
+        reference = None
+        if self.critic_ref_obs_dim > 0:
+            if ref_critic_observations is None:
+                reference = critic_observations.new_zeros(
+                    *critic_observations.shape[:-1],
+                    self.critic_ref_obs_dim,
+                )
+            else:
+                reference, reference_mask = ref_critic_observations
+                if reference.shape[:-1] != critic_observations.shape[:-1]:
+                    raise ValueError(
+                        "chunk-Q reference and state batch axes must match"
+                    )
+                if reference.shape[-1] != self.critic_ref_obs_dim:
+                    raise ValueError("chunk-Q reference dimension mismatch")
+                if reference_mask.shape != critic_observations.shape[:-1]:
+                    raise ValueError("chunk-Q reference mask axes must match")
+                reference = reference * reference_mask.unsqueeze(-1).to(
+                    reference.dtype
+                )
+        if self.reference_first and reference is not None:
+            components.append(reference)
+        components.append(critic_observations)
+        if not self.reference_first and reference is not None:
+            components.append(reference)
+        components.append(action_chunk.flatten(start_dim=-2))
+        return self.network(torch.cat(components, dim=-1))
+
+
 # MMGPT related Critic Network
 # Since MMGPT is so hard to train, we provide a simple MLP critic, in order to stabilize the advantage estimation.
 class MMGPTCritic(nn.Module):
@@ -2990,6 +3417,8 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                  use_layer_norm: bool = False,
                  fusion_mode: str = "gated",
                  critic_fusion_mode: Optional[str] = None,
+                 chunk_q_enabled: bool = False,
+                 chunk_q_hidden_dims: Optional[List[int]] = None,
                  actor_hidden_dims: Optional[List[int]] = None,
                  joint_decoder_hidden_dims: Optional[List[int]] = None,
                  **kwargs
@@ -3136,6 +3565,27 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                 if num_critic_ref_obs > 0
                 else None
             )
+
+        self.chunk_q_enabled = bool(chunk_q_enabled)
+        if self.chunk_q_enabled:
+            chunk_size = int(kwargs.get("temporal_chunk_size", 1))
+            if chunk_size < 2:
+                raise ValueError(
+                    "chunk_q_enabled requires temporal_chunk_size > 1"
+                )
+            self.chunk_q = PrivilegedChunkQ(
+                critic_obs_dim=num_critic_obs,
+                critic_ref_obs_dim=num_critic_ref_obs,
+                action_dim=num_actions,
+                chunk_size=chunk_size,
+                hidden_dims=chunk_q_hidden_dims,
+                reference_first=(
+                    resolved_critic_fusion_mode
+                    == "direct_concat_ref_first"
+                ),
+            )
+        else:
+            self.chunk_q = None
         
         if load_actor_path:
             self.load_actor_weights(load_actor_path)
@@ -3144,6 +3594,7 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
             
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Model: {self.critic}")
+        print(f"Chunk-Q Model: {self.chunk_q}")
         print(f"Dagger Model: {self.actor_dagger}")
         
         # disable args validation for speedup
@@ -3274,6 +3725,22 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
                 ref_critic_observations = self.critic_ref_obs_lambda(ref_critic_observations)
         value = self.critic(critic_observations, ref_critic_observations, masks=masks, memory=memory, **kwargs)
         return value
+
+    def evaluate_chunk_q(
+        self,
+        critic_observations: torch.Tensor,
+        action_chunk: torch.Tensor,
+        ref_critic_observations: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
+    ) -> torch.Tensor:
+        if self.chunk_q is None:
+            raise RuntimeError("chunk-Q calibration head is disabled")
+        return self.chunk_q(
+            critic_observations,
+            action_chunk,
+            ref_critic_observations,
+        )
         
     def reset(self, dones=None):
         self.actor.reset(dones)

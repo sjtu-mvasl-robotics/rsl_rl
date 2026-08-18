@@ -1,5 +1,6 @@
 import copy
 
+import pytest
 import torch
 
 from rsl_rl.modules.actor_critic_mm_gpt import MMGPT
@@ -331,9 +332,11 @@ def _make_streaming_rope_mmgpt(history_length, num_layers=2):
     ).eval()
 
 
-def _make_chunked_streaming_mmgpt(history_length=10, num_layers=2):
+def _make_chunked_streaming_mmgpt(
+    history_length=10, num_layers=2, **overrides
+):
     torch.manual_seed(17)
-    return MMGPT(
+    kwargs = dict(
         obs_size=sum(_TERM_DIMS.values()),
         ref_obs_size=2,
         dim_out=2,
@@ -354,7 +357,9 @@ def _make_chunked_streaming_mmgpt(history_length=10, num_layers=2):
         streaming_sequence_training=True,
         streaming_context_steps=history_length,
         temporal_chunk_size=5,
-    ).eval()
+    )
+    kwargs.update(overrides)
+    return MMGPT(**kwargs).eval()
 
 
 def _episode_ids_from_dones(dones):
@@ -443,6 +448,148 @@ def test_chunk5_streaming_matches_batch_across_async_resets():
     )
 
 
+def test_fast_slow_plan_is_persistent_while_current_frame_closes_the_loop():
+    online_a = _make_chunked_streaming_mmgpt(
+        temporal_fast_slow_enabled=True,
+    )
+    torch.manual_seed(105)
+    with torch.no_grad():
+        torch.nn.init.normal_(
+            online_a.temporal_fast_controller[-1].weight, std=0.1
+        )
+    online_b = copy.deepcopy(online_a)
+    plan_batch_sizes = []
+    plan_hook = online_a.temporal_plan_head.register_forward_hook(
+        lambda _module, args, _output: plan_batch_sizes.append(args[0].shape[0])
+    )
+
+    first_obs = torch.randn(1, sum(_TERM_DIMS.values()))
+    first_ref = torch.randn(1, 2)
+    valid_ref = torch.ones(1, dtype=torch.bool)
+    with torch.no_grad():
+        first_a = online_a(first_obs, (first_ref, valid_ref))
+        first_b = online_b(first_obs, (first_ref, valid_ref))
+        plan_at_start = online_a.inference_chunk_plan.clone()
+        torch.testing.assert_close(first_a, first_b)
+        torch.testing.assert_close(
+            plan_at_start, online_b.inference_chunk_plan
+        )
+
+        second_obs = torch.randn_like(first_obs)
+        second_ref = torch.randn_like(first_ref)
+        second_a = online_a(second_obs, (second_ref, valid_ref))
+        second_b = online_b(
+            second_obs + 10.0, (second_ref - 10.0, valid_ref)
+        )
+    plan_hook.remove()
+
+    # The slow proposal is committed only at phase zero.  Later observations
+    # change the feedback correction, not the nominal plan.
+    torch.testing.assert_close(online_a.inference_chunk_plan, plan_at_start)
+    torch.testing.assert_close(online_b.inference_chunk_plan, plan_at_start)
+    assert plan_batch_sizes == [1]
+    assert not torch.allclose(second_a, second_b)
+
+
+def test_fast_slow_streaming_matches_differentiable_batch_across_resets():
+    time_steps = 17
+    num_envs = 3
+    online_model = _make_chunked_streaming_mmgpt(
+        temporal_fast_slow_enabled=True,
+    )
+    batch_model = copy.deepcopy(online_model)
+    torch.manual_seed(106)
+    observations = torch.randn(
+        time_steps, num_envs, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(time_steps, num_envs, 2)
+    ref_masks = torch.ones(time_steps, num_envs, dtype=torch.bool)
+    masks = torch.ones_like(ref_masks)
+    dones = torch.zeros_like(ref_masks)
+    dones[2, 0] = True
+    dones[6, 1] = True
+    dones[10, 2] = True
+    dones[12, 0] = True
+    episode_ids = _episode_ids_from_dones(dones)
+
+    online_outputs = []
+    temporal_phases = []
+    with torch.no_grad():
+        for step in range(time_steps):
+            online_outputs.append(
+                online_model(
+                    observations[step],
+                    (references[step], ref_masks[step]),
+                )
+            )
+            temporal_phases.append(
+                online_model.last_inference_temporal_phase.clone()
+            )
+            online_model.reset(dones[step])
+
+        phases = torch.stack(temporal_phases)
+        hidden, obs_embedding, ref_embedding = (
+            batch_model._chunked_streaming_sequence_hidden(
+                observations,
+                (references, ref_masks),
+                masks,
+                episode_ids=episode_ids,
+                temporal_phases=phases,
+            )
+        )
+        batch_outputs = batch_model._decode_temporal_sequence_actions(
+            hidden,
+            obs_embedding,
+            masks,
+            episode_ids,
+            phases,
+            ref_embedding,
+            ref_masks,
+        )
+
+    torch.testing.assert_close(
+        torch.stack(online_outputs),
+        batch_outputs,
+        atol=3.0e-7,
+        rtol=3.0e-6,
+    )
+
+
+def test_fast_slow_policy_gradient_reaches_slow_plan_and_fast_controller():
+    model = _make_chunked_streaming_mmgpt(
+        history_length=10,
+        num_layers=1,
+        temporal_fast_slow_enabled=True,
+    ).train()
+    torch.manual_seed(108)
+    observations = torch.randn(10, 2, sum(_TERM_DIMS.values()))
+    references = torch.randn(10, 2, 2)
+    masks = torch.ones(10, 2, dtype=torch.bool)
+    phases = torch.arange(10).remainder(5).view(-1, 1).expand(-1, 2)
+    plan_batch_sizes = []
+    plan_hook = model.temporal_plan_head.register_forward_hook(
+        lambda _module, args, _output: plan_batch_sizes.append(args[0].shape[0])
+    )
+
+    output = model(
+        observations,
+        (references, masks),
+        masks,
+        episode_ids=torch.zeros_like(phases),
+        temporal_phases=phases,
+    )
+    plan_hook.remove()
+    output.square().mean().backward()
+
+    assert plan_batch_sizes == [4]
+    assert model.temporal_plan_head[-1].weight.grad.norm() > 0.0
+    assert model.temporal_fast_controller[-1].weight.grad.norm() > 0.0
+    assert (
+        model.decoder.encoder.layers[0].self_attn.qkv_proj.weight.grad.norm()
+        > 0.0
+    )
+
+
 def test_chunk5_partial_tokens_are_causal_and_use_seen_frames_in_chunk():
     model = _make_chunked_streaming_mmgpt()
     torch.manual_seed(107)
@@ -485,8 +632,13 @@ def test_chunk5_partial_tokens_are_causal_and_use_seen_frames_in_chunk():
     assert not torch.allclose(baseline[2], seen_changed[2])
 
 
-def test_chunk5_cache_rebuild_discards_only_the_unrecoverable_prefix_chunk():
-    model = _make_chunked_streaming_mmgpt()
+@pytest.mark.parametrize("fast_slow_enabled", [False, True])
+def test_chunk5_cache_rebuild_discards_only_the_unrecoverable_prefix_chunk(
+    fast_slow_enabled,
+):
+    model = _make_chunked_streaming_mmgpt(
+        temporal_fast_slow_enabled=fast_slow_enabled,
+    )
     torch.manual_seed(109)
     num_envs = 2
     observations = torch.randn(25, num_envs, sum(_TERM_DIMS.values()))
@@ -519,17 +671,30 @@ def test_chunk5_cache_rebuild_discards_only_the_unrecoverable_prefix_chunk():
         replay_phases = torch.arange(
             start_position, end_position
         ).remainder(5).view(-1, 1).expand(-1, num_envs)
-        replay_hidden, _, _ = replay_model._chunked_streaming_sequence_hidden(
-            model.inference_buffer_obs,
-            (
-                model.inference_buffer_ref_obs,
-                model.inference_buffer_ref_obs_mask,
-            ),
-            replay_masks,
-            episode_ids=torch.zeros_like(replay_masks, dtype=torch.long),
-            temporal_phases=replay_phases,
+        replay_hidden, replay_obs_embedding, replay_ref_embedding = (
+            replay_model._chunked_streaming_sequence_hidden(
+                model.inference_buffer_obs,
+                (
+                    model.inference_buffer_ref_obs,
+                    model.inference_buffer_ref_obs_mask,
+                ),
+                replay_masks,
+                episode_ids=torch.zeros_like(replay_masks, dtype=torch.long),
+                temporal_phases=replay_phases,
+            )
         )
-        replay_output = replay_model.fc(replay_hidden[-1])
+        if fast_slow_enabled:
+            replay_output = replay_model._decode_temporal_sequence_actions(
+                replay_hidden,
+                replay_obs_embedding,
+                replay_masks,
+                torch.zeros_like(replay_masks, dtype=torch.long),
+                replay_phases,
+                replay_ref_embedding,
+                model.inference_buffer_ref_obs_mask,
+            )[-1]
+        else:
+            replay_output = replay_model.fc(replay_hidden[-1])
 
     assert not model.inference_kv_cache_dirty
     torch.testing.assert_close(
@@ -537,9 +702,14 @@ def test_chunk5_cache_rebuild_discards_only_the_unrecoverable_prefix_chunk():
     )
 
 
-def test_chunk5_rollout_update_recomputes_means_across_rollout_boundary():
+@pytest.mark.parametrize("fast_slow_enabled", [False, True])
+def test_chunk5_rollout_update_recomputes_means_across_rollout_boundary(
+    fast_slow_enabled,
+):
     torch.manual_seed(113)
-    model = _make_chunked_streaming_mmgpt()
+    model = _make_chunked_streaming_mmgpt(
+        temporal_fast_slow_enabled=fast_slow_enabled,
+    )
     num_envs = 2
     rollout_steps = 6
     obs_dim = sum(_TERM_DIMS.values())
