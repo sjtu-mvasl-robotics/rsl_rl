@@ -37,6 +37,8 @@ class RolloutStorageMM:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
+            self.actor_recurrent_state = None
+            self.actor_recurrent_state_reset_mask = None
             self.actor_temporal_phase = None
             self.rnd_state = None
 
@@ -62,6 +64,7 @@ class RolloutStorageMM:
         raw_obs_shape=None,
         dreamer_target_shape=None,
         store_actor_temporal_phases=False,
+        store_actor_recurrent_state=False,
     ):
         self.training_type = training_type
         self.device = device
@@ -78,6 +81,7 @@ class RolloutStorageMM:
         self.raw_obs_shape = raw_obs_shape
         self.dreamer_target_shape = dreamer_target_shape
         self.store_actor_temporal_phases = bool(store_actor_temporal_phases)
+        self.store_actor_recurrent_state = bool(store_actor_recurrent_state)
         if self.actor_history_length < 1:
             raise ValueError("actor_history_length must be at least 1")
         if self.critic_history_length < 1:
@@ -190,12 +194,55 @@ class RolloutStorageMM:
         # rnn
         self.saved_hidden_states_a = None
         self.saved_hidden_states_c = None
+        # Streaming MMGPT batches contain complete per-environment rollouts,
+        # so only the pre-action state at rollout step zero is required.  Do
+        # not replicate a large TTT fast-weight tensor over every transition.
+        self.actor_initial_recurrent_state = None
+        self.actor_initial_recurrent_state_reset_mask = None
 
         self.step = 0
 
     def add_transitions(self, transition: Transition):
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
+        if self.store_actor_recurrent_state and self.step == 0:
+            if transition.actor_recurrent_state is None:
+                raise ValueError(
+                    "actor recurrent state is required at rollout step zero"
+                )
+            if transition.actor_recurrent_state_reset_mask is None:
+                raise ValueError(
+                    "actor recurrent reset mask is required at rollout step zero"
+                )
+            recurrent_state = transition.actor_recurrent_state.detach()
+            reset_mask = transition.actor_recurrent_state_reset_mask.detach().bool()
+            expected_batch = self.num_envs
+            if recurrent_state.ndim < 2 or recurrent_state.shape[0] != expected_batch:
+                raise ValueError(
+                    "actor recurrent state must use the environment batch as "
+                    f"its leading dimension ({expected_batch}), got "
+                    f"{tuple(recurrent_state.shape)}"
+                )
+            if tuple(reset_mask.shape) != (expected_batch,):
+                raise ValueError(
+                    "actor recurrent reset mask must have shape "
+                    f"{(expected_batch,)}, got {tuple(reset_mask.shape)}"
+                )
+            if self.actor_initial_recurrent_state is None:
+                self.actor_initial_recurrent_state = torch.empty_like(
+                    recurrent_state, device=self.device
+                )
+                self.actor_initial_recurrent_state_reset_mask = torch.empty(
+                    expected_batch, dtype=torch.bool, device=self.device
+                )
+            if self.actor_initial_recurrent_state.shape != recurrent_state.shape:
+                raise ValueError(
+                    "actor recurrent state shape changed across rollouts: "
+                    f"{tuple(self.actor_initial_recurrent_state.shape)} vs "
+                    f"{tuple(recurrent_state.shape)}"
+                )
+            self.actor_initial_recurrent_state.copy_(recurrent_state)
+            self.actor_initial_recurrent_state_reset_mask.copy_(reset_mask)
         self.observations[self.step].copy_(transition.observations)
         if self.actor_temporal_phases is not None:
             if transition.actor_temporal_phase is None:
@@ -1219,6 +1266,17 @@ class RolloutStorageMM:
                     "episode_ids": episode_ids[:, env_idx],
                     "sequence_output_start": prefix_length,
                 }
+                if self.store_actor_recurrent_state:
+                    if self.actor_initial_recurrent_state is None:
+                        raise RuntimeError(
+                            "streaming actor recurrent state was not captured"
+                        )
+                    sequence_metadata["ttt_initial_state"] = (
+                        self.actor_initial_recurrent_state[env_idx]
+                    )
+                    sequence_metadata["ttt_initial_state_reset_mask"] = (
+                        self.actor_initial_recurrent_state_reset_mask[env_idx]
+                    )
                 if temporal_phase_sequence is not None:
                     sequence_metadata["temporal_phases"] = (
                         temporal_phase_sequence[:, env_idx]

@@ -3,7 +3,7 @@ import copy
 import pytest
 import torch
 
-from rsl_rl.modules.actor_critic_mm_gpt import MMGPT
+from rsl_rl.modules.actor_critic_mm_gpt import MMGPT, TTTKVBLinearMemory
 from rsl_rl.networks.rope_transformer import RoPEMultiHeadAttention
 from rsl_rl.storage.rollout_storage_mm import RolloutStorageMM
 
@@ -117,6 +117,7 @@ def _make_storage(
     action_dim=1,
     self_supervision=False,
     store_temporal_phases=False,
+    store_recurrent_state=False,
 ):
     return RolloutStorageMM(
         training_type="rl",
@@ -133,6 +134,7 @@ def _make_storage(
         raw_obs_shape=(obs_dim,) if self_supervision else None,
         dreamer_target_shape=(action_dim,) if self_supervision else None,
         store_actor_temporal_phases=store_temporal_phases,
+        store_actor_recurrent_state=store_recurrent_state,
     )
 
 
@@ -143,6 +145,8 @@ def _add_storage_step(
     dones,
     action_mean=None,
     temporal_phase=None,
+    recurrent_state=None,
+    recurrent_state_reset_mask=None,
 ):
     num_envs = observations.shape[0]
     if action_mean is None:
@@ -175,6 +179,8 @@ def _add_storage_step(
     transition.action_mean = action_mean
     transition.action_sigma = torch.ones(num_envs, action_dim)
     transition.hidden_states = None
+    transition.actor_recurrent_state = recurrent_state
+    transition.actor_recurrent_state_reset_mask = recurrent_state_reset_mask
     if storage.actor_temporal_phases is not None:
         if temporal_phase is None:
             raise ValueError("test transition requires an explicit temporal phase")
@@ -329,6 +335,35 @@ def _make_streaming_rope_mmgpt(history_length, num_layers=2):
         latest_reference_only=False,
         streaming_kv_cache=True,
         streaming_context_steps=history_length,
+    ).eval()
+
+
+def _make_ttt_streaming_mmgpt(history_length=4, num_layers=2):
+    torch.manual_seed(17)
+    return MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=2,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=num_layers,
+        dropout=0.0,
+        num_steps_per_env=history_length,
+        max_seq_len=history_length,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"target_actions": 2},
+        pred_obs_term_names=None,
+        pred_obs_term_weights=None,
+        default_joint_pos=torch.zeros(2),
+        apply_rope=True,
+        latest_reference_only=False,
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=history_length,
+        ttt_memory_enabled=True,
+        ttt_num_heads=2,
+        ttt_inner_lr=0.1,
+        ttt_gate_init=1.0e-3,
     ).eval()
 
 
@@ -1181,3 +1216,162 @@ def test_raw_history_and_adjacent_targets_follow_the_same_sample_indices():
         dreamer_target_batch[0], old_mu_batch + 20_000.0
     )
     assert dreamer_target_batch[1].all()
+
+
+def test_ttt_kvb_state_is_per_environment_and_uses_bounded_headwise_blocks():
+    torch.manual_seed(127)
+    memory = TTTKVBLinearMemory(16, 2, inner_lr=0.1)
+    state = memory.initial_state(
+        3, device=torch.device("cpu"), dtype=torch.float32
+    )
+    hidden = torch.randn(3, 16)
+    baseline, next_state = memory.step(hidden, state)
+
+    qkv = memory.qkv_proj(memory.input_norm(hidden)).reshape(3, 3, 2, 8)
+    query, key, value = qkv.unbind(dim=1)
+    prediction = torch.einsum("bhij,bhj->bhi", state, key)
+    normalized_update = (
+        (prediction - value).unsqueeze(-1) * key.unsqueeze(-2)
+        / key.square().sum(dim=-1, keepdim=True).clamp_min(1.0e-6).unsqueeze(-1)
+    )
+    expected_state = state - memory.inner_lr.view(1, -1, 1, 1) * normalized_update
+    expected_memory = memory.out_proj(
+        torch.einsum("bhij,bhj->bhi", expected_state, query).reshape(3, 16)
+    )
+    expected_baseline = hidden + memory.gate.view(1, -1) * expected_memory
+
+    changed_hidden = hidden.clone()
+    changed_hidden[0] += 50.0
+    changed, changed_state = memory.step(changed_hidden, state)
+
+    assert state.shape == (3, 2, 8, 8)
+    assert memory.gate.shape == (16,)
+    assert 0.0 < float(memory.inner_lr.detach().min()) < 1.0
+    torch.testing.assert_close(next_state, expected_state)
+    torch.testing.assert_close(baseline, expected_baseline)
+    assert not torch.allclose(baseline[0], changed[0])
+    assert not torch.allclose(next_state[0], changed_state[0])
+    torch.testing.assert_close(baseline[1:], changed[1:])
+    torch.testing.assert_close(next_state[1:], changed_state[1:])
+
+
+def test_ttt_streaming_matches_sequence_replay_across_async_resets():
+    time_steps = 11
+    num_envs = 3
+    online_model = _make_ttt_streaming_mmgpt()
+    batch_model = copy.deepcopy(online_model)
+    torch.manual_seed(131)
+    observations = torch.randn(
+        time_steps, num_envs, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(time_steps, num_envs, 2)
+    reference_masks = torch.ones(time_steps, num_envs, dtype=torch.bool)
+    masks = torch.ones_like(reference_masks)
+    dones = torch.zeros_like(reference_masks)
+    dones[2, 0] = True
+    dones[5, 1] = True
+    dones[7, 2] = True
+    episode_ids = _episode_ids_from_dones(dones)
+
+    initial_state = online_model.get_inference_ttt_state(observations[0])
+    online_actions = []
+    with torch.no_grad():
+        for step in range(time_steps):
+            online_actions.append(
+                online_model(
+                    observations[step],
+                    (references[step], reference_masks[step]),
+                )
+            )
+            online_model.reset(dones[step])
+
+        replay_actions = batch_model(
+            observations,
+            (references, reference_masks),
+            masks,
+            memory={
+                "ttt_initial_state": initial_state,
+                "ttt_initial_state_reset_mask": torch.ones(
+                    num_envs, dtype=torch.bool
+                ),
+            },
+            episode_ids=episode_ids,
+            sequence_output_start=0,
+        )
+
+    torch.testing.assert_close(
+        torch.stack(online_actions).flatten(0, 1),
+        replay_actions,
+        atol=3.0e-7,
+        rtol=3.0e-6,
+    )
+
+
+def test_ttt_rollout_start_state_recomputes_means_across_boundary():
+    torch.manual_seed(137)
+    num_envs = 2
+    rollout_steps = 5
+    history_length = 4
+    obs_dim = sum(_TERM_DIMS.values())
+    model = _make_ttt_streaming_mmgpt(history_length)
+    storage = _make_storage(
+        num_envs=num_envs,
+        rollout_steps=rollout_steps,
+        history_length=history_length,
+        obs_dim=obs_dim,
+        ref_dim=2,
+        action_dim=2,
+        store_recurrent_state=True,
+    )
+
+    def collect(done_schedule):
+        for step in range(rollout_steps):
+            observations = torch.randn(num_envs, obs_dim)
+            references = torch.randn(num_envs, 2)
+            reference_masks = torch.ones(num_envs, dtype=torch.bool)
+            if step == 0:
+                recurrent_state, recurrent_reset_mask = (
+                    model.get_inference_ttt_rollout_state(observations)
+                )
+            else:
+                recurrent_state = None
+                recurrent_reset_mask = None
+            with torch.no_grad():
+                action_mean = model(
+                    observations, (references, reference_masks)
+                )
+            dones = done_schedule(step)
+            _add_storage_step(
+                storage,
+                observations,
+                references,
+                dones,
+                action_mean=action_mean,
+                recurrent_state=recurrent_state,
+                recurrent_state_reset_mask=recurrent_reset_mask,
+            )
+            model.reset(dones)
+
+    collect(lambda step: torch.tensor([step == 1, False]))
+    storage.clear()
+    model.invalidate_inference_cache()
+    collect(lambda step: torch.tensor([False, step == 2]))
+
+    batch = next(storage.streaming_sequence_mini_batch_generator(1, 1))
+    obs_batch, ref_batch, old_mu_batch = batch[0], batch[1], batch[9]
+    metadata, masks_batch = batch[12], batch[13]
+    assert metadata["ttt_initial_state"].shape == (2, 2, 8, 8)
+    assert metadata["ttt_initial_state_reset_mask"].shape == (2,)
+    with torch.no_grad():
+        recomputed_mu = model(
+            obs_batch,
+            ref_batch,
+            masks_batch,
+            memory=metadata,
+            episode_ids=metadata["episode_ids"],
+            sequence_output_start=metadata["sequence_output_start"],
+        )
+
+    torch.testing.assert_close(
+        recomputed_mu, old_mu_batch, atol=3.0e-7, rtol=3.0e-6
+    )

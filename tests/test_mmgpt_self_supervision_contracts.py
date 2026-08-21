@@ -90,6 +90,68 @@ def test_policy_action_path_updates_mmgpt_backbone_and_action_head():
     assert _grad_norm(model.fc[-1].weight) > 0.0
 
 
+def test_ppo_action_path_updates_ttt_memory_and_shared_backbone():
+    torch.manual_seed(12)
+    model = MMGPT(
+        obs_size=sum(_TERM_DIMS.values()),
+        ref_obs_size=2,
+        dim_out=2,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        dropout=0.0,
+        num_steps_per_env=4,
+        max_seq_len=4,
+        term_dict=_TERM_DIMS,
+        ref_term_dict={"target_actions": 2},
+        pred_obs_term_names=None,
+        pred_obs_term_weights=None,
+        default_joint_pos=torch.zeros(2),
+        apply_rope=True,
+        latest_reference_only=False,
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=4,
+        ttt_memory_enabled=True,
+        ttt_num_heads=2,
+    )
+    time_steps = 6
+    batch_size = 2
+    observations = torch.randn(
+        time_steps, batch_size, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(time_steps, batch_size, 2)
+    masks = torch.ones(time_steps, batch_size, dtype=torch.bool)
+    initial_state = model.ttt_memory.initial_state(
+        batch_size,
+        device=observations.device,
+        dtype=observations.dtype,
+    ).detach()
+
+    output = model(
+        observations,
+        (references, masks),
+        masks,
+        memory={
+            "ttt_initial_state": initial_state,
+            "ttt_initial_state_reset_mask": torch.ones(
+                batch_size, dtype=torch.bool
+            ),
+        },
+        episode_ids=torch.zeros_like(masks, dtype=torch.long),
+        sequence_output_start=0,
+    )
+    output.square().mean().backward()
+
+    assert _grad_norm(
+        model.decoder.encoder.layers[0].self_attn.qkv_proj.weight
+    ) > 0.0
+    assert _grad_norm(model.ttt_memory.qkv_proj.weight) > 0.0
+    assert _grad_norm(model.ttt_memory.out_proj.weight) > 0.0
+    assert _grad_norm(model.ttt_memory.gate_logit) > 0.0
+    assert _grad_norm(model.fc[-1].weight) > 0.0
+
+
 def test_chunk5_partial_frame_policy_aux_and_dreamer_share_trainable_latent():
     torch.manual_seed(13)
     model = MMGPT(

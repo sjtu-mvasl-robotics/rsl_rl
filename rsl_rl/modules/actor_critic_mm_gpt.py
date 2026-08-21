@@ -532,6 +532,243 @@ class ObservationSeqEmbeddingV3(nn.Module): # Simple MLP concatenation version
         return structural_token_seq.reshape(T, B, self.d_model)
     
 
+class TTTKVBLinearMemory(nn.Module):
+    """Per-environment fast-weight memory with a vectorized KVB update.
+
+    The slow projections and initial fast weights are ordinary model
+    parameters.  ``fast_weights`` are recurrent actor state: one independent
+    block-diagonal linear map per environment.  A normalized analytic form of
+    the gradient update avoids an inner ``autograd.grad`` call for every
+    vectorized environment.  With the normalization omitted, this is the exact
+    gradient of
+    ``0.5 * ||W k - v||^2``; key normalization is retained here as a bounded
+    on-policy stability adaptation.
+    """
+
+    def __init__(
+        self,
+        dim_model: int,
+        num_heads: int,
+        *,
+        inner_lr: float = 0.1,
+        inner_lr_max: float = 1.0,
+        gate_init: float = 1.0e-3,
+        learnable_inner_lr: bool = True,
+    ):
+        super().__init__()
+        if dim_model % num_heads != 0:
+            raise ValueError(
+                "TTT dim_model must be divisible by num_heads, got "
+                f"{dim_model} and {num_heads}"
+            )
+        if not 0.0 < inner_lr < inner_lr_max:
+            raise ValueError(
+                "TTT inner_lr must lie strictly between zero and "
+                f"inner_lr_max, got {inner_lr} and {inner_lr_max}"
+            )
+        if not 0.0 <= gate_init < 1.0:
+            raise ValueError(
+                "TTT gate_init must lie in [0, 1), got "
+                f"{gate_init}"
+            )
+
+        self.dim_model = int(dim_model)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim_model // self.num_heads
+        self.inner_lr_max = float(inner_lr_max)
+
+        self.input_norm = nn.LayerNorm(self.dim_model)
+        self.qkv_proj = nn.Linear(self.dim_model, 3 * self.dim_model, bias=False)
+        self.out_proj = nn.Linear(self.dim_model, self.dim_model, bias=False)
+        self.initial_fast_weights = nn.Parameter(
+            torch.zeros(self.num_heads, self.head_dim, self.head_dim)
+        )
+
+        lr_fraction = float(inner_lr) / self.inner_lr_max
+        lr_logit = math.log(lr_fraction / (1.0 - lr_fraction))
+        self.inner_lr_logit = nn.Parameter(
+            torch.full((self.num_heads,), lr_logit),
+            requires_grad=bool(learnable_inner_lr),
+        )
+        self.gate_logit = nn.Parameter(
+            torch.full(
+                (self.dim_model,),
+                math.atanh(float(gate_init)),
+            )
+        )
+
+    @property
+    def state_shape(self) -> tuple[int, int, int]:
+        return (self.num_heads, self.head_dim, self.head_dim)
+
+    @property
+    def inner_lr(self) -> torch.Tensor:
+        return self.inner_lr_max * torch.sigmoid(self.inner_lr_logit)
+
+    @property
+    def gate(self) -> torch.Tensor:
+        return torch.tanh(self.gate_logit)
+
+    def initial_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return self.initial_fast_weights.to(device=device, dtype=dtype).unsqueeze(0).expand(
+            int(batch_size), -1, -1, -1
+        ).clone()
+
+    def _validate_state(self, state: torch.Tensor, batch_size: int) -> None:
+        expected = (batch_size, *self.state_shape)
+        if tuple(state.shape) != expected:
+            raise ValueError(
+                "TTT fast-weight state must have shape "
+                f"{expected}, got {tuple(state.shape)}"
+            )
+
+    def step(
+        self,
+        hidden: torch.Tensor,
+        fast_weights: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write the current fused token, then query the updated memory."""
+
+        if hidden.ndim != 2 or hidden.shape[-1] != self.dim_model:
+            raise ValueError(
+                "TTT hidden input must have shape (B, dim_model), got "
+                f"{tuple(hidden.shape)}"
+            )
+        batch_size = hidden.shape[0]
+        self._validate_state(fast_weights, batch_size)
+        if valid is None:
+            valid = torch.ones(batch_size, dtype=torch.bool, device=hidden.device)
+        if tuple(valid.shape) != (batch_size,):
+            raise ValueError(
+                f"TTT valid mask must have shape {(batch_size,)}, got "
+                f"{tuple(valid.shape)}"
+            )
+
+        state = fast_weights.to(device=hidden.device, dtype=hidden.dtype)
+        qkv = self.qkv_proj(self.input_norm(hidden)).reshape(
+            batch_size, 3, self.num_heads, self.head_dim
+        )
+        query, key, value = qkv.unbind(dim=1)
+
+        prediction = torch.einsum("bhij,bhj->bhi", state, key)
+        error = prediction - value
+        key_norm_sq = key.square().sum(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        update = error.unsqueeze(-1) * key.unsqueeze(-2)
+        update = update / key_norm_sq.unsqueeze(-1)
+        step_size = self.inner_lr.to(dtype=hidden.dtype).view(1, -1, 1, 1)
+        candidate_state = state - step_size * update
+        next_state = torch.where(
+            valid.view(batch_size, 1, 1, 1), candidate_state, state
+        )
+
+        memory_heads = torch.einsum("bhij,bhj->bhi", next_state, query)
+        memory = self.out_proj(memory_heads.reshape(batch_size, self.dim_model))
+        fused = hidden + self.gate.to(dtype=hidden.dtype).view(1, -1) * memory
+        fused = torch.where(valid.unsqueeze(-1), fused, hidden)
+        return fused, next_state
+
+    def forward_sequence(
+        self,
+        hidden: torch.Tensor,
+        masks: torch.Tensor,
+        *,
+        episode_ids: Optional[torch.Tensor] = None,
+        initial_state: Optional[torch.Tensor] = None,
+        initial_state_reset_mask: Optional[torch.Tensor] = None,
+        update_start: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replay fast-weight writes in chronological per-environment order.
+
+        ``update_start`` lets PPO prepend raw frames for the short KV cache
+        without writing them twice into a fast state captured at rollout start.
+        """
+
+        if hidden.ndim != 3 or hidden.shape[-1] != self.dim_model:
+            raise ValueError(
+                "TTT sequence input must have shape (T, B, dim_model), got "
+                f"{tuple(hidden.shape)}"
+            )
+        time_steps, batch_size, _ = hidden.shape
+        if tuple(masks.shape) != (time_steps, batch_size):
+            raise ValueError(
+                "TTT masks must match the sequence leading dimensions, got "
+                f"{tuple(masks.shape)} and {(time_steps, batch_size)}"
+            )
+        if not 0 <= update_start < time_steps:
+            raise ValueError(
+                f"TTT update_start must lie in [0, {time_steps}), got "
+                f"{update_start}"
+            )
+        if episode_ids is not None and tuple(episode_ids.shape) != tuple(masks.shape):
+            raise ValueError(
+                "TTT episode_ids must match masks, got "
+                f"{tuple(episode_ids.shape)} and {tuple(masks.shape)}"
+            )
+
+        if initial_state is None:
+            state = self.initial_state(
+                batch_size, device=hidden.device, dtype=hidden.dtype
+            )
+        else:
+            self._validate_state(initial_state, batch_size)
+            state = initial_state.to(device=hidden.device, dtype=hidden.dtype)
+
+        reset_state = self.initial_fast_weights.to(
+            device=hidden.device, dtype=hidden.dtype
+        ).unsqueeze(0)
+        if initial_state_reset_mask is not None:
+            if initial_state is None:
+                raise ValueError(
+                    "TTT initial_state_reset_mask requires initial_state"
+                )
+            if tuple(initial_state_reset_mask.shape) != (batch_size,):
+                raise ValueError(
+                    "TTT initial reset mask must have shape "
+                    f"{(batch_size,)}, got "
+                    f"{tuple(initial_state_reset_mask.shape)}"
+                )
+            state = torch.where(
+                initial_state_reset_mask.bool().view(batch_size, 1, 1, 1),
+                reset_state,
+                state,
+            )
+        outputs = []
+        for step_index in range(time_steps):
+            if step_index < update_start:
+                outputs.append(hidden[step_index])
+                continue
+
+            valid = masks[step_index].bool()
+            if step_index > update_start:
+                starts_segment = valid & ~masks[step_index - 1].bool()
+                if episode_ids is not None:
+                    starts_segment = starts_segment | (
+                        valid
+                        & masks[step_index - 1].bool()
+                        & (
+                            episode_ids[step_index]
+                            != episode_ids[step_index - 1]
+                        )
+                    )
+                state = torch.where(
+                    starts_segment.view(batch_size, 1, 1, 1),
+                    reset_state,
+                    state,
+                )
+
+            fused, state = self.step(hidden[step_index], state, valid)
+            outputs.append(fused)
+
+        return torch.stack(outputs, dim=0), state
+
+
 class MMGPT(nn.Module):
     def __init__(
         self,
@@ -571,6 +808,12 @@ class MMGPT(nn.Module):
         temporal_chunk_size: int = 1,
         temporal_fast_slow_enabled: bool = False,
         temporal_fast_residual_scale: float = 1.0,
+        ttt_memory_enabled: bool = False,
+        ttt_num_heads: Optional[int] = None,
+        ttt_inner_lr: float = 0.1,
+        ttt_inner_lr_max: float = 1.0,
+        ttt_gate_init: float = 1.0e-3,
+        ttt_learnable_inner_lr: bool = True,
         score_prediction_enabled: bool = False,
         apply_mlp_residual = False,
         # some not pretty fix
@@ -598,6 +841,10 @@ class MMGPT(nn.Module):
         self.temporal_chunk_enabled = self.temporal_chunk_size > 1
         self.temporal_fast_slow_enabled = bool(temporal_fast_slow_enabled)
         self.temporal_fast_residual_scale = float(temporal_fast_residual_scale)
+        self.ttt_memory_enabled = bool(ttt_memory_enabled)
+        self.ttt_num_heads = (
+            int(num_heads) if ttt_num_heads is None else int(ttt_num_heads)
+        )
         if self.temporal_fast_residual_scale < 0.0:
             raise ValueError("temporal_fast_residual_scale must be non-negative")
         if self.temporal_fast_slow_enabled and not self.temporal_chunk_enabled:
@@ -941,6 +1188,28 @@ class MMGPT(nn.Module):
             self.temporal_output_norm = None
             self.temporal_plan_head = None
             self.temporal_fast_controller = None
+
+        if self.ttt_memory_enabled:
+            if not self.streaming_kv_cache or not self.streaming_sequence_training:
+                raise ValueError(
+                    "ttt_memory_enabled requires streaming_kv_cache=True and "
+                    "streaming_sequence_training=True"
+                )
+            if self.temporal_chunk_enabled:
+                raise ValueError(
+                    "the first TTT adapter requires temporal_chunk_size=1; "
+                    "chunk/TTT interaction is a separate architecture ablation"
+                )
+            self.ttt_memory = TTTKVBLinearMemory(
+                dim_model,
+                self.ttt_num_heads,
+                inner_lr=ttt_inner_lr,
+                inner_lr_max=ttt_inner_lr_max,
+                gate_init=ttt_gate_init,
+                learnable_inner_lr=ttt_learnable_inner_lr,
+            )
+        else:
+            self.ttt_memory = None
         
         self.pos_emb = nn.Embedding(self.compressed_len, dim_model) if not self.apply_rope else None # *2 for obs and ref_obs
         self.modality_emb = nn.Embedding(2, dim_model) # 0 for obs, 1 for ref_obs
@@ -984,6 +1253,8 @@ class MMGPT(nn.Module):
         self.inference_slow_valid = None
         self.inference_chunk_plan = None
         self.inference_chunk_plan_valid = None
+        self.inference_ttt_state = None
+        self.inference_ttt_state_is_reset = None
         self.last_inference_temporal_phase = None
         
         self.aux_loss = 0.0
@@ -1151,6 +1422,18 @@ class MMGPT(nn.Module):
             num_envs, dtype=torch.long, device=device
         )
         self.inference_kv_cache_dirty = False
+        if self.ttt_memory_enabled:
+            self.inference_ttt_state = self.ttt_memory.initial_state(
+                num_envs,
+                device=device,
+                dtype=self.ttt_memory.initial_fast_weights.dtype,
+            ).detach()
+            self.inference_ttt_state_is_reset = torch.ones(
+                num_envs, dtype=torch.bool, device=device
+            )
+        else:
+            self.inference_ttt_state = None
+            self.inference_ttt_state_is_reset = None
         if self.ref_obs_dim > 0:
             ref_obs_buffer_shape = (self.rollout_history_frames, num_envs, self.ref_obs_dim)
             self.inference_buffer_ref_obs = torch.zeros(ref_obs_buffer_shape, device=device)
@@ -1208,6 +1491,15 @@ class MMGPT(nn.Module):
             if self.inference_position_ids is not None:
                 self.inference_position_ids.zero_()
             self.inference_kv_cache_dirty = False
+            if self.inference_ttt_state is not None:
+                self.inference_ttt_state.copy_(
+                    self.ttt_memory.initial_state(
+                        self.num_envs_cache,
+                        device=self.inference_ttt_state.device,
+                        dtype=self.inference_ttt_state.dtype,
+                    ).detach()
+                )
+                self.inference_ttt_state_is_reset.fill_(True)
             if self.temporal_chunk_enabled:
                 self.inference_chunk_frame_buffer.zero_()
                 self.inference_chunk_slot_mask.zero_()
@@ -1239,6 +1531,13 @@ class MMGPT(nn.Module):
                 for key, value in self.inference_kv_cache["key_values"]:
                     key[mask] = 0.0
                     value[mask] = 0.0
+            if self.inference_ttt_state is not None and mask.any():
+                reset_state = self.ttt_memory.initial_fast_weights.to(
+                    device=self.inference_ttt_state.device,
+                    dtype=self.inference_ttt_state.dtype,
+                )
+                self.inference_ttt_state[mask] = reset_state.detach()
+                self.inference_ttt_state_is_reset[mask] = True
             if self.temporal_chunk_enabled:
                 self.inference_chunk_frame_buffer[:, mask] = 0.0
                 self.inference_chunk_slot_mask[:, mask] = False
@@ -1250,6 +1549,54 @@ class MMGPT(nn.Module):
                 if self.inference_chunk_plan_valid is not None:
                     self.inference_chunk_plan_valid[mask] = False
                 self.last_inference_temporal_phase[mask] = 0
+
+    def get_inference_ttt_state(
+        self,
+        observations: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Return the pre-action fast state captured at a rollout boundary."""
+
+        state = self.get_inference_ttt_rollout_state(observations)
+        return None if state is None else state[0]
+
+    def get_inference_ttt_rollout_state(
+        self,
+        observations: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Return fast weights and which rows are currently at learned W0."""
+
+        if not self.ttt_memory_enabled:
+            return None
+        if observations.ndim != 2 or observations.shape[-1] != self.obs_dim:
+            raise ValueError(
+                "MMGPT rollout observations must have shape (B, obs_dim), got "
+                f"{tuple(observations.shape)}"
+            )
+        batch_size = observations.shape[0]
+        if self.inference_buffer_obs is None or batch_size != self.num_envs_cache:
+            self._init_inference_buffer(batch_size, observations.device)
+        return (
+            self.inference_ttt_state.detach().clone(),
+            self.inference_ttt_state_is_reset.detach().clone(),
+        )
+
+    def _apply_ttt_inference(self, hidden: torch.Tensor) -> torch.Tensor:
+        if not self.ttt_memory_enabled:
+            return hidden
+        if self.inference_ttt_state is None:
+            raise RuntimeError("TTT inference state is not initialized")
+        valid = torch.ones(
+            hidden.shape[0], dtype=torch.bool, device=hidden.device
+        )
+        fused, next_state = self.ttt_memory.step(
+            hidden, self.inference_ttt_state, valid
+        )
+        # Rollout state is deliberately graph-free across physical control
+        # steps. PPO reconstructs the differentiable trajectory from the saved
+        # rollout-start state instead of retaining the collection graph.
+        self.inference_ttt_state = next_state.detach()
+        self.inference_ttt_state_is_reset.fill_(False)
+        return fused
 
     def invalidate_inference_cache(self):
         """Rebuild cached K/V with current parameters on the next rollout step."""
@@ -2209,6 +2556,19 @@ class MMGPT(nn.Module):
         
         T_in, B, _ = obs.shape
         device = obs.device   
+        ttt_initial_state = None
+        ttt_initial_state_reset_mask = None
+        if self.ttt_memory_enabled:
+            if memory is not None and not isinstance(memory, dict):
+                raise ValueError(
+                    "TTT PPO memory must be streaming metadata, got "
+                    f"{type(memory).__name__}"
+                )
+            if isinstance(memory, dict):
+                ttt_initial_state = memory.get("ttt_initial_state")
+                ttt_initial_state_reset_mask = memory.get(
+                    "ttt_initial_state_reset_mask"
+                )
         if sequence_output_start is not None:
             if not self.streaming_kv_cache:
                 raise ValueError(
@@ -2221,6 +2581,14 @@ class MMGPT(nn.Module):
             if self.temporal_chunk_enabled and temporal_phases is None:
                 raise ValueError(
                     "chunked streaming PPO requires stored temporal_phases"
+                )
+            if self.ttt_memory_enabled and ttt_initial_state is None:
+                raise ValueError(
+                    "streaming TTT PPO requires the rollout-start fast state"
+                )
+            if self.ttt_memory_enabled and ttt_initial_state_reset_mask is None:
+                raise ValueError(
+                    "streaming TTT PPO requires the rollout-start reset mask"
                 )
         if raw_observations is None:
             # Backward-compatible fallback for environments/runners that do not
@@ -2378,6 +2746,19 @@ class MMGPT(nn.Module):
         else:
             upsampled_out = obs_out_seq # [T_in, B, D]
 
+        if self.ttt_memory_enabled:
+            ttt_update_start = (
+                0 if sequence_output_start is None else sequence_output_start
+            )
+            upsampled_out, _ = self.ttt_memory.forward_sequence(
+                upsampled_out,
+                masks,
+                episode_ids=episode_ids,
+                initial_state=ttt_initial_state,
+                initial_state_reset_mask=ttt_initial_state_reset_mask,
+                update_start=ttt_update_start,
+            )
+
 
         # if self.apply_res:
         #     # Add residual connection    
@@ -2421,8 +2802,14 @@ class MMGPT(nn.Module):
                     loss_steps = torch.arange(
                         T_in - 1, device=device
                     ).unsqueeze(1)
+                    loss_start = sequence_output_start - 1
+                    if self.ttt_memory_enabled and ttt_initial_state is not None:
+                        # The saved state already contains the raw prefix.  Its
+                        # final hidden cannot be reconstructed without writing
+                        # that prefix twice, so omit only this boundary pair.
+                        loss_start = sequence_output_start
                     valid_mask = valid_mask & (
-                        loss_steps >= sequence_output_start - 1
+                        loss_steps >= loss_start
                     )
                 aux_loss_i = self._masked_prediction_mse(
                     pred_shifted,
@@ -2665,6 +3052,7 @@ class MMGPT(nn.Module):
                         torch.ones(B, dtype=torch.bool, device=device),
                         ref_step,
                     )
+            hidden = self._apply_ttt_inference(hidden)
             self.last_hidden_state = hidden
             return self.fc(hidden)
 
@@ -3747,6 +4135,17 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
         self.critic.reset(dones)
         if self.actor_dagger is not None:
             self.actor_dagger.reset(dones)
-            
+
+    def get_actor_recurrent_state(
+        self,
+        observations: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Capture actor-only state before the first action of a rollout."""
+
+        return self.actor.get_inference_ttt_rollout_state(observations)
+
     def get_hidden_states(self):
+        # TTT uses the optimized rollout-start-only storage path above.  The
+        # generic RNN API would replicate this large state at every physical
+        # transition and is intentionally left inactive.
         return None, None

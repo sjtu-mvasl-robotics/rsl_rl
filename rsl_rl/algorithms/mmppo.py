@@ -730,6 +730,10 @@ class MMPPO:
                 is_mmgpt
                 and self.actor_critic.actor.temporal_chunk_enabled
             ),
+            store_actor_recurrent_state=(
+                is_mmgpt
+                and self.actor_critic.actor.ttt_memory_enabled
+            ),
         )
 
         # Initialize teacher replay buffer
@@ -761,8 +765,23 @@ class MMPPO:
         raw_obs=None,
         dreamer_target=None,
     ):
-        # if self.actor_critic.is_recurrent:
-        #     self.transition.hidden_states = self.actor_critic.get_hidden_states()
+        if (
+            isinstance(self.actor_critic, ActorCriticMMGPT)
+            and self.actor_critic.actor.ttt_memory_enabled
+            and self.storage is not None
+            and self.storage.step == 0
+        ):
+            # Capture the state before the first action in this rollout.  The
+            # streaming generator replays the whole rollout from exactly this
+            # detached TBPTT boundary, so no per-transition state copies are
+            # necessary.
+            rollout_state = self.actor_critic.get_actor_recurrent_state(obs)
+            if rollout_state is None:
+                raise RuntimeError("TTT actor did not expose rollout state")
+            (
+                self.transition.actor_recurrent_state,
+                self.transition.actor_recurrent_state_reset_mask,
+            ) = rollout_state
         
         # Stage 1: Teacher-Only (pure imitation)
         # Stage 2: Hybrid (weighted mix of teacher and student)
@@ -1032,6 +1051,18 @@ class MMPPO:
                     if "temporal_phases" in hid_states_batch:
                         streaming_kwargs["temporal_phases"] = (
                             hid_states_batch["temporal_phases"]
+                        )
+                    if self.actor_critic.actor.ttt_memory_enabled and (
+                        "ttt_initial_state" not in hid_states_batch
+                    ):
+                        raise RuntimeError(
+                            "streaming TTT batch is missing rollout-start state"
+                        )
+                    if self.actor_critic.actor.ttt_memory_enabled and (
+                        "ttt_initial_state_reset_mask" not in hid_states_batch
+                    ):
+                        raise RuntimeError(
+                            "streaming TTT batch is missing initial reset mask"
                         )
                 self.actor_critic.act(
                     obs_batch,
