@@ -147,6 +147,7 @@ def _add_storage_step(
     temporal_phase=None,
     recurrent_state=None,
     recurrent_state_reset_mask=None,
+    recurrent_reset_event=None,
 ):
     num_envs = observations.shape[0]
     if action_mean is None:
@@ -181,6 +182,12 @@ def _add_storage_step(
     transition.hidden_states = None
     transition.actor_recurrent_state = recurrent_state
     transition.actor_recurrent_state_reset_mask = recurrent_state_reset_mask
+    if storage.actor_recurrent_reset_events is not None:
+        transition.actor_recurrent_reset_event = (
+            torch.zeros(num_envs, dtype=torch.bool)
+            if recurrent_reset_event is None
+            else recurrent_reset_event
+        )
     if storage.actor_temporal_phases is not None:
         if temporal_phase is None:
             raise ValueError("test transition requires an explicit temporal phase")
@@ -338,9 +345,9 @@ def _make_streaming_rope_mmgpt(history_length, num_layers=2):
     ).eval()
 
 
-def _make_ttt_streaming_mmgpt(history_length=4, num_layers=2):
+def _make_ttt_streaming_mmgpt(history_length=4, num_layers=2, **overrides):
     torch.manual_seed(17)
-    return MMGPT(
+    kwargs = dict(
         obs_size=sum(_TERM_DIMS.values()),
         ref_obs_size=2,
         dim_out=2,
@@ -364,7 +371,9 @@ def _make_ttt_streaming_mmgpt(history_length=4, num_layers=2):
         ttt_num_heads=2,
         ttt_inner_lr=0.1,
         ttt_gate_init=1.0e-3,
-    ).eval()
+    )
+    kwargs.update(overrides)
+    return MMGPT(**kwargs).eval()
 
 
 def _make_chunked_streaming_mmgpt(
@@ -1307,13 +1316,94 @@ def test_ttt_streaming_matches_sequence_replay_across_async_resets():
     )
 
 
+def test_ttt_finite_horizon_events_match_replay_and_preserve_short_context():
+    time_steps = 10
+    num_envs = 2
+    horizon_steps = 3
+    online_model = _make_ttt_streaming_mmgpt(
+        history_length=4,
+        ttt_memory_horizon_steps=horizon_steps,
+    )
+    batch_model = copy.deepcopy(online_model)
+    torch.manual_seed(133)
+    observations = torch.randn(
+        time_steps, num_envs, sum(_TERM_DIMS.values())
+    )
+    references = torch.randn(time_steps, num_envs, 2)
+    reference_masks = torch.ones(time_steps, num_envs, dtype=torch.bool)
+    masks = torch.ones_like(reference_masks)
+    dones = torch.zeros_like(reference_masks)
+    dones[4, 1] = True
+    episode_ids = _episode_ids_from_dones(dones)
+
+    initial_state = online_model.get_inference_ttt_state(observations[0])
+    online_actions = []
+    reset_events = []
+    short_context_lengths = []
+    with torch.no_grad():
+        for step in range(time_steps):
+            online_actions.append(
+                online_model(
+                    observations[step],
+                    (references[step], reference_masks[step]),
+                )
+            )
+            reset_events.append(online_model.get_inference_ttt_reset_event())
+            short_context_lengths.append(online_model.current_timesteps.clone())
+            online_model.reset(dones[step])
+
+        reset_events = torch.stack(reset_events)
+        replay_actions = batch_model(
+            observations,
+            (references, reference_masks),
+            masks,
+            memory={
+                "ttt_initial_state": initial_state,
+                "ttt_initial_state_reset_mask": torch.ones(
+                    num_envs, dtype=torch.bool
+                ),
+                "ttt_state_reset_masks": reset_events,
+            },
+            episode_ids=episode_ids,
+            sequence_output_start=0,
+        )
+
+    expected_resets = torch.tensor(
+        [
+            [False, False],
+            [False, False],
+            [False, False],
+            [True, True],
+            [False, False],
+            [False, False],
+            [True, False],
+            [False, False],
+            [False, True],
+            [True, False],
+        ]
+    )
+    torch.testing.assert_close(reset_events, expected_resets)
+    # A finite TTT horizon must not reset the independent H=4 K/V context.
+    assert short_context_lengths[3][0].item() == 4
+    assert short_context_lengths[6][0].item() == 4
+    torch.testing.assert_close(
+        torch.stack(online_actions).flatten(0, 1),
+        replay_actions,
+        atol=3.0e-7,
+        rtol=3.0e-6,
+    )
+
+
 def test_ttt_rollout_start_state_recomputes_means_across_boundary():
     torch.manual_seed(137)
     num_envs = 2
     rollout_steps = 5
     history_length = 4
     obs_dim = sum(_TERM_DIMS.values())
-    model = _make_ttt_streaming_mmgpt(history_length)
+    model = _make_ttt_streaming_mmgpt(
+        history_length,
+        ttt_memory_horizon_steps=3,
+    )
     storage = _make_storage(
         num_envs=num_envs,
         rollout_steps=rollout_steps,
@@ -1340,6 +1430,7 @@ def test_ttt_rollout_start_state_recomputes_means_across_boundary():
                 action_mean = model(
                     observations, (references, reference_masks)
                 )
+            recurrent_reset_event = model.get_inference_ttt_reset_event()
             dones = done_schedule(step)
             _add_storage_step(
                 storage,
@@ -1349,6 +1440,7 @@ def test_ttt_rollout_start_state_recomputes_means_across_boundary():
                 action_mean=action_mean,
                 recurrent_state=recurrent_state,
                 recurrent_state_reset_mask=recurrent_reset_mask,
+                recurrent_reset_event=recurrent_reset_event,
             )
             model.reset(dones)
 
@@ -1362,6 +1454,11 @@ def test_ttt_rollout_start_state_recomputes_means_across_boundary():
     metadata, masks_batch = batch[12], batch[13]
     assert metadata["ttt_initial_state"].shape == (2, 2, 8, 8)
     assert metadata["ttt_initial_state_reset_mask"].shape == (2,)
+    assert metadata["ttt_state_reset_masks"].shape == (
+        history_length - 1 + rollout_steps,
+        num_envs,
+    )
+    assert not metadata["ttt_state_reset_masks"][: history_length - 1].any()
     with torch.no_grad():
         recomputed_mu = model(
             obs_batch,

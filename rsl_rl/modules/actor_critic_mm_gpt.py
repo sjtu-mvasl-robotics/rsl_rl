@@ -680,6 +680,7 @@ class TTTKVBLinearMemory(nn.Module):
         masks: torch.Tensor,
         *,
         episode_ids: Optional[torch.Tensor] = None,
+        state_reset_masks: Optional[torch.Tensor] = None,
         initial_state: Optional[torch.Tensor] = None,
         initial_state_reset_mask: Optional[torch.Tensor] = None,
         update_start: int = 0,
@@ -710,6 +711,14 @@ class TTTKVBLinearMemory(nn.Module):
             raise ValueError(
                 "TTT episode_ids must match masks, got "
                 f"{tuple(episode_ids.shape)} and {tuple(masks.shape)}"
+            )
+        if (
+            state_reset_masks is not None
+            and tuple(state_reset_masks.shape) != tuple(masks.shape)
+        ):
+            raise ValueError(
+                "TTT state_reset_masks must match masks, got "
+                f"{tuple(state_reset_masks.shape)} and {tuple(masks.shape)}"
             )
 
         if initial_state is None:
@@ -746,6 +755,7 @@ class TTTKVBLinearMemory(nn.Module):
                 continue
 
             valid = masks[step_index].bool()
+            starts_segment = torch.zeros_like(valid)
             if step_index > update_start:
                 starts_segment = valid & ~masks[step_index - 1].bool()
                 if episode_ids is not None:
@@ -757,11 +767,15 @@ class TTTKVBLinearMemory(nn.Module):
                             != episode_ids[step_index - 1]
                         )
                     )
-                state = torch.where(
-                    starts_segment.view(batch_size, 1, 1, 1),
-                    reset_state,
-                    state,
+            if state_reset_masks is not None:
+                starts_segment = starts_segment | (
+                    valid & state_reset_masks[step_index].bool()
                 )
+            state = torch.where(
+                starts_segment.view(batch_size, 1, 1, 1),
+                reset_state,
+                state,
+            )
 
             fused, state = self.step(hidden[step_index], state, valid)
             outputs.append(fused)
@@ -814,6 +828,7 @@ class MMGPT(nn.Module):
         ttt_inner_lr_max: float = 1.0,
         ttt_gate_init: float = 1.0e-3,
         ttt_learnable_inner_lr: bool = True,
+        ttt_memory_horizon_steps: int = 0,
         score_prediction_enabled: bool = False,
         apply_mlp_residual = False,
         # some not pretty fix
@@ -845,6 +860,9 @@ class MMGPT(nn.Module):
         self.ttt_num_heads = (
             int(num_heads) if ttt_num_heads is None else int(ttt_num_heads)
         )
+        self.ttt_memory_horizon_steps = int(ttt_memory_horizon_steps)
+        if self.ttt_memory_horizon_steps < 0:
+            raise ValueError("ttt_memory_horizon_steps must be non-negative")
         if self.temporal_fast_residual_scale < 0.0:
             raise ValueError("temporal_fast_residual_scale must be non-negative")
         if self.temporal_fast_slow_enabled and not self.temporal_chunk_enabled:
@@ -1255,6 +1273,8 @@ class MMGPT(nn.Module):
         self.inference_chunk_plan_valid = None
         self.inference_ttt_state = None
         self.inference_ttt_state_is_reset = None
+        self.inference_ttt_steps_since_reset = None
+        self.last_inference_ttt_reset_event = None
         self.last_inference_temporal_phase = None
         
         self.aux_loss = 0.0
@@ -1431,9 +1451,17 @@ class MMGPT(nn.Module):
             self.inference_ttt_state_is_reset = torch.ones(
                 num_envs, dtype=torch.bool, device=device
             )
+            self.inference_ttt_steps_since_reset = torch.zeros(
+                num_envs, dtype=torch.long, device=device
+            )
+            self.last_inference_ttt_reset_event = torch.zeros(
+                num_envs, dtype=torch.bool, device=device
+            )
         else:
             self.inference_ttt_state = None
             self.inference_ttt_state_is_reset = None
+            self.inference_ttt_steps_since_reset = None
+            self.last_inference_ttt_reset_event = None
         if self.ref_obs_dim > 0:
             ref_obs_buffer_shape = (self.rollout_history_frames, num_envs, self.ref_obs_dim)
             self.inference_buffer_ref_obs = torch.zeros(ref_obs_buffer_shape, device=device)
@@ -1500,6 +1528,8 @@ class MMGPT(nn.Module):
                     ).detach()
                 )
                 self.inference_ttt_state_is_reset.fill_(True)
+                self.inference_ttt_steps_since_reset.zero_()
+                self.last_inference_ttt_reset_event.zero_()
             if self.temporal_chunk_enabled:
                 self.inference_chunk_frame_buffer.zero_()
                 self.inference_chunk_slot_mask.zero_()
@@ -1538,6 +1568,8 @@ class MMGPT(nn.Module):
                 )
                 self.inference_ttt_state[mask] = reset_state.detach()
                 self.inference_ttt_state_is_reset[mask] = True
+                self.inference_ttt_steps_since_reset[mask] = 0
+                self.last_inference_ttt_reset_event[mask] = False
             if self.temporal_chunk_enabled:
                 self.inference_chunk_frame_buffer[:, mask] = 0.0
                 self.inference_chunk_slot_mask[:, mask] = False
@@ -1580,11 +1612,39 @@ class MMGPT(nn.Module):
             self.inference_ttt_state_is_reset.detach().clone(),
         )
 
+    def get_inference_ttt_reset_event(self) -> Optional[torch.Tensor]:
+        """Return scheduled fast-state resets applied to the latest action."""
+
+        if not self.ttt_memory_enabled:
+            return None
+        if self.last_inference_ttt_reset_event is None:
+            raise RuntimeError("TTT inference state is not initialized")
+        return self.last_inference_ttt_reset_event.detach().clone()
+
     def _apply_ttt_inference(self, hidden: torch.Tensor) -> torch.Tensor:
         if not self.ttt_memory_enabled:
             return hidden
         if self.inference_ttt_state is None:
             raise RuntimeError("TTT inference state is not initialized")
+        if self.inference_ttt_steps_since_reset is None:
+            raise RuntimeError("TTT inference horizon counter is not initialized")
+        reset_event = torch.zeros(
+            hidden.shape[0], dtype=torch.bool, device=hidden.device
+        )
+        if self.ttt_memory_horizon_steps > 0:
+            reset_event = (
+                self.inference_ttt_steps_since_reset
+                >= self.ttt_memory_horizon_steps
+            )
+            if reset_event.any():
+                reset_state = self.ttt_memory.initial_fast_weights.to(
+                    device=self.inference_ttt_state.device,
+                    dtype=self.inference_ttt_state.dtype,
+                )
+                self.inference_ttt_state[reset_event] = reset_state.detach()
+                self.inference_ttt_state_is_reset[reset_event] = True
+                self.inference_ttt_steps_since_reset[reset_event] = 0
+        self.last_inference_ttt_reset_event.copy_(reset_event)
         valid = torch.ones(
             hidden.shape[0], dtype=torch.bool, device=hidden.device
         )
@@ -1596,6 +1656,7 @@ class MMGPT(nn.Module):
         # rollout-start state instead of retaining the collection graph.
         self.inference_ttt_state = next_state.detach()
         self.inference_ttt_state_is_reset.fill_(False)
+        self.inference_ttt_steps_since_reset.add_(1)
         return fused
 
     def invalidate_inference_cache(self):
@@ -2558,6 +2619,7 @@ class MMGPT(nn.Module):
         device = obs.device   
         ttt_initial_state = None
         ttt_initial_state_reset_mask = None
+        ttt_state_reset_masks = None
         if self.ttt_memory_enabled:
             if memory is not None and not isinstance(memory, dict):
                 raise ValueError(
@@ -2569,6 +2631,7 @@ class MMGPT(nn.Module):
                 ttt_initial_state_reset_mask = memory.get(
                     "ttt_initial_state_reset_mask"
                 )
+                ttt_state_reset_masks = memory.get("ttt_state_reset_masks")
         if sequence_output_start is not None:
             if not self.streaming_kv_cache:
                 raise ValueError(
@@ -2589,6 +2652,15 @@ class MMGPT(nn.Module):
             if self.ttt_memory_enabled and ttt_initial_state_reset_mask is None:
                 raise ValueError(
                     "streaming TTT PPO requires the rollout-start reset mask"
+                )
+            if (
+                self.ttt_memory_enabled
+                and self.ttt_memory_horizon_steps > 0
+                and ttt_state_reset_masks is None
+            ):
+                raise ValueError(
+                    "finite-horizon streaming TTT PPO requires per-action "
+                    "state reset masks"
                 )
         if raw_observations is None:
             # Backward-compatible fallback for environments/runners that do not
@@ -2754,6 +2826,7 @@ class MMGPT(nn.Module):
                 upsampled_out,
                 masks,
                 episode_ids=episode_ids,
+                state_reset_masks=ttt_state_reset_masks,
                 initial_state=ttt_initial_state,
                 initial_state_reset_mask=ttt_initial_state_reset_mask,
                 update_start=ttt_update_start,
@@ -4143,6 +4216,11 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
         """Capture actor-only state before the first action of a rollout."""
 
         return self.actor.get_inference_ttt_rollout_state(observations)
+
+    def get_actor_recurrent_reset_event(self) -> Optional[torch.Tensor]:
+        """Expose the finite-horizon reset applied to the latest action."""
+
+        return self.actor.get_inference_ttt_reset_event()
 
     def get_hidden_states(self):
         # TTT uses the optimized rollout-start-only storage path above.  The

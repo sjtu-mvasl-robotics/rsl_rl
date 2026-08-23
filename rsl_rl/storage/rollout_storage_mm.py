@@ -39,6 +39,7 @@ class RolloutStorageMM:
             self.hidden_states = None
             self.actor_recurrent_state = None
             self.actor_recurrent_state_reset_mask = None
+            self.actor_recurrent_reset_event = None
             self.actor_temporal_phase = None
             self.rnd_state = None
 
@@ -199,6 +200,16 @@ class RolloutStorageMM:
         # not replicate a large TTT fast-weight tensor over every transition.
         self.actor_initial_recurrent_state = None
         self.actor_initial_recurrent_state_reset_mask = None
+        self.actor_recurrent_reset_events = (
+            torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            if self.store_actor_recurrent_state
+            else None
+        )
 
         self.step = 0
 
@@ -243,6 +254,19 @@ class RolloutStorageMM:
                 )
             self.actor_initial_recurrent_state.copy_(recurrent_state)
             self.actor_initial_recurrent_state_reset_mask.copy_(reset_mask)
+        if self.actor_recurrent_reset_events is not None:
+            reset_event = transition.actor_recurrent_reset_event
+            if reset_event is None:
+                raise ValueError(
+                    "actor recurrent reset event is required at every rollout step"
+                )
+            reset_event = reset_event.detach().bool()
+            if tuple(reset_event.shape) != (self.num_envs,):
+                raise ValueError(
+                    "actor recurrent reset event must have shape "
+                    f"{(self.num_envs,)}, got {tuple(reset_event.shape)}"
+                )
+            self.actor_recurrent_reset_events[self.step].copy_(reset_event)
         self.observations[self.step].copy_(transition.observations)
         if self.actor_temporal_phases is not None:
             if transition.actor_temporal_phase is None:
@@ -1159,6 +1183,26 @@ class RolloutStorageMM:
             if self.actor_temporal_phases is not None
             else None
         )
+        ttt_reset_sequence = None
+        if self.actor_recurrent_reset_events is not None:
+            if prefix_length == 0:
+                ttt_reset_sequence = self.actor_recurrent_reset_events
+            else:
+                # The rollout-start fast state already contains the retained
+                # observation prefix, so prefix frames are not replayed through
+                # TTT and must never carry synthetic reset events.
+                ttt_reset_sequence = torch.cat(
+                    (
+                        torch.zeros(
+                            prefix_length,
+                            self.num_envs,
+                            dtype=torch.bool,
+                            device=self.device,
+                        ),
+                        self.actor_recurrent_reset_events,
+                    ),
+                    dim=0,
+                )
         ref_sequence = (
             prepend(
                 self.actor_history_prefix_reference_observations,
@@ -1276,6 +1320,9 @@ class RolloutStorageMM:
                     )
                     sequence_metadata["ttt_initial_state_reset_mask"] = (
                         self.actor_initial_recurrent_state_reset_mask[env_idx]
+                    )
+                    sequence_metadata["ttt_state_reset_masks"] = (
+                        ttt_reset_sequence[:, env_idx]
                     )
                 if temporal_phase_sequence is not None:
                     sequence_metadata["temporal_phases"] = (

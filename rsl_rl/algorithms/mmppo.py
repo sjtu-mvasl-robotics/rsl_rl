@@ -792,6 +792,14 @@ class MMPPO:
         self.transition.actions = student_actions  # Always use student actions for training
         if (
             isinstance(self.actor_critic, ActorCriticMMGPT)
+            and self.actor_critic.actor.ttt_memory_enabled
+        ):
+            reset_event = self.actor_critic.get_actor_recurrent_reset_event()
+            if reset_event is None:
+                raise RuntimeError("TTT actor did not expose its latest reset event")
+            self.transition.actor_recurrent_reset_event = reset_event
+        if (
+            isinstance(self.actor_critic, ActorCriticMMGPT)
             and self.actor_critic.actor.temporal_chunk_enabled
         ):
             phase = self.actor_critic.actor.last_inference_temporal_phase
@@ -1063,6 +1071,12 @@ class MMPPO:
                     ):
                         raise RuntimeError(
                             "streaming TTT batch is missing initial reset mask"
+                        )
+                    if self.actor_critic.actor.ttt_memory_enabled and (
+                        "ttt_state_reset_masks" not in hid_states_batch
+                    ):
+                        raise RuntimeError(
+                            "streaming TTT batch is missing per-action reset masks"
                         )
                 self.actor_critic.act(
                     obs_batch,
