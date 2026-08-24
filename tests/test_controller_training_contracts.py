@@ -12,6 +12,7 @@ from rsl_rl.runners.on_policy_runner_mm import (
     _amp_reward_enabled,
     _compose_amp_training_rewards,
     _restore_sonic_adaptive_sampler_state,
+    _unpack_observations_result,
 )
 import rsl_rl
 
@@ -69,6 +70,36 @@ def test_amp_reward_is_composed_without_mutating_environment_reward():
 def test_amp_pretrain_boundary_is_explicit():
     assert not _amp_reward_enabled(2_999, 3_000)
     assert _amp_reward_enabled(3_000, 3_000)
+
+
+def test_runner_accepts_current_dict_observation_contract():
+    groups = {
+        "policy": torch.randn(4, 7),
+        "critic": torch.randn(4, 11),
+    }
+
+    policy, extras = _unpack_observations_result(groups)
+
+    assert policy is groups["policy"]
+    assert extras == {"observations": groups}
+    assert extras["observations"]["critic"] is groups["critic"]
+
+
+def test_runner_preserves_legacy_observation_contract():
+    policy = torch.randn(4, 7)
+    extras = {"observations": {"policy": policy}}
+
+    unpacked_policy, unpacked_extras = _unpack_observations_result(
+        (policy, extras)
+    )
+
+    assert unpacked_policy is policy
+    assert unpacked_extras is extras
+
+
+def test_runner_rejects_current_observation_contract_without_policy_group():
+    with pytest.raises(RuntimeError, match="containing a 'policy' group"):
+        _unpack_observations_result({"critic": torch.randn(4, 11)})
 
 
 def test_runner_stores_amp_reward_before_process_env_step():

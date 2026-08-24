@@ -40,6 +40,32 @@ def _amp_reward_enabled(iteration: int, pretrain_steps: int) -> bool:
     return iteration >= pretrain_steps
 
 
+def _unpack_observations_result(observation_result):
+    """Normalize old and current Isaac Lab observation-wrapper contracts.
+
+    Older Isaac Lab wrappers return ``(policy_obs, extras)`` while current
+    wrappers return a TensorDict containing the ``policy`` and optional
+    privileged groups directly.  Keep the raw dict-like object in ``extras``
+    so MMGPT self-supervision and the privileged critic see the same sample.
+    """
+
+    if isinstance(observation_result, tuple):
+        if len(observation_result) != 2:
+            raise RuntimeError(
+                "legacy get_observations() must return (policy_obs, extras)"
+            )
+        return observation_result
+
+    try:
+        policy_obs = observation_result["policy"]
+    except (KeyError, TypeError, IndexError) as exc:
+        raise RuntimeError(
+            "get_observations() must return either (policy_obs, extras) or "
+            "a dict-like object containing a 'policy' group"
+        ) from exc
+    return policy_obs, {"observations": observation_result}
+
+
 def _restore_sonic_adaptive_sampler_state(env, loaded_dict) -> bool:
     """Restore curriculum state only when the active task owns that state.
 
@@ -88,9 +114,7 @@ class OnPolicyRunnerMM:
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
-        print(self.env.get_observations())
-        
-        obs, extras = self.env.get_observations()
+        obs, extras = _unpack_observations_result(self.env.get_observations())
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
             
         num_obs = obs.shape[1]
@@ -479,7 +503,7 @@ class OnPolicyRunnerMM:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-        obs, extras = self.env.get_observations()
+        obs, extras = _unpack_observations_result(self.env.get_observations())
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
         raw_obs, dreamer_target = self._get_mmgpt_self_supervision_inputs(
             extras["observations"]
@@ -802,7 +826,7 @@ class OnPolicyRunnerMM:
         db.begin_planner_rl_episode()
 
         # Get initial observations
-        obs, extras = self.env.get_observations()
+        obs, extras = _unpack_observations_result(self.env.get_observations())
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
         critic_obs = extras["observations"].get("critic", obs)
         critic_ref_obs_tuple = ref_extras["ref_observations"].get("critic", ref_obs_tuple) if ref_obs_tuple is not None else None
@@ -1210,7 +1234,7 @@ class OnPolicyRunnerMM:
         
         # 重置环境
         self.env.reset()
-        obs, extras = self.env.get_observations()
+        obs, extras = _unpack_observations_result(self.env.get_observations())
         ref_obs_tuple, ref_extras = self.env.get_reference_observations()
         
         obs = obs.to(self.device)
