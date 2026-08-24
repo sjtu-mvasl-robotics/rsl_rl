@@ -7,6 +7,7 @@ import torch
 
 from rsl_rl.algorithms.mmppo import (
     MMPPO,
+    _add_optional_loss,
     _fixed_expert_actor_ppo_enabled,
     _fixed_expert_bc_loss,
     _fixed_expert_stage,
@@ -120,6 +121,24 @@ def test_fixed_expert_bc_target_is_detached_but_student_receives_gradient():
 
     torch.testing.assert_close(student.grad, torch.tensor([[1.0, 2.0]]))
     assert expert.grad is None
+
+
+def test_disabled_value_objective_does_not_materialize_critic_gradient():
+    actor_parameter = torch.tensor(2.0, requires_grad=True)
+    critic_parameter = torch.tensor(3.0, requires_grad=True)
+    actor_loss = actor_parameter.square()
+    critic_loss = critic_parameter.square()
+
+    loss = _add_optional_loss(
+        actor_loss,
+        critic_loss,
+        coefficient=0.0,
+        name="teacher value loss",
+    )
+    loss.backward()
+
+    torch.testing.assert_close(actor_parameter.grad, torch.tensor(4.0))
+    assert critic_parameter.grad is None
 
 
 def test_dagger_intervention_is_one_step_then_fixed_expert_recovers():
@@ -272,6 +291,7 @@ def test_real_sonic_checkpoint_crosses_bc_to_dagger_with_frozen_labels():
         schedule="fixed",
         teacher_coef=None,
         teacher_loss_coef=None,
+        teacher_value_loss_coef=0.0,
         normalize_advantage_per_mini_batch=True,
         aux_loss_coef=0.0,
         dreamer_loss_coef=0.0,
@@ -345,6 +365,9 @@ def test_real_sonic_checkpoint_crosses_bc_to_dagger_with_frozen_labels():
     action_head_before = [
         parameter.detach().clone() for parameter in actor_critic.actor.fc.parameters()
     ]
+    critic_before = [
+        parameter.detach().clone() for parameter in actor_critic.critic.parameters()
+    ]
 
     algorithm.set_training_iteration(0)
     assert algorithm.fixed_expert_stage == "bc"
@@ -368,6 +391,10 @@ def test_real_sonic_checkpoint_crosses_bc_to_dagger_with_frozen_labels():
     assert any(
         not torch.equal(old, new.detach())
         for old, new in zip(action_head_before, actor_critic.actor.fc.parameters())
+    )
+    assert all(
+        torch.equal(old, new.detach())
+        for old, new in zip(critic_before, actor_critic.critic.parameters())
     )
 
     algorithm.set_training_iteration(1)

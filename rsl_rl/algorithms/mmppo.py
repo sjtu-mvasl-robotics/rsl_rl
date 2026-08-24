@@ -131,6 +131,28 @@ def _fixed_expert_bc_loss(
     raise ValueError("fixed-expert BC mode must be 'mse' or 'huber'")
 
 
+def _add_optional_loss(
+    total_loss: torch.Tensor,
+    component_loss: torch.Tensor,
+    *,
+    coefficient: float,
+    name: str,
+) -> torch.Tensor:
+    """Add a weighted objective without materializing zero gradients.
+
+    Adam-family optimizers can update a parameter from momentum or decoupled
+    weight decay even when its gradient tensor contains only zeros.  Returning
+    ``total_loss`` unchanged for a disabled objective keeps unrelated modules
+    genuinely frozen during strict action-BC pretraining.
+    """
+
+    if coefficient < 0.0:
+        raise ValueError(f"{name} coefficient must be non-negative")
+    if coefficient == 0.0:
+        return total_loss
+    return total_loss + coefficient * component_loss
+
+
 def chunk_q_bootstrap_target(
     rewards: torch.Tensor,
     dones: torch.Tensor,
@@ -1459,7 +1481,12 @@ class MMPPO:
             if not actor_ppo_enabled:
                 # Teacher stage or critic not ready: reduced value coef, no entropy term
                 effective_value_loss_coef = self.teacher_value_loss_coef
-                loss = surrogate_loss + effective_value_loss_coef * value_loss
+                loss = _add_optional_loss(
+                    surrogate_loss,
+                    value_loss,
+                    coefficient=effective_value_loss_coef,
+                    name="teacher value loss",
+                )
             else:
                 # Hybrid/Student stage with critic ready: normal coefficient
                 effective_value_loss_coef = self.value_loss_coef
