@@ -360,6 +360,176 @@ def test_streaming_mmgpt_first_ppo_update_changes_backbone(capsys):
     assert backbone_changed
 
 
+class _ConstantFixedTeacher(nn.Module):
+    def __init__(self, action_dim: int, value: float):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.tensor(value))
+        self.action_dim = action_dim
+
+    @torch.no_grad()
+    def act(self, raw_observations, raw_ref_observations):
+        del raw_ref_observations
+        return self.anchor.expand(raw_observations.shape[0], self.action_dim)
+
+    def reset(self, dones):
+        del dones
+
+
+def test_streaming_fixed_expert_bc_updates_student_without_ppo(capsys):
+    torch.manual_seed(111)
+    terms = {
+        "joint_pos": 2,
+        "joint_vel": 2,
+        "projected_gravity": 3,
+        "base_lin_vel": 3,
+        "base_ang_vel": 3,
+        "actions": 2,
+    }
+    reference_terms = {"target_actions": 2}
+    actor_critic = ActorCriticMMGPT(
+        num_actor_obs=sum(terms.values()),
+        num_actor_ref_obs=2,
+        num_critic_obs=sum(terms.values()),
+        num_critic_ref_obs=2,
+        num_actions=2,
+        term_dict={"policy": terms, "critic": terms},
+        ref_term_dict={
+            "policy": reference_terms,
+            "critic": reference_terms,
+        },
+        ref_term_steps={"policy": None, "critic": None},
+        concatenate_term_names={"policy": None, "critic": None},
+        concatenate_ref_term_names={"policy": None, "critic": None},
+        pred_obs_term_names=None,
+        pred_obs_term_weights=None,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        num_steps_per_env=3,
+        max_seq_len=3,
+        critic_history_length=1,
+        critic_hidden_dims=[32, 16],
+        critic_fusion_mode="direct_concat",
+        apply_rope=True,
+        latest_reference_only=False,
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=3,
+        ttt_memory_enabled=True,
+        ttt_num_heads=2,
+        default_joint_pos=torch.zeros(2),
+    )
+    fixed_teacher = _ConstantFixedTeacher(action_dim=2, value=0.75)
+    algorithm = MMPPO(
+        actor_critic,
+        fixed_teacher=fixed_teacher,
+        expert_bc_loss_coef=1.0,
+        expert_bc_only_iterations=10,
+        expert_dagger_plateau_iterations=[2],
+        expert_dagger_student_probs=[0.25],
+        num_learning_epochs=1,
+        num_mini_batches=2,
+        learning_rate=1.0e-3,
+        schedule="fixed",
+        teacher_coef=None,
+        teacher_loss_coef=None,
+        normalize_advantage_per_mini_batch=True,
+        aux_loss_coef=0.0,
+        dreamer_loss_coef=0.0,
+        device="cpu",
+    )
+    algorithm.set_training_iteration(0)
+    num_envs, rollout_steps = 4, 4
+    obs_dim = sum(terms.values())
+    algorithm.init_storage(
+        "rl",
+        num_envs=num_envs,
+        num_transitions_per_env=rollout_steps,
+        actor_obs_shape=(obs_dim,),
+        actor_ref_obs_shape=(2,),
+        critic_obs_shape=(obs_dim,),
+        critic_ref_obs_shape=(2,),
+        action_shape=(2,),
+        store_raw_observations=True,
+    )
+
+    observations = torch.randn(num_envs, obs_dim)
+    for step in range(rollout_steps):
+        references = torch.randn(num_envs, 2)
+        reference_tuple = (references, torch.ones(num_envs, dtype=torch.bool))
+        actions = algorithm.act(
+            observations,
+            reference_tuple,
+            observations,
+            reference_tuple,
+            raw_obs=observations,
+            raw_ref_obs=reference_tuple,
+        )
+        torch.testing.assert_close(actions, torch.full_like(actions, 0.75))
+        dones = torch.zeros(num_envs, dtype=torch.bool)
+        dones[0] = step == 2
+        algorithm.process_env_step(torch.ones(num_envs), dones, {})
+        observations = torch.randn_like(observations)
+    final_reference = (
+        torch.randn(num_envs, 2),
+        torch.ones(num_envs, dtype=torch.bool),
+    )
+    algorithm.compute_returns(observations, final_reference)
+
+    sequence_batch = next(
+        algorithm.storage.streaming_sequence_mini_batch_generator(1, 1)
+    )
+    sequence_obs = sequence_batch[0]
+    sequence_ref = sequence_batch[1]
+    expert_labels = sequence_batch[11]
+    sequence_metadata = sequence_batch[12]
+    sequence_masks = sequence_batch[13]
+    sequence_raw_obs = sequence_batch[19]
+
+    def current_bc_error():
+        with torch.no_grad():
+            actor_critic.act(
+                sequence_obs,
+                ref_observations=sequence_ref,
+                masks=sequence_masks,
+                memory=sequence_metadata,
+                raw_observations=sequence_raw_obs,
+                episode_ids=sequence_metadata["episode_ids"],
+                sequence_output_start=sequence_metadata[
+                    "sequence_output_start"
+                ],
+            )
+            return (
+                actor_critic.action_mean - expert_labels
+            ).square().mean().item()
+
+    bc_error_before = current_bc_error()
+    action_head_before = [
+        parameter.detach().clone() for parameter in actor_critic.actor.fc.parameters()
+    ]
+    metrics = algorithm.update(epoch=0)
+    bc_error_after = current_bc_error()
+    capsys.readouterr()
+
+    assert metrics["fixed_expert_stage"] == 0.0
+    assert metrics["fixed_expert_student_execute_fraction"] == 0.0
+    assert metrics["actor_ppo_update_fraction"] == 0.0
+    assert metrics["mean_weighted_expert_bc_loss"] > 0.0
+    assert metrics["mean_actor_grad_norm"] > 0.0
+    assert bc_error_after < bc_error_before
+    assert any(
+        not torch.equal(old, new.detach())
+        for old, new in zip(action_head_before, actor_critic.actor.fc.parameters())
+    )
+    assert not fixed_teacher.anchor.requires_grad
+    optimizer_parameter_ids = {
+        id(parameter)
+        for group in algorithm.optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert id(fixed_teacher.anchor) not in optimizer_parameter_ids
+
+
 def test_ttt_streaming_first_ppo_update_replays_rollout_start_state(capsys):
     torch.manual_seed(12)
     terms = {

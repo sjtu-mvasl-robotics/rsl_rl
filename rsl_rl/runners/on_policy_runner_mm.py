@@ -228,8 +228,68 @@ class OnPolicyRunnerMM:
         else:
             self.amp_cfg = None
 
+        # Keep the declarative teacher contract in alg_cfg for logs and saved
+        # run metadata; MMPPO accepts unknown future kwargs but receives the
+        # instantiated frozen module separately below.
+        fixed_teacher_cfg = self.alg_cfg.get("fixed_teacher_cfg", None)
+        fixed_teacher = None
+        if fixed_teacher_cfg is not None:
+            if self.training_type != "rl" or not self._is_mmgpt:
+                raise ValueError(
+                    "fixed SONIC expert distillation requires MMGPT RL"
+                )
+            fixed_teacher_cfg = dict(fixed_teacher_cfg)
+            expected_policy_terms = tuple(
+                fixed_teacher_cfg.pop("expected_policy_terms", ())
+            )
+            expected_ref_terms = tuple(
+                fixed_teacher_cfg.pop("expected_ref_terms", ())
+            )
+            policy_term_dims = actor_critic_dim["term_dict"]["policy"]
+            policy_ref_term_dims = actor_critic_dim["ref_term_dict"]["policy"]
+            if expected_policy_terms and tuple(policy_term_dims) != (
+                expected_policy_terms
+            ):
+                raise ValueError(
+                    "fixed SONIC expert policy terms differ from its checkpoint "
+                    f"contract: expected {expected_policy_terms}, got "
+                    f"{tuple(policy_term_dims)}"
+                )
+            if expected_ref_terms and tuple(policy_ref_term_dims) != (
+                expected_ref_terms
+            ):
+                raise ValueError(
+                    "fixed SONIC expert reference terms differ from its "
+                    f"checkpoint contract: expected {expected_ref_terms}, got "
+                    f"{tuple(policy_ref_term_dims)}"
+                )
+            fixed_teacher = FixedSonicMLPTeacher(
+                policy_term_dims=policy_term_dims,
+                policy_ref_term_dims=policy_ref_term_dims,
+                num_actions=self.env.num_actions,
+                student_is_delta=bool(
+                    getattr(self.env.unwrapped, "is_delta", False)
+                ),
+                action_clip_value=getattr(
+                    self.env.unwrapped, "action_clip_value", None
+                ),
+                **fixed_teacher_cfg,
+            )
+            print(
+                "[OnPolicyRunnerMM] Loaded frozen SONIC expert "
+                f"iteration={fixed_teacher.checkpoint_iteration}, "
+                f"actor_parameters={fixed_teacher.actor_parameter_count:,}, "
+                f"checkpoint={fixed_teacher.checkpoint_path}"
+            )
+
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
-        self.alg: MMPPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        self.alg: MMPPO = alg_class(
+            actor_critic,
+            device=self.device,
+            fixed_teacher=fixed_teacher,
+            **self.alg_cfg,
+            multi_gpu_cfg=self.multi_gpu_cfg,
+        )
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
@@ -381,6 +441,15 @@ class OnPolicyRunnerMM:
             target_mask.to(self.device).bool().detach().clone(),
         )
 
+    def _clone_raw_reference_observations(self, ref_obs_tuple):
+        """Preserve the teacher's pre-normalizer command tensor and mask."""
+
+        if ref_obs_tuple is None:
+            return None
+        return tuple(
+            value.to(self.device).detach().clone() for value in ref_obs_tuple
+        )
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = True):
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -420,6 +489,7 @@ class OnPolicyRunnerMM:
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         if ref_obs_tuple is not None:
             ref_obs_tuple = tuple(ref_obs.to(self.device) for ref_obs in ref_obs_tuple)
+        raw_ref_obs_tuple = self._clone_raw_reference_observations(ref_obs_tuple)
         if critic_ref_obs_tuple is not None:
             critic_ref_obs_tuple = tuple(critic_ref_obs.to(self.device) for critic_ref_obs in critic_ref_obs_tuple)
         self.train_mode()  # switch to train mode (for dropout for example)
@@ -486,6 +556,7 @@ class OnPolicyRunnerMM:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+            self.alg.set_training_iteration(it)
 
             # ====== Episode-level planner RL: separate code path ======
             if self._planner_rl_episode_mode:
@@ -525,6 +596,7 @@ class OnPolicyRunnerMM:
                         critic_obs=critic_obs,
                         ref_critic_obs=critic_ref_obs_tuple,
                         raw_obs=raw_obs,
+                        raw_ref_obs=raw_ref_obs_tuple,
                         dreamer_target=dreamer_target,
                     )
                     if self.amp_cfg: # Get amp observation before step and shift into per-env ring buffer
@@ -543,6 +615,9 @@ class OnPolicyRunnerMM:
                         dones.to(self.device),
                     )
                     ref_obs_tuple = tuple(ref_obs.to(self.device) for ref_obs in ref_obs_tuple) if ref_obs_tuple is not None else None
+                    raw_ref_obs_tuple = self._clone_raw_reference_observations(
+                        ref_obs_tuple
+                    )
                     raw_obs, dreamer_target = (
                         self._get_mmgpt_self_supervision_inputs(
                             infos["observations"]

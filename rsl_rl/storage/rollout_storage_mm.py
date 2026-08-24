@@ -1120,11 +1120,6 @@ class RolloutStorageMM:
             raise ValueError("streaming sequence batches require RL storage")
         if self.amp_cfg is not None:
             raise ValueError("streaming MMGPT sequence batches do not support AMP")
-        if self.dagger_actions is not None:
-            raise ValueError(
-                "streaming MMGPT sequence batches currently require pure RL "
-                "without a DAgger teacher"
-            )
         history_length = (
             self.actor_history_length
             if num_steps_per_env is None
@@ -1341,7 +1336,11 @@ class RolloutStorageMM:
                     current_flat(self.actions_log_prob),
                     current_flat(self.mu),
                     current_flat(self.sigma),
-                    None,
+                    (
+                        current_flat(self.dagger_actions)
+                        if self.dagger_actions is not None
+                        else None
+                    ),
                     sequence_metadata,
                     masks_batch,
                     rnd_state_batch,

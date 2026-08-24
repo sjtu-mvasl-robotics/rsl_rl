@@ -21,6 +21,11 @@ from .actor_critic_mlp import ActorCriticMLP, MultiModalMLP
 from .actor_critic_mlp_v2 import ActorCriticMLPV2, DirectConcatMLP, MultiModalMLPV2
 from .actor_critic_mlp_v2_moe import ActorCriticMLPV2MoE
 from .actor_critic_mlp_v3 import ActorCriticMLPV3
+from .fixed_sonic_teacher import (
+    FixedSonicMLPTeacher,
+    SonicHistoryAssembler,
+    convert_teacher_action_coordinates,
+)
 from .conv_encoder import ConvEncoder, PrivilegeEncoder, MotionEncoder
 from .student_teacher_transformer import StudentTeacherMMTransformer, StudentTeacherMMTransformerV2
 from .amp import AMPNet
@@ -46,6 +51,9 @@ __all__ = [
     "ActorCriticMLPV2MoE",
     "MultiModalMLPV2",
     "ActorCriticMLPV3",
+    "FixedSonicMLPTeacher",
+    "SonicHistoryAssembler",
+    "convert_teacher_action_coordinates",
     "ConvEncoder",
     "PrivilegeEncoder",
     "MotionEncoder",
