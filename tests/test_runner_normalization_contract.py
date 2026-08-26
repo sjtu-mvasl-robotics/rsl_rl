@@ -3,6 +3,11 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import torch
+
+from rsl_rl.modules.normalizer import EmpiricalNormalization
+from rsl_rl.runners.on_policy_runner_mm import OnPolicyRunnerMM
+
 
 RUNNER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -28,15 +33,71 @@ def _method_source(name: str) -> str:
 
 
 def test_all_four_normalizers_follow_train_and_eval_mode():
-    for method_name, mode_call in (("train_mode", "train()"), ("eval_mode", "eval()")):
-        source = _method_source(method_name)
-        for normalizer_name in (
-            "obs_normalizer",
-            "critic_obs_normalizer",
-            "ref_obs_normalizer",
-            "critic_ref_obs_normalizer",
-        ):
-            assert f"self.{normalizer_name}.{mode_call}" in source
+    train_source = _method_source("train_mode")
+    eval_source = _method_source("eval_mode")
+    assert "normalizer_training = not self._loaded_normalization_frozen" in train_source
+    for normalizer_name in (
+        "obs_normalizer",
+        "critic_obs_normalizer",
+        "ref_obs_normalizer",
+        "critic_ref_obs_normalizer",
+    ):
+        assert f"self.{normalizer_name}.train(normalizer_training)" in train_source
+        assert f"self.{normalizer_name}.eval()" in eval_source
+
+
+def test_loaded_dagger_normalizers_remain_frozen_in_train_mode():
+    class _Algorithm:
+        actor_critic = torch.nn.Identity()
+        rnd = None
+
+    runner = OnPolicyRunnerMM.__new__(OnPolicyRunnerMM)
+    runner.alg = _Algorithm()
+    runner.amp_cfg = None
+    runner.empirical_normalization = True
+    runner._loaded_normalization_frozen = True
+    runner.obs_normalizer = EmpiricalNormalization(2)
+    runner.critic_obs_normalizer = EmpiricalNormalization(2)
+    runner.ref_obs_normalizer = EmpiricalNormalization(2)
+    runner.critic_ref_obs_normalizer = EmpiricalNormalization(2)
+
+    runner.train_mode()
+    for normalizer in (
+        runner.obs_normalizer,
+        runner.critic_obs_normalizer,
+        runner.ref_obs_normalizer,
+        runner.critic_ref_obs_normalizer,
+    ):
+        normalizer(torch.ones(4, 2))
+
+    assert runner.alg.actor_critic.training
+    assert runner.obs_normalizer.count.item() == 0
+    assert runner.critic_obs_normalizer.count.item() == 0
+    assert runner.ref_obs_normalizer.count.item() == 0
+    assert runner.critic_ref_obs_normalizer.count.item() == 0
+
+
+def test_fresh_run_normalizers_still_train():
+    class _Algorithm:
+        actor_critic = torch.nn.Identity()
+        rnd = None
+
+    runner = OnPolicyRunnerMM.__new__(OnPolicyRunnerMM)
+    runner.alg = _Algorithm()
+    runner.amp_cfg = None
+    runner.empirical_normalization = True
+    runner._loaded_normalization_frozen = False
+    runner.obs_normalizer = EmpiricalNormalization(2)
+    runner.critic_obs_normalizer = EmpiricalNormalization(2)
+    runner.ref_obs_normalizer = None
+    runner.critic_ref_obs_normalizer = None
+
+    runner.train_mode()
+    runner.obs_normalizer(torch.ones(4, 2))
+    runner.critic_obs_normalizer(torch.ones(4, 2))
+
+    assert runner.obs_normalizer.count.item() == 4
+    assert runner.critic_obs_normalizer.count.item() == 4
 
 
 def test_dataset_collection_does_not_double_normalize_policy_inputs():

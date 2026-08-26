@@ -317,6 +317,11 @@ class OnPolicyRunnerMM:
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
+        # ``expert_freeze_loaded_normalization`` applies only after a
+        # checkpoint's empirical statistics have actually been restored.
+        # Keep this runner-side latch separate from the algorithm config so a
+        # fresh run with the same config can still fit its normalizers.
+        self._loaded_normalization_frozen = False
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
             self.ref_obs_normalizer = EmpiricalNormalization(shape=[num_ref_obs], until=1.0e8).to(self.device) if num_ref_obs > 0 else None
@@ -1160,6 +1165,7 @@ class OnPolicyRunnerMM:
                 ):
                     if normalizer is not None:
                         normalizer.eval()
+                self._loaded_normalization_frozen = True
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if self.alg.teacher_coef is not None:
@@ -1225,12 +1231,18 @@ class OnPolicyRunnerMM:
         if self.amp_cfg:
             self.alg.amp.train()
         if self.empirical_normalization:
-            self.obs_normalizer.train()
-            self.critic_obs_normalizer.train()
+            # DAgger replay stores already-normalized sequence tensors.  Once
+            # a mature BC checkpoint's statistics are loaded, train_mode must
+            # not silently put the empirical normalizers back into update
+            # mode, otherwise old replay and new rollout samples use drifting
+            # coordinate systems.
+            normalizer_training = not self._loaded_normalization_frozen
+            self.obs_normalizer.train(normalizer_training)
+            self.critic_obs_normalizer.train(normalizer_training)
             if self.ref_obs_normalizer is not None:
-                self.ref_obs_normalizer.train()
+                self.ref_obs_normalizer.train(normalizer_training)
             if self.critic_ref_obs_normalizer is not None:
-                self.critic_ref_obs_normalizer.train()
+                self.critic_ref_obs_normalizer.train(normalizer_training)
 
     def eval_mode(self):
         self.alg.actor_critic.eval()
