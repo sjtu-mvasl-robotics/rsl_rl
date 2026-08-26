@@ -28,6 +28,13 @@ class RolloutStorageMM:
             self.amp_reference_observations = None
             self.amp_reference_observations_mask = None
             self.actions = None
+            # ``actions`` is the student proposal used to evaluate its
+            # distribution.  These two fields record what was actually sent
+            # to the environment and which policy produced it.  Keeping the
+            # three concepts separate is required for a fail-closed PPO
+            # contract during fixed-expert DAgger.
+            self.executed_actions = None
+            self.executed_by_student = None
             self.privileged_actions = None
             self.dagger_actions = None
             self.rewards = None
@@ -164,6 +171,18 @@ class RolloutStorageMM:
         
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        self.executed_actions = torch.zeros(
+            num_transitions_per_env,
+            num_envs,
+            *actions_shape,
+            device=self.device,
+        )
+        self.executed_by_student = torch.ones(
+            num_transitions_per_env,
+            num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
         self.dagger_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device) if apply_dagger_actions else None
 
@@ -306,6 +325,33 @@ class RolloutStorageMM:
             self.dagger_actions[self.step].copy_(transition.dagger_actions)           
         
         self.actions[self.step].copy_(transition.actions)
+        executed_actions = (
+            transition.actions
+            if transition.executed_actions is None
+            else transition.executed_actions
+        )
+        executed_by_student = transition.executed_by_student
+        if executed_by_student is None:
+            executed_by_student = torch.ones(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+        if tuple(executed_actions.shape) != tuple(transition.actions.shape):
+            raise ValueError(
+                "executed actions must match student proposal shape, got "
+                f"{tuple(executed_actions.shape)} and "
+                f"{tuple(transition.actions.shape)}"
+            )
+        if tuple(executed_by_student.shape) != (self.num_envs,):
+            raise ValueError(
+                "executed_by_student must have shape "
+                f"{(self.num_envs,)}, got {tuple(executed_by_student.shape)}"
+            )
+        self.executed_actions[self.step].copy_(executed_actions)
+        self.executed_by_student[self.step].copy_(
+            executed_by_student.bool()
+        )
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
         if self.training_type == "distillation":

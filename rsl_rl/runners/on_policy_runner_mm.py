@@ -1076,6 +1076,7 @@ class OnPolicyRunnerMM:
             "model_state_dict": self.alg.actor_critic.state_dict(),
             "optimizer_state_dict": self.alg.optimizer.state_dict(),
             "iter": self.current_learning_iteration,
+            "next_iter": self.current_learning_iteration + 1,
             "infos": infos,
         }
         if self.empirical_normalization:
@@ -1093,6 +1094,16 @@ class OnPolicyRunnerMM:
             saved_dict["amp_optimizer_state_dict"] = self.alg.amp_optimizer.state_dict()
         if self.alg.scaler is not None:
             saved_dict["scaler_state_dict"] = self.alg.scaler.state_dict()
+        fixed_expert_state_fn = getattr(
+            self.alg, "fixed_expert_state_dict", None
+        )
+        fixed_expert_state = (
+            fixed_expert_state_fn()
+            if callable(fixed_expert_state_fn)
+            else None
+        )
+        if fixed_expert_state is not None:
+            saved_dict["fixed_expert_state_dict"] = fixed_expert_state
         
         if self.alg.teacher_coef is not None:
             saved_dict["imitation_optimizer_state_dict"] = self.alg.imitation_optimizer.state_dict()
@@ -1135,6 +1146,20 @@ class OnPolicyRunnerMM:
                 self.ref_obs_normalizer.load_state_dict(loaded_dict["ref_obs_norm_state_dict"])
             if self.critic_ref_obs_normalizer is not None:
                 self.critic_ref_obs_normalizer.load_state_dict(loaded_dict["critic_ref_obs_norm_state_dict"])
+            if getattr(
+                self.alg, "expert_freeze_loaded_normalization", False
+            ):
+                # Aggregated DAgger sequences are stored after normalization.
+                # Freeze the mature BC checkpoint statistics so old and new
+                # sequences retain one stable input coordinate system.
+                for normalizer in (
+                    self.obs_normalizer,
+                    self.ref_obs_normalizer,
+                    self.critic_obs_normalizer,
+                    self.critic_ref_obs_normalizer,
+                ):
+                    if normalizer is not None:
+                        normalizer.eval()
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
         if self.alg.teacher_coef is not None:
@@ -1148,8 +1173,25 @@ class OnPolicyRunnerMM:
                 self.alg.amp_optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
             except:
                 print("AMP state dict not available or mismatch in the loaded file. Skipping AMP loading.")
+        load_fixed_expert_state = getattr(
+            self.alg, "load_fixed_expert_state_dict", None
+        )
+        if callable(load_fixed_expert_state):
+            load_fixed_expert_state(
+                loaded_dict.get("fixed_expert_state_dict")
+            )
         if load_optimizer:
-            self.current_learning_iteration = loaded_dict["iter"]
+            if "next_iter" in loaded_dict:
+                self.current_learning_iteration = int(loaded_dict["next_iter"])
+            elif getattr(self.alg, "fixed_expert_enabled", False):
+                # Legacy fixed-expert checkpoints stored the iteration that
+                # had already completed.  Repeating it can silently shift a
+                # BC/DAgger boundary, so continue at the next iteration.
+                self.current_learning_iteration = int(loaded_dict["iter"]) + 1
+            else:
+                # Preserve the historical resume convention for unrelated
+                # runners whose schedules may already rely on it.
+                self.current_learning_iteration = loaded_dict["iter"]
         return loaded_dict["infos"]
 
     def get_inference_policy(self, device=None):

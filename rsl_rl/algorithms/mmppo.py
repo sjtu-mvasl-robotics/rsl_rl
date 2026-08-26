@@ -336,6 +336,450 @@ class TeacherReplayBuffer:
 
         return result
 
+
+class FixedExpertSequenceReplayBuffer:
+    """Bounded DAgger aggregation for a stateful streaming MMGPT actor.
+
+    A cached TTT fast weight is not a stable training input: it was produced
+    by an older backbone and becomes stale after an optimizer step.  This
+    buffer therefore keeps only contiguous sequences that begin at either an
+    episode reset or an explicit finite-horizon TTT reset.  Replay starts from
+    the *current* learned initial fast weight and reconstructs every recurrent
+    write in the stored sequence.  The H-1 observation frames before the reset
+    are retained solely as causal Transformer context and are excluded from
+    both TTT writes and the imitation objective.
+
+    Completed reset-aligned sequences are retained with reservoir sampling,
+    which gives a bounded-memory approximation to cumulative DAgger data.  An
+    incomplete live segment is deliberately not checkpointed: simulator state
+    is not restored across processes, so that segment cannot be resumed with
+    valid dynamics after a restart.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        history_length: int,
+        *,
+        storage_dtype: torch.dtype = torch.float16,
+    ):
+        if capacity <= 0:
+            raise ValueError("sequence replay capacity must be positive")
+        if history_length < 1:
+            raise ValueError("sequence replay history length must be positive")
+        if storage_dtype not in {torch.float16, torch.float32, torch.bfloat16}:
+            raise ValueError("unsupported sequence replay storage dtype")
+        self.capacity = int(capacity)
+        self.history_length = int(history_length)
+        self.storage_dtype = storage_dtype
+        self.buffer: list[dict[str, torch.Tensor | None]] = []
+        self.active: list[dict[str, object] | None] = []
+        self.seen_sequences = 0
+
+    @property
+    def prefix_length(self) -> int:
+        return self.history_length - 1
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+    def _to_storage(self, tensor: torch.Tensor) -> torch.Tensor:
+        detached = tensor.detach().to(device="cpu")
+        if detached.is_floating_point():
+            detached = detached.to(dtype=self.storage_dtype)
+        return detached.contiguous()
+
+    @staticmethod
+    def _cat(parts: list[torch.Tensor]) -> torch.Tensor:
+        if not parts:
+            raise RuntimeError("cannot finalize an empty replay field")
+        return torch.cat(parts, dim=0).contiguous()
+
+    def _new_active(
+        self,
+        combined: dict[str, torch.Tensor | None],
+        *,
+        env_index: int,
+        current_step: int,
+    ) -> dict[str, object]:
+        prefix_start = current_step
+        prefix_stop = current_step + self.prefix_length
+
+        def context(name: str):
+            value = combined[name]
+            if value is None:
+                return None
+            return [value[prefix_start:prefix_stop, env_index].clone()]
+
+        return {
+            "observations": context("observations"),
+            "reference_observations": context("reference_observations"),
+            "reference_masks": context("reference_masks"),
+            "masks": context("masks"),
+            "dones": context("dones"),
+            "temporal_phases": context("temporal_phases"),
+            "ttt_reset_masks": [
+                torch.zeros(self.prefix_length, dtype=torch.bool)
+            ],
+            "expert_actions": [],
+        }
+
+    @staticmethod
+    def _append_optional(
+        active: dict[str, object],
+        name: str,
+        value: torch.Tensor | None,
+        start: int,
+        stop: int,
+        env_index: int,
+    ) -> None:
+        parts = active[name]
+        if parts is None:
+            if value is not None:
+                raise RuntimeError(f"replay field {name} appeared mid-sequence")
+            return
+        if value is None:
+            raise RuntimeError(f"replay field {name} disappeared mid-sequence")
+        assert isinstance(parts, list)
+        parts.append(value[start:stop, env_index].clone())
+
+    def _append_current(
+        self,
+        active: dict[str, object],
+        current: dict[str, torch.Tensor | None],
+        *,
+        start: int,
+        stop: int,
+        env_index: int,
+    ) -> None:
+        if stop <= start:
+            return
+        for name in (
+            "observations",
+            "reference_observations",
+            "reference_masks",
+            "masks",
+            "dones",
+            "temporal_phases",
+            "ttt_reset_masks",
+            "expert_actions",
+        ):
+            self._append_optional(
+                active,
+                name,
+                current[name],
+                start,
+                stop,
+                env_index,
+            )
+
+    def _reservoir_insert(
+        self, sequence: dict[str, torch.Tensor | None]
+    ) -> None:
+        self.seen_sequences += 1
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(sequence)
+            return
+        replacement = int(
+            torch.randint(self.seen_sequences, (1,), device="cpu").item()
+        )
+        if replacement < self.capacity:
+            self.buffer[replacement] = sequence
+
+    def _finalize(self, active: dict[str, object] | None) -> None:
+        if active is None:
+            return
+        expert_parts = active["expert_actions"]
+        assert isinstance(expert_parts, list)
+        if not expert_parts:
+            return
+        sequence: dict[str, torch.Tensor | None] = {}
+        for name, parts in active.items():
+            if parts is None:
+                sequence[name] = None
+                continue
+            assert isinstance(parts, list)
+            sequence[name] = self._cat(parts)
+        expert_actions = sequence["expert_actions"]
+        observations = sequence["observations"]
+        assert expert_actions is not None and observations is not None
+        expected_input_steps = self.prefix_length + expert_actions.shape[0]
+        if observations.shape[0] != expected_input_steps:
+            raise RuntimeError(
+                "reset-aligned replay sequence length mismatch: "
+                f"{observations.shape[0]} vs {expected_input_steps}"
+            )
+        self._reservoir_insert(sequence)
+
+    def add_rollout(self, storage: RolloutStorageMM) -> None:
+        """Aggregate one rollout without flattening its temporal semantics."""
+
+        if storage.step != storage.num_transitions_per_env:
+            raise RuntimeError("sequence replay requires a complete rollout")
+        if storage.dagger_actions is None:
+            raise RuntimeError("sequence replay requires fixed-expert labels")
+        if not storage.store_actor_recurrent_state:
+            raise RuntimeError("sequence replay requires stored actor TTT state")
+        if storage.actor_recurrent_reset_events is None:
+            raise RuntimeError("sequence replay requires TTT reset events")
+        if storage.actor_initial_recurrent_state_reset_mask is None:
+            raise RuntimeError("sequence replay requires rollout-start reset mask")
+        if storage.actor_history_length != self.history_length:
+            raise RuntimeError(
+                "sequence replay history length changed from "
+                f"{self.history_length} to {storage.actor_history_length}"
+            )
+
+        time_steps, num_envs = storage.observations.shape[:2]
+        if not self.active:
+            self.active = [None] * num_envs
+        elif len(self.active) != num_envs:
+            raise RuntimeError("sequence replay environment count changed")
+
+        current: dict[str, torch.Tensor | None] = {
+            "observations": self._to_storage(storage.observations),
+            "reference_observations": (
+                self._to_storage(storage.reference_observations)
+                if storage.reference_observations is not None
+                else None
+            ),
+            "reference_masks": (
+                self._to_storage(storage.reference_observations_mask).bool()
+                if storage.reference_observations_mask is not None
+                else None
+            ),
+            "masks": torch.ones(time_steps, num_envs, dtype=torch.bool),
+            "dones": self._to_storage(storage.dones).squeeze(-1).bool(),
+            "temporal_phases": (
+                self._to_storage(storage.actor_temporal_phases).long()
+                if storage.actor_temporal_phases is not None
+                else None
+            ),
+            "ttt_reset_masks": self._to_storage(
+                storage.actor_recurrent_reset_events
+            ).bool(),
+            "expert_actions": self._to_storage(storage.dagger_actions),
+        }
+
+        prefix_sources = {
+            "observations": storage.actor_history_prefix_observations,
+            "reference_observations": (
+                storage.actor_history_prefix_reference_observations
+            ),
+            "reference_masks": storage.actor_history_prefix_reference_masks,
+            "masks": storage.actor_history_prefix_valid,
+            "dones": storage.actor_history_prefix_dones,
+            "temporal_phases": storage.actor_history_prefix_temporal_phases,
+        }
+        combined: dict[str, torch.Tensor | None] = {}
+        for name, prefix in prefix_sources.items():
+            current_value = current[name]
+            if current_value is None:
+                combined[name] = None
+                continue
+            if self.prefix_length == 0:
+                combined[name] = current_value
+                continue
+            if prefix is None or prefix.shape[0] < self.prefix_length:
+                raise RuntimeError(
+                    f"sequence replay is missing {name} history prefix"
+                )
+            prefix_value = self._to_storage(prefix[-self.prefix_length :])
+            if name == "dones":
+                prefix_value = prefix_value.squeeze(-1).bool()
+            elif name in {"reference_masks", "masks"}:
+                prefix_value = prefix_value.bool()
+            elif name == "temporal_phases":
+                prefix_value = prefix_value.long()
+            combined[name] = torch.cat(
+                (prefix_value, current_value), dim=0
+            ).contiguous()
+
+        starts = current["ttt_reset_masks"].clone()
+        assert starts is not None
+        starts = starts.bool()
+        starts[0] |= self._to_storage(
+            storage.actor_initial_recurrent_state_reset_mask
+        ).bool()
+        dones = current["dones"]
+        assert dones is not None
+        if time_steps > 1:
+            starts[1:] |= dones[:-1]
+        if self.prefix_length > 0:
+            combined_dones = combined["dones"]
+            assert combined_dones is not None
+            starts[0] |= combined_dones[self.prefix_length - 1]
+
+        for env_index in range(num_envs):
+            active = self.active[env_index]
+            cursor = 0
+            for step_index in range(time_steps):
+                if bool(starts[step_index, env_index]):
+                    if active is not None:
+                        self._append_current(
+                            active,
+                            current,
+                            start=cursor,
+                            stop=step_index,
+                            env_index=env_index,
+                        )
+                        self._finalize(active)
+                    active = self._new_active(
+                        combined,
+                        env_index=env_index,
+                        current_step=step_index,
+                    )
+                    cursor = step_index
+
+                if bool(dones[step_index, env_index]):
+                    if active is not None:
+                        self._append_current(
+                            active,
+                            current,
+                            start=cursor,
+                            stop=step_index + 1,
+                            env_index=env_index,
+                        )
+                        self._finalize(active)
+                    active = None
+                    cursor = step_index + 1
+
+            if active is not None:
+                self._append_current(
+                    active,
+                    current,
+                    start=cursor,
+                    stop=time_steps,
+                    env_index=env_index,
+                )
+            self.active[env_index] = active
+
+    def sample_batch(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None]:
+        if not self.buffer:
+            raise RuntimeError("cannot sample an empty sequence replay buffer")
+        if batch_size <= 0:
+            raise ValueError("sequence replay batch size must be positive")
+        actual_batch = min(int(batch_size), len(self.buffer))
+        indices = torch.randperm(len(self.buffer))[:actual_batch].tolist()
+        sequences = [self.buffer[index] for index in indices]
+        output_lengths = [
+            int(sequence["expert_actions"].shape[0]) for sequence in sequences
+        ]
+        max_output_steps = max(output_lengths)
+        max_input_steps = self.prefix_length + max_output_steps
+
+        def padded(name: str, *, pad_value=0, out_dtype=None):
+            exemplar = sequences[0][name]
+            if exemplar is None:
+                return None
+            assert isinstance(exemplar, torch.Tensor)
+            shape = (max_input_steps, actual_batch, *exemplar.shape[1:])
+            tensor = torch.full(
+                shape,
+                pad_value,
+                dtype=exemplar.dtype if out_dtype is None else out_dtype,
+            )
+            for batch_index, sequence in enumerate(sequences):
+                value = sequence[name]
+                if value is None:
+                    raise RuntimeError(f"replay field {name} is inconsistent")
+                tensor[: value.shape[0], batch_index].copy_(value)
+            return tensor
+
+        observations = padded("observations").to(device=device, dtype=dtype)
+        masks = padded("masks", out_dtype=torch.bool).to(
+            device=device, dtype=torch.bool
+        )
+        dones = padded("dones", out_dtype=torch.bool).to(
+            device=device, dtype=torch.bool
+        )
+        reset_masks = padded("ttt_reset_masks", out_dtype=torch.bool).to(
+            device=device, dtype=torch.bool
+        )
+        episode_ids = torch.zeros_like(masks, dtype=torch.long)
+        if max_input_steps > 1:
+            episode_ids[1:] = torch.cumsum(dones[:-1].long(), dim=0)
+
+        reference_observations = padded("reference_observations")
+        reference_masks = padded("reference_masks", out_dtype=torch.bool)
+        reference = None
+        if reference_observations is not None:
+            assert reference_masks is not None
+            reference = (
+                reference_observations.to(device=device, dtype=dtype),
+                reference_masks.to(device=device, dtype=torch.bool),
+            )
+
+        temporal_phases = padded("temporal_phases", out_dtype=torch.long)
+        if temporal_phases is not None:
+            temporal_phases = temporal_phases.to(device=device, dtype=torch.long)
+
+        action_dim = int(sequences[0]["expert_actions"].shape[-1])
+        expert_actions = torch.zeros(
+            max_output_steps,
+            actual_batch,
+            action_dim,
+            device=device,
+            dtype=dtype,
+        )
+        output_masks = torch.zeros(
+            max_output_steps,
+            actual_batch,
+            device=device,
+            dtype=torch.bool,
+        )
+        for batch_index, sequence in enumerate(sequences):
+            value = sequence["expert_actions"]
+            assert isinstance(value, torch.Tensor)
+            length = value.shape[0]
+            expert_actions[:length, batch_index].copy_(
+                value.to(device=device, dtype=dtype)
+            )
+            output_masks[:length, batch_index] = True
+
+        return {
+            "observations": observations,
+            "reference_observations": reference,
+            "masks": masks,
+            "episode_ids": episode_ids,
+            "ttt_state_reset_masks": reset_masks,
+            "temporal_phases": temporal_phases,
+            "expert_actions": expert_actions,
+            "output_masks": output_masks,
+            "sequence_output_start": self.prefix_length,
+        }
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "capacity": self.capacity,
+            "history_length": self.history_length,
+            "storage_dtype": str(self.storage_dtype),
+            "seen_sequences": self.seen_sequences,
+            "buffer": self.buffer,
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        if int(state["history_length"]) != self.history_length:
+            raise ValueError("sequence replay checkpoint history length mismatch")
+        saved_buffer = state.get("buffer", [])
+        if not isinstance(saved_buffer, list):
+            raise ValueError("sequence replay checkpoint buffer must be a list")
+        # A smaller runtime capacity may intentionally trim an older dataset;
+        # a larger one retains all saved examples and continues reservoir
+        # sampling from the saved total count.
+        self.buffer = saved_buffer[-self.capacity :]
+        self.seen_sequences = max(
+            int(state.get("seen_sequences", len(self.buffer))),
+            len(self.buffer),
+        )
+        self.active = []
+
 class MMPPO:
     actor_critic: ActorCriticMMTransformer | ActorCriticMMTransformerV2 | ActorCriticMMGPT
 
@@ -422,6 +866,12 @@ class MMPPO:
         expert_dagger_student_probs: tuple[float, ...] | list[float] | None = None,
         expert_recovery_steps: int = 10,
         expert_require_critic_ready_for_rl: bool = True,
+        expert_dagger_value_loss_coef: float = 0.0,
+        expert_rl_critic_loss_coef: float | None = None,
+        expert_sequence_replay_capacity: int = 0,
+        expert_sequence_replay_batch_size: int = 32,
+        expert_sequence_replay_epochs: int = 1,
+        expert_freeze_loaded_normalization: bool = False,
 
 
         **kwargs # reserved for future use
@@ -584,6 +1034,27 @@ class MMPPO:
         self.expert_require_critic_ready_for_rl = bool(
             expert_require_critic_ready_for_rl
         )
+        self.expert_dagger_value_loss_coef = float(
+            expert_dagger_value_loss_coef
+        )
+        self.expert_rl_critic_loss_coef = float(
+            teacher_value_loss_coef
+            if expert_rl_critic_loss_coef is None
+            else expert_rl_critic_loss_coef
+        )
+        self.expert_sequence_replay_capacity = int(
+            expert_sequence_replay_capacity
+        )
+        self.expert_sequence_replay_batch_size = int(
+            expert_sequence_replay_batch_size
+        )
+        self.expert_sequence_replay_epochs = int(
+            expert_sequence_replay_epochs
+        )
+        self.expert_freeze_loaded_normalization = bool(
+            expert_freeze_loaded_normalization
+        )
+        self.fixed_expert_sequence_replay = None
         if self.fixed_expert_enabled and self.teacher_coef is not None:
             raise ValueError(
                 "fixed SONIC expert and legacy trainable DAgger are mutually exclusive"
@@ -600,6 +1071,24 @@ class MMPPO:
             raise ValueError("expert_bc_loss_mode must be 'mse' or 'huber'")
         if self.expert_recovery_steps < 0:
             raise ValueError("expert_recovery_steps must be non-negative")
+        if not 0.0 <= self.expert_dagger_value_loss_coef <= value_loss_coef:
+            raise ValueError(
+                "expert_dagger_value_loss_coef must lie in "
+                f"[0, {value_loss_coef}]"
+            )
+        if not 0.0 <= self.expert_rl_critic_loss_coef <= value_loss_coef:
+            raise ValueError(
+                "expert_rl_critic_loss_coef must lie in "
+                f"[0, {value_loss_coef}]"
+            )
+        if self.expert_sequence_replay_capacity < 0:
+            raise ValueError("expert sequence replay capacity cannot be negative")
+        if self.expert_sequence_replay_batch_size <= 0:
+            raise ValueError("expert sequence replay batch size must be positive")
+        if self.expert_sequence_replay_epochs < 0:
+            raise ValueError("expert sequence replay epochs cannot be negative")
+        if self.expert_sequence_replay_capacity > 0 and not self.fixed_expert_enabled:
+            raise ValueError("expert sequence replay requires a fixed expert")
         self.fixed_expert_stage, self.fixed_expert_student_prob, _ = (
             _fixed_expert_stage(
                 iteration=0,
@@ -612,6 +1101,7 @@ class MMPPO:
         self._expert_recovery_remaining: torch.Tensor | None = None
         self._fixed_expert_student_execute_count = 0
         self._fixed_expert_total_execute_count = 0
+        self._last_fixed_expert_student_mask: torch.Tensor | None = None
         
         # Track current training stage
         self.current_stage = 1  # 1: teacher-only, 2: hybrid, 3: student
@@ -844,6 +1334,13 @@ class MMPPO:
             dagger_plateau_iterations=self.expert_dagger_plateau_iterations,
             dagger_student_probs=self.expert_dagger_student_probs,
         )
+        if previous_stage != "rl" and self.fixed_expert_stage == "rl":
+            # Mixed expert/student returns are not evidence that the critic is
+            # calibrated on the pure-student state distribution.  Enter the
+            # RL stage with a fresh readiness gate and let at least one whole
+            # student-only update warm the critic before PPO can open.
+            self.ev_ma = 0.0
+            self.critic_win_streak = 0
         if previous_stage != self.fixed_expert_stage and (
             self.fixed_expert_stage != "dagger"
         ):
@@ -901,6 +1398,7 @@ class MMPPO:
 
         self._fixed_expert_student_execute_count += int(student_mask.sum().item())
         self._fixed_expert_total_execute_count += int(num_envs)
+        self._last_fixed_expert_student_mask = student_mask.detach().clone()
         return torch.where(
             student_mask.unsqueeze(-1), student_actions, expert_actions
         )
@@ -989,6 +1487,29 @@ class MMPPO:
             print(f"[MMPPO] Teacher replay buffer enabled: capacity={self.replay_buffer_size}, "
                   f"replay_epochs={self.replay_imitation_epochs}")
 
+        if self.expert_sequence_replay_capacity > 0:
+            if not (
+                is_mmgpt
+                and self.streaming_sequence_training
+                and self.actor_critic.actor.ttt_memory_enabled
+            ):
+                raise ValueError(
+                    "fixed-expert sequence replay currently requires a "
+                    "streaming MMGPT actor with TTT memory"
+                )
+            self.fixed_expert_sequence_replay = (
+                FixedExpertSequenceReplayBuffer(
+                    capacity=self.expert_sequence_replay_capacity,
+                    history_length=actor_history_length,
+                )
+            )
+            print(
+                "[MMPPO] Reset-aligned fixed-expert sequence replay enabled: "
+                f"capacity={self.expert_sequence_replay_capacity}, "
+                f"batch={self.expert_sequence_replay_batch_size}, "
+                f"epochs={self.expert_sequence_replay_epochs}"
+            )
+
 
     def test_mode(self):
         self.actor_critic.test()
@@ -1074,6 +1595,12 @@ class MMPPO:
             actions_to_execute = self._select_fixed_expert_actions(
                 student_actions, expert_actions
             )
+            if self._last_fixed_expert_student_mask is None:
+                raise RuntimeError("fixed-expert action source was not recorded")
+            self.transition.executed_actions = actions_to_execute.detach()
+            self.transition.executed_by_student = (
+                self._last_fixed_expert_student_mask
+            )
         elif self.teacher_coef is not None:
             teacher_actions = self.actor_critic.act_dagger(obs, ref_observations=ref_obs).detach()
             _ = self.actor_critic.get_actions_log_prob_dagger(teacher_actions)
@@ -1093,6 +1620,17 @@ class MMPPO:
         else:
             # No teacher, return student actions
             actions_to_execute = student_actions
+        if not self.fixed_expert_enabled:
+            self.transition.executed_actions = actions_to_execute.detach()
+            executed_by_student = (
+                self.teacher_coef is None or self.current_stage == 3
+            )
+            self.transition.executed_by_student = torch.full(
+                (student_actions.shape[0],),
+                executed_by_student,
+                dtype=torch.bool,
+                device=student_actions.device,
+            )
         
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
@@ -1179,6 +1717,222 @@ class MMPPO:
             # Late stage: fixed light constraint
             return max_coef
 
+    def _validate_fixed_expert_rollout_contract(self) -> None:
+        """Fail closed before any fixed-expert PPO objective is constructed."""
+
+        if not self.fixed_expert_enabled:
+            return
+        if self.storage is None:
+            raise RuntimeError("fixed-expert rollout storage is not initialized")
+        if self.storage.step != self.storage.num_transitions_per_env:
+            raise RuntimeError("fixed-expert update requires a complete rollout")
+
+        stored_student_count = int(
+            self.storage.executed_by_student.sum().item()
+        )
+        stored_total = self.storage.executed_by_student.numel()
+        if stored_student_count != self._fixed_expert_student_execute_count:
+            raise RuntimeError(
+                "fixed-expert action-source counter disagrees with storage: "
+                f"{stored_student_count} vs "
+                f"{self._fixed_expert_student_execute_count}"
+            )
+        if stored_total != self._fixed_expert_total_execute_count:
+            raise RuntimeError(
+                "fixed-expert execution total disagrees with storage: "
+                f"{stored_total} vs {self._fixed_expert_total_execute_count}"
+            )
+
+        if self.fixed_expert_stage == "rl":
+            if not bool(self.storage.executed_by_student.all()):
+                raise RuntimeError(
+                    "PPO rollout contains a teacher-executed transition"
+                )
+            if not torch.equal(
+                self.storage.actions, self.storage.executed_actions
+            ):
+                raise RuntimeError(
+                    "PPO rollout student proposals differ from executed actions"
+                )
+
+    def _sequence_replay_ready(self) -> bool:
+        replay = self.fixed_expert_sequence_replay
+        local_ready = replay is not None and len(replay) > 0
+        if not self.is_multi_gpu:
+            return local_ready
+        ready = torch.tensor(
+            int(local_ready), device=self.device, dtype=torch.int32
+        )
+        torch.distributed.all_reduce(
+            ready, op=torch.distributed.ReduceOp.MIN
+        )
+        return bool(ready.item())
+
+    def _update_fixed_expert_sequence_replay(
+        self,
+    ) -> tuple[float, float, int]:
+        """Run imitation-only updates on reset-aligned aggregate sequences."""
+
+        replay = self.fixed_expert_sequence_replay
+        if (
+            replay is None
+            or self.expert_sequence_replay_epochs == 0
+            or self.fixed_expert_stage not in {"dagger", "rl"}
+            or not self._sequence_replay_ready()
+        ):
+            return 0.0, 0.0, 0
+        replay_coefficient = (
+            self.expert_rl_bc_loss_coef
+            if self.fixed_expert_stage == "rl"
+            else self.expert_bc_loss_coef
+        )
+        if replay_coefficient == 0.0:
+            return 0.0, 0.0, 0
+
+        actor_parameter = next(self.actor_critic.actor.parameters())
+        replay_loss_total = 0.0
+        replay_grad_total = 0.0
+        replay_updates = 0
+        for _ in range(self.expert_sequence_replay_epochs):
+            batch = replay.sample_batch(
+                self.expert_sequence_replay_batch_size,
+                device=self.device,
+                dtype=actor_parameter.dtype,
+            )
+            observations = batch["observations"]
+            masks = batch["masks"]
+            episode_ids = batch["episode_ids"]
+            reset_masks = batch["ttt_state_reset_masks"]
+            output_masks = batch["output_masks"]
+            expert_actions = batch["expert_actions"]
+            output_start = int(batch["sequence_output_start"])
+            assert isinstance(observations, torch.Tensor)
+            assert isinstance(masks, torch.Tensor)
+            assert isinstance(episode_ids, torch.Tensor)
+            assert isinstance(reset_masks, torch.Tensor)
+            assert isinstance(output_masks, torch.Tensor)
+            assert isinstance(expert_actions, torch.Tensor)
+
+            batch_size = observations.shape[1]
+            initial_state = self.actor_critic.actor.ttt_memory.initial_state(
+                batch_size,
+                device=observations.device,
+                dtype=observations.dtype,
+            )
+            sequence_metadata = {
+                "streaming_sequence": True,
+                "episode_ids": episode_ids,
+                "sequence_output_start": output_start,
+                "ttt_initial_state": initial_state,
+                "ttt_initial_state_reset_mask": torch.ones(
+                    batch_size,
+                    device=observations.device,
+                    dtype=torch.bool,
+                ),
+                "ttt_state_reset_masks": reset_masks,
+            }
+            temporal_phases = batch["temporal_phases"]
+            streaming_kwargs = {
+                "episode_ids": episode_ids,
+                "sequence_output_start": output_start,
+                "compute_aux_loss": False,
+                "compute_dreamer_loss": False,
+            }
+            if temporal_phases is not None:
+                sequence_metadata["temporal_phases"] = temporal_phases
+                streaming_kwargs["temporal_phases"] = temporal_phases
+
+            with torch.amp.autocast(
+                device_type="cuda", enabled=self.auto_mix_precision
+            ):
+                self.actor_critic.update_distribution(
+                    observations,
+                    ref_observations=batch["reference_observations"],
+                    masks=masks,
+                    memory=sequence_metadata,
+                    **streaming_kwargs,
+                )
+                predicted = self.actor_critic.action_mean
+                valid = output_masks.flatten()
+                predicted = predicted[valid]
+                targets = expert_actions.flatten(0, 1)[valid]
+                replay_imitation_loss = _fixed_expert_bc_loss(
+                    predicted,
+                    targets,
+                    mode=self.expert_bc_loss_mode,
+                )
+                replay_loss = replay_coefficient * replay_imitation_loss
+
+            self.optimizer.zero_grad()
+            if self.auto_mix_precision:
+                self.scaler.scale(replay_loss).backward()
+                self.scaler.unscale_(self.optimizer)
+            else:
+                replay_loss.backward()
+            if self.is_multi_gpu:
+                self.reduce_parameters()
+            actor_grad_sq_norm = sum(
+                parameter.grad.detach().float().pow(2).sum()
+                for parameter in self.actor_critic.actor.parameters()
+                if parameter.grad is not None
+            )
+            replay_grad_norm = (
+                actor_grad_sq_norm.sqrt().item()
+                if isinstance(actor_grad_sq_norm, torch.Tensor)
+                else 0.0
+            )
+            nn.utils.clip_grad_norm_(
+                self.actor_critic.actor.parameters(), self.max_grad_norm
+            )
+            if self.auto_mix_precision:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            replay_loss_total += replay_imitation_loss.item()
+            replay_grad_total += replay_grad_norm
+            replay_updates += 1
+
+        return (
+            replay_loss_total / replay_updates,
+            replay_grad_total / replay_updates,
+            replay_updates,
+        )
+
+    def fixed_expert_state_dict(self) -> dict[str, object] | None:
+        if not self.fixed_expert_enabled:
+            return None
+        state: dict[str, object] = {
+            "ev_ma": float(self.ev_ma),
+            "critic_win_streak": int(self.critic_win_streak),
+        }
+        if self.fixed_expert_sequence_replay is not None:
+            state["sequence_replay"] = (
+                self.fixed_expert_sequence_replay.state_dict()
+            )
+        return state
+
+    def load_fixed_expert_state_dict(
+        self, state: dict[str, object] | None
+    ) -> None:
+        if state is None:
+            return
+        if not self.fixed_expert_enabled:
+            raise ValueError(
+                "checkpoint contains fixed-expert state but expert is disabled"
+            )
+        self.ev_ma = float(state.get("ev_ma", 0.0))
+        self.critic_win_streak = int(state.get("critic_win_streak", 0))
+        replay_state = state.get("sequence_replay")
+        if replay_state is not None:
+            if self.fixed_expert_sequence_replay is None:
+                raise ValueError(
+                    "checkpoint contains sequence replay but runtime disabled it"
+                )
+            if not isinstance(replay_state, dict):
+                raise ValueError("sequence replay checkpoint must be a mapping")
+            self.fixed_expert_sequence_replay.load_state_dict(replay_state)
+
     def update(self, epoch=0):
         # Skip controller update if frozen (Stage 1 Planner RL)
         if getattr(self, 'skip_controller_update', False):
@@ -1201,6 +1955,25 @@ class MMPPO:
             self.current_stage = 2  # Hybrid stage
         else:
             self.current_stage = 3  # Student stage
+
+        self._validate_fixed_expert_rollout_contract()
+        if self.fixed_expert_sequence_replay is not None:
+            # Aggregate before the optimizer changes the model.  Only raw
+            # trajectory tensors and expert labels are retained; replay later
+            # rebuilds recurrent state with current parameters.
+            self.fixed_expert_sequence_replay.add_rollout(self.storage)
+
+        fixed_actor_ppo_enabled_for_update = None
+        if self.fixed_expert_enabled:
+            fixed_actor_ppo_enabled_for_update = (
+                _fixed_expert_actor_ppo_enabled(
+                    stage=self.fixed_expert_stage,
+                    require_critic_ready=(
+                        self.expert_require_critic_ready_for_rl
+                    ),
+                    critic_win_streak=self.critic_win_streak,
+                )
+            )
             
         is_mmgpt = isinstance(self.actor_critic, ActorCriticMMGPT)
         streaming_sequence_training = self.streaming_sequence_training
@@ -1434,24 +2207,22 @@ class MMPPO:
 
             # Explained Variance (InterMimic-style): measures critic quality
             # ev = 1 - Var(return - value) / Var(return), clamped to [-1, 1]
-            with torch.no_grad():
-                returns_var = returns_batch.var(unbiased=False) + 1e-8
-                errors_var = (returns_batch - value_batch).var(unbiased=False)
-                ev = (1.0 - errors_var / returns_var).clamp(-1.0, 1.0).item()
-                self.ev_ma = self.ev_ema_decay * self.ev_ma + (1.0 - self.ev_ema_decay) * ev
-                if self.ev_ma >= 0.6:
-                    self.critic_win_streak += 1
-                else:
-                    self.critic_win_streak = 0
+            if not self.fixed_expert_enabled or self.fixed_expert_stage == "rl":
+                with torch.no_grad():
+                    returns_var = returns_batch.var(unbiased=False) + 1e-8
+                    errors_var = (returns_batch - value_batch).var(unbiased=False)
+                    ev = (1.0 - errors_var / returns_var).clamp(-1.0, 1.0).item()
+                    self.ev_ma = self.ev_ema_decay * self.ev_ma + (1.0 - self.ev_ema_decay) * ev
+                    if self.ev_ma >= 0.6:
+                        self.critic_win_streak += 1
+                    else:
+                        self.critic_win_streak = 0
 
             if self.fixed_expert_enabled:
-                actor_ppo_enabled = _fixed_expert_actor_ppo_enabled(
-                    stage=self.fixed_expert_stage,
-                    require_critic_ready=(
-                        self.expert_require_critic_ready_for_rl
-                    ),
-                    critic_win_streak=self.critic_win_streak,
-                )
+                # The readiness decision is frozen for the whole update.  A
+                # critic becoming ready in minibatch k must not turn PPO on for
+                # minibatch k+1 from the same rollout.
+                actor_ppo_enabled = fixed_actor_ppo_enabled_for_update
             else:
                 teacher_enabled = self.teacher_coef is not None
                 actor_ppo_enabled = _actor_ppo_enabled(
@@ -1480,12 +2251,21 @@ class MMPPO:
             # Determine effective value_loss_coef based on stage
             if not actor_ppo_enabled:
                 # Teacher stage or critic not ready: reduced value coef, no entropy term
-                effective_value_loss_coef = self.teacher_value_loss_coef
+                if self.fixed_expert_enabled:
+                    effective_value_loss_coef = (
+                        self.expert_rl_critic_loss_coef
+                        if self.fixed_expert_stage == "rl"
+                        else self.expert_dagger_value_loss_coef
+                    )
+                    value_loss_name = "fixed-expert stage value loss"
+                else:
+                    effective_value_loss_coef = self.teacher_value_loss_coef
+                    value_loss_name = "teacher value loss"
                 loss = _add_optional_loss(
                     surrogate_loss,
                     value_loss,
                     coefficient=effective_value_loss_coef,
-                    name="teacher value loss",
+                    name=value_loss_name,
                 )
             else:
                 # Hybrid/Student stage with critic ready: normal coefficient
@@ -1853,6 +2633,12 @@ class MMPPO:
         if replay_updates > 0:
             mean_replay_imitation_loss /= replay_updates
 
+        (
+            mean_fixed_sequence_replay_loss,
+            mean_fixed_sequence_replay_actor_grad_norm,
+            fixed_sequence_replay_updates,
+        ) = self._update_fixed_expert_sequence_replay()
+
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
@@ -1926,6 +2712,22 @@ class MMPPO:
             loss_dict["fixed_expert_student_execute_fraction"] = (
                 self._fixed_expert_student_execute_count / total_executed
             )
+            loss_dict["mean_fixed_sequence_replay_loss"] = (
+                mean_fixed_sequence_replay_loss
+            )
+            loss_dict["mean_fixed_sequence_replay_actor_grad_norm"] = (
+                mean_fixed_sequence_replay_actor_grad_norm
+            )
+            loss_dict["fixed_sequence_replay_updates"] = float(
+                fixed_sequence_replay_updates
+            )
+            if self.fixed_expert_sequence_replay is not None:
+                loss_dict["fixed_sequence_replay_size"] = float(
+                    len(self.fixed_expert_sequence_replay)
+                )
+                loss_dict["fixed_sequence_replay_seen"] = float(
+                    self.fixed_expert_sequence_replay.seen_sequences
+                )
         if self.replay_buffer is not None:
             loss_dict["mean_replay_imitation_loss"] = mean_replay_imitation_loss
         if is_mmgpt:

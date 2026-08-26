@@ -3177,8 +3177,15 @@ class MMGPT(nn.Module):
                 masks=masks,
                 memory=memory,
                 unpad_output=unpad_output,
-                compute_aux_loss=True,
-                compute_dreamer_loss=True,
+                # Sequence DAgger replay intentionally optimizes only the
+                # stored expert action label.  Its reset-aligned sequences do
+                # not carry self-supervision targets, so callers must be able
+                # to disable those independent objectives without changing
+                # the ordinary PPO/BC path.
+                compute_aux_loss=kwargs.get("compute_aux_loss", True),
+                compute_dreamer_loss=kwargs.get(
+                    "compute_dreamer_loss", True
+                ),
                 compute_dreamer_reward=self.score_prediction_enabled,
                 episode_ids=kwargs.get("episode_ids"),
                 temporal_phases=kwargs.get("temporal_phases"),

@@ -5,7 +5,12 @@ import torch
 from torch import nn
 from torch.distributions import Normal
 
-from rsl_rl.algorithms.mmppo import MMPPO, _actor_ppo_enabled
+from rsl_rl.algorithms.mmppo import (
+    MMPPO,
+    _actor_ppo_enabled,
+    _fixed_expert_actor_ppo_enabled,
+    _fixed_expert_stage,
+)
 from rsl_rl.modules.actor_critic_mm_gpt import ActorCriticMMGPT
 from rsl_rl.runners.on_policy_runner_mm import (
     OnPolicyRunnerMM,
@@ -45,6 +50,43 @@ def test_teacher_warmup_keeps_critic_readiness_gate():
     )
     assert _actor_ppo_enabled(
         **common, epoch=10, critic_win_streak=3
+    )
+
+
+def test_all65_dagger_schedule_keeps_q1_bc_only_before_rl():
+    schedule = {
+        "bc_only_iterations": 2_000,
+        "dagger_plateau_iterations": (250, 250, 500, 500, 500),
+        "dagger_student_probs": (0.05, 0.2, 0.5, 0.8, 1.0),
+    }
+    assert _fixed_expert_stage(iteration=1_999, **schedule) == (
+        "bc",
+        0.0,
+        -1,
+    )
+    assert _fixed_expert_stage(iteration=2_000, **schedule) == (
+        "dagger",
+        0.05,
+        0,
+    )
+    assert _fixed_expert_stage(iteration=3_999, **schedule) == (
+        "dagger",
+        1.0,
+        4,
+    )
+    assert _fixed_expert_stage(iteration=4_000, **schedule) == (
+        "rl",
+        1.0,
+        -1,
+    )
+    assert not _fixed_expert_actor_ppo_enabled(
+        stage="dagger", require_critic_ready=False, critic_win_streak=100
+    )
+    assert not _fixed_expert_actor_ppo_enabled(
+        stage="rl", require_critic_ready=True, critic_win_streak=2
+    )
+    assert _fixed_expert_actor_ppo_enabled(
+        stage="rl", require_critic_ready=True, critic_win_streak=3
     )
 
 
@@ -135,6 +177,17 @@ def test_sonic_adaptive_statistics_are_checkpointed_backward_compatibly():
     assert '"sonic_adaptive_sampler_state_dict"' in save_source
     assert "sonic_adaptive_state_dict" in save_source
     assert "_restore_sonic_adaptive_sampler_state" in load_source
+
+
+def test_fixed_expert_resume_advances_past_completed_iteration():
+    save_source = inspect.getsource(OnPolicyRunnerMM.save)
+    load_source = inspect.getsource(OnPolicyRunnerMM.load)
+
+    assert '"next_iter": self.current_learning_iteration + 1' in save_source
+    assert 'getattr(self.alg, "fixed_expert_enabled", False)' in load_source
+    assert 'int(loaded_dict["iter"]) + 1' in load_source
+    assert '"expert_freeze_loaded_normalization"' in load_source
+    assert "normalizer.eval()" in load_source
 
 
 class _SamplerStateEnv:
@@ -559,6 +612,179 @@ def test_streaming_fixed_expert_bc_updates_student_without_ppo(capsys):
         for parameter in group["params"]
     }
     assert id(fixed_teacher.anchor) not in optimizer_parameter_ids
+
+
+def test_streaming_fixed_expert_dagger_tracks_execution_and_replays_sequences(
+    capsys,
+):
+    torch.manual_seed(112)
+    terms = {
+        "joint_pos": 2,
+        "joint_vel": 2,
+        "projected_gravity": 3,
+        "base_lin_vel": 3,
+        "base_ang_vel": 3,
+        "actions": 2,
+    }
+    reference_terms = {"target_actions": 2}
+    obs_dim = sum(terms.values())
+    actor_critic = ActorCriticMMGPT(
+        num_actor_obs=obs_dim,
+        num_actor_ref_obs=2,
+        num_critic_obs=obs_dim,
+        num_critic_ref_obs=2,
+        num_actions=2,
+        term_dict={"policy": terms, "critic": terms},
+        ref_term_dict={
+            "policy": reference_terms,
+            "critic": reference_terms,
+        },
+        ref_term_steps={"policy": None, "critic": None},
+        concatenate_term_names={"policy": None, "critic": None},
+        concatenate_ref_term_names={"policy": None, "critic": None},
+        pred_obs_term_names=None,
+        pred_obs_term_weights=None,
+        dim_model=16,
+        num_heads=2,
+        num_layers=1,
+        num_steps_per_env=3,
+        max_seq_len=3,
+        critic_history_length=1,
+        critic_hidden_dims=[32, 16],
+        critic_fusion_mode="direct_concat",
+        apply_rope=True,
+        latest_reference_only=False,
+        streaming_kv_cache=True,
+        streaming_sequence_training=True,
+        streaming_context_steps=3,
+        ttt_memory_enabled=True,
+        ttt_num_heads=2,
+        ttt_memory_horizon_steps=3,
+        default_joint_pos=torch.zeros(2),
+    )
+    fixed_teacher = _ConstantFixedTeacher(action_dim=2, value=0.75)
+    algorithm = MMPPO(
+        actor_critic,
+        fixed_teacher=fixed_teacher,
+        expert_bc_loss_coef=1.0,
+        expert_bc_only_iterations=0,
+        expert_dagger_plateau_iterations=[10],
+        expert_dagger_student_probs=[0.5],
+        expert_recovery_steps=0,
+        expert_dagger_value_loss_coef=0.0,
+        expert_sequence_replay_capacity=8,
+        expert_sequence_replay_batch_size=4,
+        expert_sequence_replay_epochs=1,
+        num_learning_epochs=1,
+        num_mini_batches=2,
+        learning_rate=1.0e-3,
+        schedule="fixed",
+        teacher_coef=None,
+        teacher_loss_coef=None,
+        normalize_advantage_per_mini_batch=True,
+        aux_loss_coef=0.0,
+        dreamer_loss_coef=0.0,
+        device="cpu",
+    )
+    algorithm.set_training_iteration(0)
+    num_envs, rollout_steps = 4, 4
+    algorithm.init_storage(
+        "rl",
+        num_envs=num_envs,
+        num_transitions_per_env=rollout_steps,
+        actor_obs_shape=(obs_dim,),
+        actor_ref_obs_shape=(2,),
+        critic_obs_shape=(obs_dim,),
+        critic_ref_obs_shape=(2,),
+        action_shape=(2,),
+        store_raw_observations=True,
+    )
+
+    observations = torch.randn(num_envs, obs_dim)
+    for step in range(rollout_steps):
+        reference_tuple = (
+            torch.randn(num_envs, 2),
+            torch.ones(num_envs, dtype=torch.bool),
+        )
+        algorithm.act(
+            observations,
+            reference_tuple,
+            observations,
+            reference_tuple,
+            raw_obs=observations,
+            raw_ref_obs=reference_tuple,
+        )
+        dones = torch.full(
+            (num_envs,), step == rollout_steps - 1, dtype=torch.bool
+        )
+        algorithm.process_env_step(torch.ones(num_envs), dones, {})
+        observations = torch.randn_like(observations)
+
+    source = algorithm.storage.executed_by_student
+    torch.testing.assert_close(
+        algorithm.storage.executed_actions[source],
+        algorithm.storage.actions[source],
+    )
+    torch.testing.assert_close(
+        algorithm.storage.executed_actions[~source],
+        torch.full_like(algorithm.storage.executed_actions[~source], 0.75),
+    )
+    final_reference = (
+        torch.randn(num_envs, 2),
+        torch.ones(num_envs, dtype=torch.bool),
+    )
+    algorithm.compute_returns(observations, final_reference)
+    metrics = algorithm.update(epoch=0)
+    capsys.readouterr()
+
+    assert metrics["fixed_expert_stage"] == 1.0
+    assert metrics["actor_ppo_update_fraction"] == 0.0
+    assert metrics["fixed_sequence_replay_updates"] == 1.0
+    # The explicit horizon reset at step three closes one sequence and the
+    # terminal transition closes the next, yielding two exact segments/env.
+    assert metrics["fixed_sequence_replay_size"] == 2 * num_envs
+    assert metrics["mean_fixed_sequence_replay_loss"] > 0.0
+    assert metrics["mean_fixed_sequence_replay_actor_grad_norm"] > 0.0
+
+    state = algorithm.fixed_expert_state_dict()
+    assert state is not None
+    replay_state = state["sequence_replay"]
+    assert "active" not in replay_state
+    assert len(replay_state["buffer"]) == 2 * num_envs
+
+
+def test_fixed_expert_rl_fails_closed_on_action_mismatch():
+    actor_critic = _TinyActorCritic()
+    algorithm = MMPPO(
+        actor_critic,
+        teacher_coef=None,
+        teacher_loss_coef=None,
+        device="cpu",
+    )
+    algorithm.init_storage(
+        "rl",
+        num_envs=2,
+        num_transitions_per_env=1,
+        actor_obs_shape=(3,),
+        actor_ref_obs_shape=(None,),
+        critic_obs_shape=(3,),
+        critic_ref_obs_shape=(None,),
+        action_shape=(2,),
+    )
+    # Enable only the read-only validator; act() is not involved in this unit
+    # test and the ordinary constructor correctly restricts real fixed experts
+    # to MMGPT.
+    algorithm.fixed_expert_enabled = True
+    algorithm.fixed_expert_stage = "rl"
+    algorithm.storage.step = 1
+    algorithm.storage.actions.zero_()
+    algorithm.storage.executed_actions.fill_(1.0)
+    algorithm.storage.executed_by_student.fill_(True)
+    algorithm._fixed_expert_student_execute_count = 2
+    algorithm._fixed_expert_total_execute_count = 2
+
+    with pytest.raises(RuntimeError, match="proposals differ"):
+        algorithm._validate_fixed_expert_rollout_contract()
 
 
 def test_ttt_streaming_first_ppo_update_replays_rollout_start_state(capsys):
