@@ -113,6 +113,52 @@ def test_fixed_expert_schedule_never_enables_ppo_before_student_only_rl():
     )
 
 
+def test_fixed_expert_linear_schedule_increases_student_ratio_each_update():
+    common = {
+        "bc_only_iterations": 2_000,
+        "dagger_linear_iterations": 2_000,
+        "dagger_student_start_prob": 0.0,
+        "dagger_student_end_prob": 1.0,
+    }
+    assert _fixed_expert_stage(iteration=1_999, **common) == (
+        "bc",
+        0.0,
+        -1,
+    )
+    assert _fixed_expert_stage(iteration=2_000, **common) == (
+        "dagger",
+        0.0,
+        0,
+    )
+    stage, probability, schedule_index = _fixed_expert_stage(
+        iteration=3_000, **common
+    )
+    assert stage == "dagger"
+    assert probability == pytest.approx(1_000 / 1_999)
+    assert schedule_index == 1_000
+    assert _fixed_expert_stage(iteration=3_999, **common) == (
+        "dagger",
+        1.0,
+        1_999,
+    )
+    assert _fixed_expert_stage(iteration=4_000, **common) == (
+        "rl",
+        1.0,
+        -1,
+    )
+
+
+def test_fixed_expert_linear_and_plateau_schedules_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _fixed_expert_stage(
+            iteration=0,
+            bc_only_iterations=0,
+            dagger_plateau_iterations=(1,),
+            dagger_student_probs=(0.1,),
+            dagger_linear_iterations=2,
+        )
+
+
 def test_fixed_expert_bc_target_is_detached_but_student_receives_gradient():
     student = torch.tensor([[1.0, 2.0]], requires_grad=True)
     expert = torch.tensor([[0.0, 0.0]], requires_grad=True)

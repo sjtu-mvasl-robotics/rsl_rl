@@ -53,7 +53,7 @@ def test_teacher_warmup_keeps_critic_readiness_gate():
     )
 
 
-def test_all65_dagger_schedule_keeps_q1_bc_only_before_rl():
+def test_legacy_all65_dagger_plateau_schedule_remains_reproducible():
     schedule = {
         "bc_only_iterations": 2_000,
         "dagger_plateau_iterations": (250, 250, 500, 500, 500),
@@ -87,6 +87,35 @@ def test_all65_dagger_schedule_keeps_q1_bc_only_before_rl():
     )
     assert _fixed_expert_actor_ppo_enabled(
         stage="rl", require_critic_ready=True, critic_win_streak=3
+    )
+
+
+def test_all65_linear_dagger_schedule_reaches_q1_only_on_final_bc_update():
+    schedule = {
+        "bc_only_iterations": 2_000,
+        "dagger_linear_iterations": 2_000,
+        "dagger_student_start_prob": 0.0,
+        "dagger_student_end_prob": 1.0,
+    }
+    expected = {
+        2_000: 0.0,
+        2_100: 100 / 1_999,
+        2_400: 400 / 1_999,
+        3_000: 1_000 / 1_999,
+        3_600: 1_600 / 1_999,
+        3_999: 1.0,
+    }
+    for iteration, probability in expected.items():
+        stage, actual, schedule_index = _fixed_expert_stage(
+            iteration=iteration, **schedule
+        )
+        assert stage == "dagger"
+        assert actual == pytest.approx(probability)
+        assert schedule_index == iteration - 2_000
+    assert _fixed_expert_stage(iteration=4_000, **schedule) == (
+        "rl",
+        1.0,
+        -1,
     )
 
 
