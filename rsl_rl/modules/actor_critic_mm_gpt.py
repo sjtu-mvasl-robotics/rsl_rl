@@ -1278,6 +1278,11 @@ class MMGPT(nn.Module):
         self.last_inference_temporal_phase = None
         
         self.aux_loss = 0.0
+        # A value-identical auxiliary graph whose latent is detached.  MMPPO
+        # uses it only to compensate the predictor/FiLM gradients when the
+        # actor-facing auxiliary gradient is normalized.  This keeps the FDM
+        # learning rate independent from the policy-guidance cap.
+        self.aux_head_loss = 0.0
         self.aux_loss_fn = nn.MSELoss()
         self.dreamer_loss = 0.0
         self.dreamer_reward = 0.0
@@ -1297,6 +1302,10 @@ class MMGPT(nn.Module):
     @property
     def auxiliary_loss(self):
         return self.aux_loss
+
+    @property
+    def auxiliary_head_loss(self):
+        return self.aux_head_loss
 
     def _route_future_prediction_latent(self, latent: torch.Tensor) -> torch.Tensor:
         """Apply only the configured future-prediction backbone stop-gradient."""
@@ -1366,15 +1375,15 @@ class MMGPT(nn.Module):
         prediction: torch.Tensor,
         target: torch.Tensor,
         valid_mask: torch.Tensor,
+        *,
+        use_configured_loss: bool = True,
     ) -> torch.Tensor:
         """Mean prediction error over valid transitions/environments only."""
 
         valid_mask = valid_mask.bool()
         if valid_mask.any():
-            return self.aux_loss_fn(
-                prediction[valid_mask],
-                target[valid_mask],
-            )
+            loss_fn = self.aux_loss_fn if use_configured_loss else F.mse_loss
+            return loss_fn(prediction[valid_mask], target[valid_mask])
         # Preserve a differentiable scalar when a batch contains no valid
         # transition (for example, immediately after every environment reset).
         return prediction.sum() * 0.0
@@ -2849,6 +2858,7 @@ class MMGPT(nn.Module):
         
         if compute_aux_loss and self.aux_heads is not None:
             self.aux_loss = 0.0
+            self.aux_head_loss = 0.0
             obs_actions = raw_observations[:, :, self.action_slice[0]:self.action_slice[1]]  # [T_in, B, action_dim]
             obs_actions = obs_actions[1:] # shift 1 step to ensure matching with input
             gamma, beta = self.action_film(obs_actions).chunk(2, dim=-1)  # [T_in-1, B, D] each
@@ -2889,10 +2899,28 @@ class MMGPT(nn.Module):
                     target_shifted,
                     valid_mask,
                 )
-                self.aux_loss += weight * aux_loss_i            
+                self.aux_loss += weight * aux_loss_i
+
+                # Re-evaluate only the light prediction readout with a stopped
+                # policy latent.  Its forward value and its gradients for
+                # ``aux_head``/``action_film`` match ``aux_loss_i`` exactly,
+                # while it has no gradient to the MMGPT policy backbone.
+                # Combining
+                #   scale * aux_loss + (1 - scale) * aux_head_loss
+                # therefore scales only the actor-facing auxiliary gradient.
+                head_only_pred_in = gamma * upsampled_out[:-1].detach() + beta
+                head_only_pred = aux_head(head_only_pred_in)
+                aux_head_loss_i = self._masked_prediction_mse(
+                    head_only_pred,
+                    target_shifted,
+                    valid_mask,
+                    use_configured_loss=False,
+                )
+                self.aux_head_loss += weight * aux_head_loss_i
                 
         else:
             self.aux_loss = 0.0
+            self.aux_head_loss = 0.0
         
         # PPO must reach both the action decoder and the shared MMGPT
         # backbone.  Auxiliary gradient routing is controlled independently
@@ -4087,6 +4115,10 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
     @property
     def actor_aux_loss(self):
         return self.actor.aux_loss
+
+    @property
+    def actor_aux_head_loss(self):
+        return self.actor.auxiliary_head_loss
     
 
     @property

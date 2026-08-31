@@ -885,6 +885,15 @@ class MMPPO:
         # PPO so zero-valued controls retain the exact same network shape.
         aux_loss_coef: float = 1.0,
         dreamer_loss_coef: float = 1.0,
+        # Optional per-objective actor-gradient cap.  The auxiliary predictor
+        # head retains its nominal update; only gradients entering the policy
+        # backbone/action path are balanced against PPO+BC.
+        guidance_grad_norm_enabled: bool = False,
+        guidance_grad_norm_target_ratio: float = 0.25,
+        guidance_grad_norm_min_scale: float = 0.0,
+        guidance_grad_norm_max_scale: float = 1.0,
+        guidance_grad_norm_epsilon: float = 1.0e-8,
+        guidance_grad_norm_update_interval: int = 20,
         # Fixed SONIC expert distillation.  This is intentionally independent
         # of the legacy trainable ``actor_dagger`` path above.
         fixed_teacher: FixedSonicMLPTeacher | None = None,
@@ -1048,6 +1057,85 @@ class MMPPO:
         self.dreamer_loss_coef = float(dreamer_loss_coef)
         if self.aux_loss_coef < 0.0 or self.dreamer_loss_coef < 0.0:
             raise ValueError("MMGPT auxiliary loss coefficients must be non-negative")
+        self.guidance_grad_norm_enabled = bool(guidance_grad_norm_enabled)
+        self.guidance_grad_norm_target_ratio = float(
+            guidance_grad_norm_target_ratio
+        )
+        self.guidance_grad_norm_min_scale = float(
+            guidance_grad_norm_min_scale
+        )
+        self.guidance_grad_norm_max_scale = float(
+            guidance_grad_norm_max_scale
+        )
+        self.guidance_grad_norm_epsilon = float(
+            guidance_grad_norm_epsilon
+        )
+        self.guidance_grad_norm_update_interval = int(
+            guidance_grad_norm_update_interval
+        )
+        if self.guidance_grad_norm_target_ratio <= 0.0:
+            raise ValueError("guidance_grad_norm_target_ratio must be positive")
+        if not (
+            0.0
+            <= self.guidance_grad_norm_min_scale
+            <= self.guidance_grad_norm_max_scale
+            <= 1.0
+        ):
+            raise ValueError(
+                "guidance gradient scales must satisfy 0 <= min <= max <= 1"
+            )
+        if self.guidance_grad_norm_epsilon <= 0.0:
+            raise ValueError("guidance_grad_norm_epsilon must be positive")
+        if self.guidance_grad_norm_update_interval < 1:
+            raise ValueError(
+                "guidance_grad_norm_update_interval must be at least one"
+            )
+        if self.guidance_grad_norm_enabled and self.auto_mix_precision:
+            raise ValueError(
+                "MMGPT guidance gradient normalization currently requires "
+                "auto_mix_precision=False"
+            )
+        if self.guidance_grad_norm_enabled and not isinstance(
+            self.actor_critic, ActorCriticMMGPT
+        ):
+            raise ValueError(
+                "guidance gradient normalization requires ActorCriticMMGPT"
+            )
+
+        self._guidance_grad_norm_step = 0
+        self._guidance_grad_norm_cache = {
+            "base": 0.0,
+            "aux": 0.0,
+            "dreamer": 0.0,
+            "aux_scale": 1.0,
+            "dreamer_scale": 1.0,
+        }
+        self._guidance_policy_parameters: tuple[nn.Parameter, ...] = ()
+        if self.guidance_grad_norm_enabled:
+            actor = self.actor_critic.actor
+            predictor_parameter_ids: set[int] = set()
+            for module_name in (
+                "action_film",
+                "aux_heads",
+                "dreamer_reward_head",
+                "dreamer_ref_reward_head",
+            ):
+                module = getattr(actor, module_name, None)
+                if module is not None:
+                    predictor_parameter_ids.update(
+                        id(parameter) for parameter in module.parameters()
+                    )
+            self._guidance_policy_parameters = tuple(
+                parameter
+                for parameter in actor.parameters()
+                if parameter.requires_grad
+                and id(parameter) not in predictor_parameter_ids
+            )
+            if not self._guidance_policy_parameters:
+                raise ValueError(
+                    "MMGPT has no trainable policy parameters for guidance "
+                    "gradient normalization"
+                )
 
         self.fixed_teacher = fixed_teacher
         self.fixed_expert_enabled = self.fixed_teacher is not None
@@ -1981,6 +2069,136 @@ class MMPPO:
                 raise ValueError("sequence replay checkpoint must be a mapping")
             self.fixed_expert_sequence_replay.load_state_dict(replay_state)
 
+    def _guidance_actor_grad_norm(self, loss: torch.Tensor) -> float:
+        """Return a rank-synchronized RMS norm on policy-path parameters."""
+
+        if not torch.is_tensor(loss) or not loss.requires_grad:
+            return 0.0
+        gradients = torch.autograd.grad(
+            loss,
+            self._guidance_policy_parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        squared_norm = torch.zeros((), device=self.device, dtype=torch.float32)
+        for gradient in gradients:
+            if gradient is not None:
+                squared_norm = squared_norm + gradient.detach().float().pow(2).sum()
+        if self.is_multi_gpu:
+            torch.distributed.all_reduce(
+                squared_norm,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+            squared_norm /= self.gpu_world_size
+        return float(squared_norm.sqrt().item())
+
+    def _guidance_actor_scale(
+        self,
+        *,
+        base_grad_norm: float,
+        guidance_grad_norm: float,
+    ) -> float:
+        """Cap one guidance objective at a fraction of PPO+BC actor norm."""
+
+        values = torch.tensor(
+            [base_grad_norm, guidance_grad_norm], dtype=torch.float64
+        )
+        if not bool(torch.isfinite(values).all()):
+            raise FloatingPointError(
+                "non-finite MMGPT guidance gradient norm: "
+                f"base={base_grad_norm}, guidance={guidance_grad_norm}"
+            )
+        if guidance_grad_norm <= self.guidance_grad_norm_epsilon:
+            return 1.0
+        raw_scale = (
+            self.guidance_grad_norm_target_ratio
+            * base_grad_norm
+            / (guidance_grad_norm + self.guidance_grad_norm_epsilon)
+        )
+        return min(
+            self.guidance_grad_norm_max_scale,
+            max(self.guidance_grad_norm_min_scale, raw_scale),
+        )
+
+    def _balanced_mmgpt_guidance(
+        self,
+        *,
+        base_loss: torch.Tensor,
+        weighted_aux_loss: torch.Tensor,
+        weighted_dreamer_loss: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Balance actor guidance while preserving the nominal FDM update."""
+
+        if not self.guidance_grad_norm_enabled:
+            return weighted_aux_loss + weighted_dreamer_loss, {
+                "base": 0.0,
+                "aux": 0.0,
+                "dreamer": 0.0,
+                "aux_scale": 1.0,
+                "dreamer_scale": 1.0,
+            }
+
+        refresh = (
+            self._guidance_grad_norm_step
+            % self.guidance_grad_norm_update_interval
+            == 0
+        )
+        if refresh:
+            base_norm = self._guidance_actor_grad_norm(base_loss)
+            aux_norm = (
+                self._guidance_actor_grad_norm(weighted_aux_loss)
+                if self.aux_loss_coef > 0.0
+                else 0.0
+            )
+            dreamer_norm = (
+                self._guidance_actor_grad_norm(weighted_dreamer_loss)
+                if self.dreamer_loss_coef > 0.0
+                else 0.0
+            )
+            self._guidance_grad_norm_cache = {
+                "base": base_norm,
+                "aux": aux_norm,
+                "dreamer": dreamer_norm,
+                "aux_scale": (
+                    self._guidance_actor_scale(
+                        base_grad_norm=base_norm,
+                        guidance_grad_norm=aux_norm,
+                    )
+                    if self.aux_loss_coef > 0.0
+                    else 1.0
+                ),
+                "dreamer_scale": (
+                    self._guidance_actor_scale(
+                        base_grad_norm=base_norm,
+                        guidance_grad_norm=dreamer_norm,
+                    )
+                    if self.dreamer_loss_coef > 0.0
+                    else 1.0
+                ),
+            }
+        self._guidance_grad_norm_step += 1
+
+        metrics = dict(self._guidance_grad_norm_cache)
+        balanced = base_loss.detach().new_zeros(())
+        if self.aux_loss_coef > 0.0:
+            aux_head_loss = self.actor_critic.actor_aux_head_loss
+            if not torch.is_tensor(aux_head_loss):
+                aux_head_loss = torch.as_tensor(
+                    aux_head_loss,
+                    dtype=weighted_aux_loss.dtype,
+                    device=self.device,
+                )
+            weighted_aux_head_loss = self.aux_loss_coef * aux_head_loss
+            aux_scale = metrics["aux_scale"]
+            balanced = balanced + aux_scale * weighted_aux_loss
+            balanced = balanced + (1.0 - aux_scale) * weighted_aux_head_loss
+        if self.dreamer_loss_coef > 0.0:
+            balanced = (
+                balanced
+                + metrics["dreamer_scale"] * weighted_dreamer_loss
+            )
+        return balanced, metrics
+
     def update(self, epoch=0):
         # Skip controller update if frozen (Stage 1 Planner RL)
         if getattr(self, 'skip_controller_update', False):
@@ -2040,6 +2258,13 @@ class MMPPO:
             mean_dreamer_loss = 0.0
             mean_weighted_aux_loss = 0.0
             mean_weighted_dreamer_loss = 0.0
+            mean_guidance_base_actor_grad_norm = 0.0
+            mean_aux_actor_grad_norm_raw = 0.0
+            mean_dreamer_actor_grad_norm_raw = 0.0
+            mean_aux_actor_grad_scale = 0.0
+            mean_dreamer_actor_grad_scale = 0.0
+            mean_aux_actor_grad_norm_balanced = 0.0
+            mean_dreamer_actor_grad_norm_balanced = 0.0
 
         if self.rnd:
             mean_rnd_loss = 0.0
@@ -2334,7 +2559,6 @@ class MMPPO:
                 weighted_aux_loss = aux_loss.detach().new_zeros(())
                 if self.aux_loss_coef > 0.0:
                     weighted_aux_loss = self.aux_loss_coef * aux_loss
-                    loss = loss + weighted_aux_loss
                 mean_aux_loss += aux_loss.item()
                 mean_weighted_aux_loss += weighted_aux_loss.item()
                 dreamer_loss = self.actor_critic.actor_dreamer_loss
@@ -2345,7 +2569,6 @@ class MMPPO:
                 weighted_dreamer_loss = dreamer_loss.detach().new_zeros(())
                 if self.dreamer_loss_coef > 0.0:
                     weighted_dreamer_loss = self.dreamer_loss_coef * dreamer_loss
-                    loss = loss + weighted_dreamer_loss
                 mean_dreamer_loss += dreamer_loss.item()
                 mean_weighted_dreamer_loss += weighted_dreamer_loss.item()
 
@@ -2461,6 +2684,30 @@ class MMPPO:
                 hybrid_imitation_weight = 2.0 * (self.teacher_loss_coef if self.teacher_loss_coef is not None else 0.1)
                 loss = loss + hybrid_imitation_weight * imitation_loss
             # else: Stage 3 critic-ready, imitation loss applied separately via imitation_optimizer
+
+            if is_mmgpt:
+                guidance_loss, guidance_metrics = (
+                    self._balanced_mmgpt_guidance(
+                        base_loss=loss,
+                        weighted_aux_loss=weighted_aux_loss,
+                        weighted_dreamer_loss=weighted_dreamer_loss,
+                    )
+                )
+                loss = loss + guidance_loss
+                mean_guidance_base_actor_grad_norm += guidance_metrics["base"]
+                mean_aux_actor_grad_norm_raw += guidance_metrics["aux"]
+                mean_dreamer_actor_grad_norm_raw += guidance_metrics["dreamer"]
+                mean_aux_actor_grad_scale += guidance_metrics["aux_scale"]
+                mean_dreamer_actor_grad_scale += guidance_metrics[
+                    "dreamer_scale"
+                ]
+                mean_aux_actor_grad_norm_balanced += (
+                    guidance_metrics["aux"] * guidance_metrics["aux_scale"]
+                )
+                mean_dreamer_actor_grad_norm_balanced += (
+                    guidance_metrics["dreamer"]
+                    * guidance_metrics["dreamer_scale"]
+                )
             
             # Gradient step
             self.optimizer.zero_grad()
@@ -2701,6 +2948,13 @@ class MMPPO:
             mean_dreamer_loss /= num_updates
             mean_weighted_aux_loss /= num_updates
             mean_weighted_dreamer_loss /= num_updates
+            mean_guidance_base_actor_grad_norm /= num_updates
+            mean_aux_actor_grad_norm_raw /= num_updates
+            mean_dreamer_actor_grad_norm_raw /= num_updates
+            mean_aux_actor_grad_scale /= num_updates
+            mean_dreamer_actor_grad_scale /= num_updates
+            mean_aux_actor_grad_norm_balanced /= num_updates
+            mean_dreamer_actor_grad_norm_balanced /= num_updates
         if self.amp:
             mean_amp_loss /= num_updates
             mean_gradient_penalty /= num_updates
@@ -2785,6 +3039,30 @@ class MMPPO:
             loss_dict["mean_weighted_dreamer_loss"] = mean_weighted_dreamer_loss
             loss_dict["aux_loss_coef"] = self.aux_loss_coef
             loss_dict["dreamer_loss_coef"] = self.dreamer_loss_coef
+            loss_dict["guidance_grad_norm_enabled"] = float(
+                self.guidance_grad_norm_enabled
+            )
+            loss_dict["mean_guidance_base_actor_grad_norm"] = (
+                mean_guidance_base_actor_grad_norm
+            )
+            loss_dict["mean_aux_actor_grad_norm_raw"] = (
+                mean_aux_actor_grad_norm_raw
+            )
+            loss_dict["mean_dreamer_actor_grad_norm_raw"] = (
+                mean_dreamer_actor_grad_norm_raw
+            )
+            loss_dict["mean_aux_actor_grad_scale"] = (
+                mean_aux_actor_grad_scale
+            )
+            loss_dict["mean_dreamer_actor_grad_scale"] = (
+                mean_dreamer_actor_grad_scale
+            )
+            loss_dict["mean_aux_actor_grad_norm_balanced"] = (
+                mean_aux_actor_grad_norm_balanced
+            )
+            loss_dict["mean_dreamer_actor_grad_norm_balanced"] = (
+                mean_dreamer_actor_grad_norm_balanced
+            )
         if self.rnd:
             loss_dict["mean_rnd_loss"] = mean_rnd_loss
         if self.symmetry:

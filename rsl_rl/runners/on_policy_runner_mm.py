@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 import statistics
 import time
 import torch
@@ -104,6 +106,7 @@ class OnPolicyRunnerMM:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.metrics_jsonl_path = os.environ.get("GBC_TRAIN_METRICS_JSONL")
 
         self._configure_multi_gpu()
 
@@ -797,6 +800,20 @@ class OnPolicyRunnerMM:
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
+            if self.gpu_global_rank == 0 and self.metrics_jsonl_path:
+                metrics_path = Path(self.metrics_jsonl_path)
+                metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "iteration": int(it),
+                    "collection_time_s": float(collection_time),
+                    "learning_time_s": float(learn_time),
+                    "loss": {
+                        key: float(value)
+                        for key, value in loss_dict.items()
+                    },
+                }
+                with metrics_path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(payload, sort_keys=True) + "\n")
             if self.log_dir is not None and not self.disable_logs:
                 self.log(locals())
                 if it % self.save_interval == 0:

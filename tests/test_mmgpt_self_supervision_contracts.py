@@ -289,6 +289,35 @@ def test_future_prediction_backbone_gradient_is_an_explicit_control(
     assert _grad_norm(model.fc[-1].weight) == 0.0
 
 
+def test_aux_gradient_balance_preserves_fdm_head_and_scales_only_backbone():
+    model = _make_model(aux_backbone_grad=True)
+    _forward(model)
+    scale = 0.2
+    parameters = (
+        _backbone_parameter(model),
+        model.aux_heads[0].weight,
+        model.action_film.weight,
+    )
+
+    nominal_gradients = torch.autograd.grad(
+        model.aux_loss,
+        parameters,
+        retain_graph=True,
+    )
+    balanced_loss = (
+        scale * model.aux_loss
+        + (1.0 - scale) * model.auxiliary_head_loss
+    )
+    balanced_gradients = torch.autograd.grad(balanced_loss, parameters)
+
+    torch.testing.assert_close(balanced_loss, model.aux_loss)
+    torch.testing.assert_close(
+        balanced_gradients[0], scale * nominal_gradients[0]
+    )
+    torch.testing.assert_close(balanced_gradients[1], nominal_gradients[1])
+    torch.testing.assert_close(balanced_gradients[2], nominal_gradients[2])
+
+
 def test_prediction_heads_and_weights_follow_config_term_order():
     term_dict = {
         "gravity_dir": 3,

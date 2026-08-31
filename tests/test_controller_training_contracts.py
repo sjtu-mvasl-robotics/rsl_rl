@@ -409,6 +409,9 @@ def test_streaming_mmgpt_first_ppo_update_changes_backbone(capsys):
         normalize_advantage_per_mini_batch=True,
         aux_loss_coef=1.0,
         dreamer_loss_coef=0.1,
+        guidance_grad_norm_enabled=True,
+        guidance_grad_norm_target_ratio=0.25,
+        guidance_grad_norm_update_interval=1,
         device="cpu",
     )
     num_envs, rollout_steps = 4, 4
@@ -470,6 +473,20 @@ def test_streaming_mmgpt_first_ppo_update_changes_backbone(capsys):
     assert metrics["mean_actor_grad_norm"] > 0.0
     assert metrics["mean_aux_loss"] > 0.0
     assert metrics["mean_dreamer_loss"] > 0.0
+    assert metrics["guidance_grad_norm_enabled"] == 1.0
+    assert metrics["mean_guidance_base_actor_grad_norm"] > 0.0
+    assert metrics["mean_aux_actor_grad_norm_raw"] > 0.0
+    assert metrics["mean_dreamer_actor_grad_norm_raw"] > 0.0
+    assert 0.0 <= metrics["mean_aux_actor_grad_scale"] <= 1.0
+    assert 0.0 <= metrics["mean_dreamer_actor_grad_scale"] <= 1.0
+    assert (
+        metrics["mean_aux_actor_grad_norm_balanced"]
+        <= metrics["mean_aux_actor_grad_norm_raw"] + 1.0e-8
+    )
+    assert (
+        metrics["mean_dreamer_actor_grad_norm_balanced"]
+        <= metrics["mean_dreamer_actor_grad_norm_raw"] + 1.0e-8
+    )
     assert backbone_changed
 
 
