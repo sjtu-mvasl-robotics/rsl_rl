@@ -602,6 +602,12 @@ class TTTKVBLinearMemory(nn.Module):
         return (self.num_heads, self.head_dim, self.head_dim)
 
     @property
+    def state_numel_per_environment(self) -> int:
+        """Number of persistent fast-weight scalars carried by one actor."""
+
+        return self.num_heads * self.head_dim * self.head_dim
+
+    @property
     def inner_lr(self) -> torch.Tensor:
         return self.inner_lr_max * torch.sigmoid(self.inner_lr_logit)
 
@@ -1590,6 +1596,174 @@ class MMGPT(nn.Module):
                 if self.inference_chunk_plan_valid is not None:
                     self.inference_chunk_plan_valid[mask] = False
                 self.last_inference_temporal_phase[mask] = 0
+
+    _INFERENCE_STATE_FIELDS = (
+        "inference_buffer_obs",
+        "inference_buffer_ref_obs",
+        "inference_buffer_ref_obs_mask",
+        "current_timesteps",
+        "inference_kv_cache",
+        "inference_position_ids",
+        "inference_kv_cache_dirty",
+        "inference_chunk_frame_buffer",
+        "inference_chunk_slot_mask",
+        "inference_chunk_phase",
+        "inference_slow_hidden",
+        "inference_slow_valid",
+        "inference_chunk_plan",
+        "inference_chunk_plan_valid",
+        "inference_ttt_state",
+        "inference_ttt_state_is_reset",
+        "inference_ttt_steps_since_reset",
+        "last_inference_ttt_reset_event",
+        "last_inference_temporal_phase",
+    )
+
+    @classmethod
+    def _clone_inference_value(cls, value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {
+                key: cls._clone_inference_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._clone_inference_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._clone_inference_value(item) for item in value)
+        return value
+
+    def snapshot_inference_state(self) -> dict[str, object]:
+        """Clone the complete online actor state for paired interventions.
+
+        The snapshot includes the short K/V context and the persistent TTT
+        fast weights.  Restoring it makes repeated queries start from exactly
+        the same controller state, so an experiment can alter only the memory
+        component under study.
+        """
+
+        return {
+            "num_envs_cache": int(self.num_envs_cache),
+            **{
+                name: self._clone_inference_value(getattr(self, name))
+                for name in self._INFERENCE_STATE_FIELDS
+            },
+        }
+
+    def restore_inference_state(self, snapshot: dict[str, object]) -> None:
+        """Restore a state produced by :meth:`snapshot_inference_state`."""
+
+        if not isinstance(snapshot, dict):
+            raise TypeError("MMGPT inference snapshot must be a dictionary")
+        required = {"num_envs_cache", *self._INFERENCE_STATE_FIELDS}
+        missing = sorted(required.difference(snapshot))
+        if missing:
+            raise ValueError(
+                "MMGPT inference snapshot is missing fields: "
+                + ", ".join(missing)
+            )
+        self.num_envs_cache = int(snapshot["num_envs_cache"])
+        for name in self._INFERENCE_STATE_FIELDS:
+            setattr(
+                self,
+                name,
+                self._clone_inference_value(snapshot[name]),
+            )
+
+    def get_inference_ttt_intervention_state(self) -> dict[str, torch.Tensor]:
+        """Return the persistent TTT state without the short K/V context."""
+
+        if not self.ttt_memory_enabled:
+            raise RuntimeError("TTT memory is disabled")
+        if self.inference_ttt_state is None:
+            raise RuntimeError("TTT inference state is not initialized")
+        return {
+            "fast_weights": self.inference_ttt_state.detach().clone(),
+            "is_reset": self.inference_ttt_state_is_reset.detach().clone(),
+            "steps_since_reset": (
+                self.inference_ttt_steps_since_reset.detach().clone()
+            ),
+        }
+
+    def set_inference_ttt_intervention_state(
+        self,
+        state: dict[str, torch.Tensor],
+    ) -> None:
+        """Replace only persistent TTT memory, preserving reactive context."""
+
+        if not self.ttt_memory_enabled:
+            raise RuntimeError("TTT memory is disabled")
+        if self.inference_ttt_state is None:
+            raise RuntimeError("TTT inference state is not initialized")
+        if not isinstance(state, dict):
+            raise TypeError("TTT intervention state must be a dictionary")
+        required = {"fast_weights", "is_reset", "steps_since_reset"}
+        missing = sorted(required.difference(state))
+        if missing:
+            raise ValueError(
+                "TTT intervention state is missing fields: "
+                + ", ".join(missing)
+            )
+
+        fast_weights = state["fast_weights"]
+        is_reset = state["is_reset"]
+        steps_since_reset = state["steps_since_reset"]
+        if not all(
+            isinstance(value, torch.Tensor)
+            for value in (fast_weights, is_reset, steps_since_reset)
+        ):
+            raise TypeError("all TTT intervention fields must be tensors")
+        self.ttt_memory._validate_state(fast_weights, self.num_envs_cache)
+        expected_rows = (self.num_envs_cache,)
+        if tuple(is_reset.shape) != expected_rows:
+            raise ValueError(
+                f"TTT is_reset must have shape {expected_rows}, got "
+                f"{tuple(is_reset.shape)}"
+            )
+        if tuple(steps_since_reset.shape) != expected_rows:
+            raise ValueError(
+                "TTT steps_since_reset must have shape "
+                f"{expected_rows}, got {tuple(steps_since_reset.shape)}"
+            )
+
+        self.inference_ttt_state.copy_(
+            fast_weights.to(
+                device=self.inference_ttt_state.device,
+                dtype=self.inference_ttt_state.dtype,
+            )
+        )
+        self.inference_ttt_state_is_reset.copy_(
+            is_reset.to(
+                device=self.inference_ttt_state_is_reset.device,
+                dtype=torch.bool,
+            )
+        )
+        self.inference_ttt_steps_since_reset.copy_(
+            steps_since_reset.to(
+                device=self.inference_ttt_steps_since_reset.device,
+                dtype=torch.long,
+            )
+        )
+        self.last_inference_ttt_reset_event.zero_()
+
+    def clear_inference_ttt_intervention_state(self) -> None:
+        """Reset only TTT fast weights while retaining the short context."""
+
+        if not self.ttt_memory_enabled:
+            raise RuntimeError("TTT memory is disabled")
+        if self.inference_ttt_state is None:
+            raise RuntimeError("TTT inference state is not initialized")
+        self.inference_ttt_state.copy_(
+            self.ttt_memory.initial_state(
+                self.num_envs_cache,
+                device=self.inference_ttt_state.device,
+                dtype=self.inference_ttt_state.dtype,
+            ).detach()
+        )
+        self.inference_ttt_state_is_reset.fill_(True)
+        self.inference_ttt_steps_since_reset.zero_()
+        self.last_inference_ttt_reset_event.zero_()
 
     def get_inference_ttt_state(
         self,
@@ -4260,6 +4434,25 @@ class ActorCriticMMGPT(ActorCriticMMTransformer):
         """Expose the finite-horizon reset applied to the latest action."""
 
         return self.actor.get_inference_ttt_reset_event()
+
+    def snapshot_actor_inference_state(self) -> dict[str, object]:
+        return self.actor.snapshot_inference_state()
+
+    def restore_actor_inference_state(
+        self, snapshot: dict[str, object]
+    ) -> None:
+        self.actor.restore_inference_state(snapshot)
+
+    def get_actor_ttt_intervention_state(self) -> dict[str, torch.Tensor]:
+        return self.actor.get_inference_ttt_intervention_state()
+
+    def set_actor_ttt_intervention_state(
+        self, state: dict[str, torch.Tensor]
+    ) -> None:
+        self.actor.set_inference_ttt_intervention_state(state)
+
+    def clear_actor_ttt_intervention_state(self) -> None:
+        self.actor.clear_inference_ttt_intervention_state()
 
     def get_hidden_states(self):
         # TTT uses the optimized rollout-start-only storage path above.  The

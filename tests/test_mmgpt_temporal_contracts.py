@@ -1264,6 +1264,111 @@ def test_ttt_kvb_state_is_per_environment_and_uses_bounded_headwise_blocks():
     torch.testing.assert_close(next_state[1:], changed_state[1:])
 
 
+def test_ttt_late_loss_backpropagates_through_187_writes_until_reset():
+    """A late objective must train early writes, but not cross a reset."""
+
+    torch.manual_seed(129)
+    time_steps = 187
+    memory = TTTKVBLinearMemory(
+        32,
+        4,
+        inner_lr=0.1,
+        gate_init=0.2,
+    )
+    hidden = torch.randn(time_steps, 1, 32, requires_grad=True)
+    masks = torch.ones(time_steps, 1, dtype=torch.bool)
+    fused, _ = memory.forward_sequence(hidden, masks)
+    fused[-1].square().mean().backward()
+
+    assert memory.state_numel_per_environment == 256
+    assert torch.isfinite(hidden.grad).all()
+    assert hidden.grad[0].abs().sum().item() > 0.0
+    assert memory.qkv_proj.weight.grad is not None
+    assert memory.qkv_proj.weight.grad.abs().sum().item() > 0.0
+    assert memory.initial_fast_weights.grad is not None
+    assert memory.initial_fast_weights.grad.abs().sum().item() > 0.0
+
+    reset_memory = copy.deepcopy(memory)
+    reset_memory.zero_grad(set_to_none=True)
+    reset_hidden = hidden.detach().clone().requires_grad_(True)
+    reset_masks = torch.zeros(time_steps, 1, dtype=torch.bool)
+    reset_masks[96] = True
+    reset_fused, _ = reset_memory.forward_sequence(
+        reset_hidden,
+        masks,
+        state_reset_masks=reset_masks,
+    )
+    reset_fused[-1].square().mean().backward()
+
+    torch.testing.assert_close(
+        reset_hidden.grad[:96],
+        torch.zeros_like(reset_hidden.grad[:96]),
+        atol=0.0,
+        rtol=0.0,
+    )
+    assert reset_hidden.grad[96].abs().sum().item() > 0.0
+
+
+def test_ttt_state_clear_and_exchange_change_only_persistent_memory():
+    torch.manual_seed(130)
+    model = _make_ttt_streaming_mmgpt(
+        history_length=4,
+        ttt_gate_init=0.5,
+    )
+    obs_dim = sum(_TERM_DIMS.values())
+    reference_mask = torch.ones(1, dtype=torch.bool)
+
+    def advance(observations, references):
+        with torch.no_grad():
+            for observation, reference in zip(
+                observations, references, strict=True
+            ):
+                model(
+                    observation.unsqueeze(0),
+                    (reference.unsqueeze(0), reference_mask),
+                )
+
+    history_a = torch.randn(6, obs_dim) - 2.0
+    refs_a = torch.randn(6, 2) - 1.0
+    model.get_inference_ttt_state(history_a[0].unsqueeze(0))
+    advance(history_a, refs_a)
+    state_a = model.get_inference_ttt_intervention_state()
+
+    model.reset()
+    history_b = torch.randn(6, obs_dim) + 2.0
+    refs_b = torch.randn(6, 2) + 1.0
+    advance(history_b, refs_b)
+    state_b = model.get_inference_ttt_intervention_state()
+    assert not torch.equal(state_a["fast_weights"], state_b["fast_weights"])
+
+    model.reset()
+    common_history = torch.randn(3, obs_dim)
+    common_refs = torch.randn(3, 2)
+    advance(common_history, common_refs)
+    common_snapshot = model.snapshot_inference_state()
+    query_obs = torch.randn(1, obs_dim)
+    query_ref = (torch.randn(1, 2), reference_mask)
+
+    def paired_action(ttt_state=None, *, clear=False):
+        model.restore_inference_state(common_snapshot)
+        if ttt_state is not None:
+            model.set_inference_ttt_intervention_state(ttt_state)
+        if clear:
+            model.clear_inference_ttt_intervention_state()
+        with torch.no_grad():
+            return model(query_obs, query_ref)
+
+    baseline = paired_action()
+    repeated = paired_action()
+    action_a = paired_action(state_a)
+    action_b = paired_action(state_b)
+    action_clear = paired_action(clear=True)
+
+    torch.testing.assert_close(baseline, repeated, atol=0.0, rtol=0.0)
+    assert torch.linalg.vector_norm(action_a - action_b).item() > 1.0e-8
+    assert torch.linalg.vector_norm(baseline - action_clear).item() > 1.0e-8
+
+
 def test_ttt_streaming_matches_sequence_replay_across_async_resets():
     time_steps = 11
     num_envs = 3

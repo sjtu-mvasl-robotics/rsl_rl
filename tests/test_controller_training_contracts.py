@@ -557,6 +557,9 @@ def test_streaming_fixed_expert_bc_updates_student_without_ppo(capsys):
         expert_bc_only_iterations=10,
         expert_dagger_plateau_iterations=[2],
         expert_dagger_student_probs=[0.25],
+        expert_sequence_replay_capacity=8,
+        expert_sequence_replay_batch_size=4,
+        expert_sequence_replay_epochs=1,
         num_learning_epochs=1,
         num_mini_batches=2,
         learning_rate=1.0e-3,
@@ -646,6 +649,9 @@ def test_streaming_fixed_expert_bc_updates_student_without_ppo(capsys):
     assert metrics["actor_ppo_update_fraction"] == 0.0
     assert metrics["mean_weighted_expert_bc_loss"] > 0.0
     assert metrics["mean_actor_grad_norm"] > 0.0
+    assert metrics["fixed_sequence_replay_updates"] == 1.0
+    assert metrics["fixed_sequence_replay_size"] == 1.0
+    assert metrics["mean_fixed_sequence_replay_actor_grad_norm"] > 0.0
     assert bc_error_after < bc_error_before
     assert any(
         not torch.equal(old, new.detach())
@@ -941,6 +947,9 @@ def test_ttt_streaming_first_ppo_update_replays_rollout_start_state(capsys):
 
     assert metrics["actor_ppo_update_fraction"] == 1.0
     assert metrics["mean_actor_grad_norm"] > 0.0
+    assert metrics["mean_ttt_grad_norm"] > 0.0
+    assert metrics["mean_ttt_parameter_delta_norm"] > 0.0
+    assert metrics["ttt_state_numel_per_environment"] == 128.0
     assert not torch.equal(
         ttt_before, actor_critic.actor.ttt_memory.qkv_proj.weight.detach()
     )

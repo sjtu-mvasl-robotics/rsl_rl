@@ -1665,6 +1665,7 @@ class MMPPO:
         ref_critic_obs,
         raw_obs=None,
         raw_ref_obs=None,
+        expert_ref_obs=None,
         dreamer_target=None,
     ):
         if (
@@ -1719,13 +1720,16 @@ class MMPPO:
         
         # Determine which actions to RETURN (for environment execution) based on current training stage
         if self.fixed_expert_enabled:
-            if raw_obs is None or raw_ref_obs is None:
+            teacher_reference = (
+                raw_ref_obs if expert_ref_obs is None else expert_ref_obs
+            )
+            if raw_obs is None or teacher_reference is None:
                 raise ValueError(
                     "fixed SONIC expert requires raw policy and reference observations"
                 )
             assert self.fixed_teacher is not None
             expert_actions = self.fixed_teacher.act(
-                raw_obs, raw_ref_obs
+                raw_obs, teacher_reference
             ).detach()
             self.transition.dagger_actions = expert_actions
             actions_to_execute = self._select_fixed_expert_actions(
@@ -1913,7 +1917,7 @@ class MMPPO:
         if (
             replay is None
             or self.expert_sequence_replay_epochs == 0
-            or self.fixed_expert_stage not in {"dagger", "rl"}
+            or self.fixed_expert_stage not in {"bc", "dagger", "rl"}
             or not self._sequence_replay_ready()
         ):
             return 0.0, 0.0, 0
@@ -2265,6 +2269,8 @@ class MMPPO:
             mean_dreamer_actor_grad_scale = 0.0
             mean_aux_actor_grad_norm_balanced = 0.0
             mean_dreamer_actor_grad_norm_balanced = 0.0
+            mean_ttt_grad_norm = 0.0
+            mean_ttt_parameter_delta_norm = 0.0
 
         if self.rnd:
             mean_rnd_loss = 0.0
@@ -2833,11 +2839,38 @@ class MMPPO:
             )
             if isinstance(actor_grad_sq_norm, torch.Tensor):
                 mean_actor_grad_norm += actor_grad_sq_norm.sqrt().item()
+            ttt_parameters = []
+            ttt_before_step = []
+            if is_mmgpt and self.actor_critic.actor.ttt_memory is not None:
+                ttt_parameters = list(
+                    self.actor_critic.actor.ttt_memory.parameters()
+                )
+                ttt_grad_sq_norm = sum(
+                    parameter.grad.detach().float().pow(2).sum()
+                    for parameter in ttt_parameters
+                    if parameter.grad is not None
+                )
+                if isinstance(ttt_grad_sq_norm, torch.Tensor):
+                    mean_ttt_grad_norm += ttt_grad_sq_norm.sqrt().item()
+                ttt_before_step = [
+                    parameter.detach().clone()
+                    for parameter in ttt_parameters
+                ]
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             if not self.auto_mix_precision:
                 self.optimizer.step()
             else:
                 self.scaler.step(self.optimizer)
+            if ttt_before_step:
+                ttt_delta_sq_norm = sum(
+                    (parameter.detach() - before).float().pow(2).sum()
+                    for parameter, before in zip(
+                        ttt_parameters, ttt_before_step, strict=True
+                    )
+                )
+                mean_ttt_parameter_delta_norm += (
+                    ttt_delta_sq_norm.sqrt().item()
+                )
 
             if self.amp and ((epoch % self.amp_cfg["amp_update_interval"] == 0) or (epoch < self.amp_cfg["amp_pretrain_steps"])):
                 self.amp_optimizer.step()
@@ -2955,6 +2988,8 @@ class MMPPO:
             mean_dreamer_actor_grad_scale /= num_updates
             mean_aux_actor_grad_norm_balanced /= num_updates
             mean_dreamer_actor_grad_norm_balanced /= num_updates
+            mean_ttt_grad_norm /= num_updates
+            mean_ttt_parameter_delta_norm /= num_updates
         if self.amp:
             mean_amp_loss /= num_updates
             mean_gradient_penalty /= num_updates
@@ -3062,6 +3097,22 @@ class MMPPO:
             )
             loss_dict["mean_dreamer_actor_grad_norm_balanced"] = (
                 mean_dreamer_actor_grad_norm_balanced
+            )
+            ttt_memory = self.actor_critic.actor.ttt_memory
+            loss_dict["ttt_memory_enabled"] = float(ttt_memory is not None)
+            loss_dict["mean_ttt_grad_norm"] = mean_ttt_grad_norm
+            loss_dict["mean_ttt_parameter_delta_norm"] = (
+                mean_ttt_parameter_delta_norm
+            )
+            loss_dict["ttt_state_numel_per_environment"] = float(
+                ttt_memory.state_numel_per_environment
+                if ttt_memory is not None
+                else 0
+            )
+            loss_dict["ttt_slow_parameter_count"] = float(
+                sum(parameter.numel() for parameter in ttt_memory.parameters())
+                if ttt_memory is not None
+                else 0
             )
         if self.rnd:
             loss_dict["mean_rnd_loss"] = mean_rnd_loss
