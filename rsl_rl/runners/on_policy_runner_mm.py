@@ -474,6 +474,11 @@ class OnPolicyRunnerMM:
         # Logging
         self.log_dir = log_dir
         self.writer = None
+        # Keep the selected logger available even when logging is disabled on
+        # a non-zero distributed rank or when ``log_dir`` is intentionally
+        # omitted (for example, a checkpoint-only continuation).  ``save`` is
+        # still called for the final checkpoint in those modes.
+        self.logger_type = str(self.cfg.get("logger", "tensorboard")).lower()
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
@@ -1234,7 +1239,7 @@ class OnPolicyRunnerMM:
         torch.save(saved_dict, path)
 
         # Upload model to external logging service
-        if self.logger_type in ["neptune", "wandb"]:
+        if self.logger_type in ["neptune", "wandb"] and self.writer is not None:
             self.writer.save_model(path, self.current_learning_iteration)
 
     def load(self, path, load_optimizer=True):
