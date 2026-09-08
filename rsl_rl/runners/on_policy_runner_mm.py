@@ -549,7 +549,9 @@ class OnPolicyRunnerMM:
             return None
         group_name = self.fixed_teacher_reference_group
         if group_name == "policy":
-            selected = policy_reference
+            # The wrapper may interrupt only the student's reference tokens.
+            # Raw environment groups remain complete for expert supervision.
+            selected = reference_groups.get("policy", policy_reference)
         else:
             selected = reference_groups.get(group_name)
         if selected is None:
