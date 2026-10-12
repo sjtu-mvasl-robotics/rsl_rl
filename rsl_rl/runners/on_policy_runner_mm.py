@@ -86,6 +86,14 @@ def _restore_sonic_adaptive_sampler_state(env, loaded_dict) -> bool:
     )
     if not callable(adaptive_enabled) or not adaptive_enabled():
         return False
+    if os.environ.get("MMGPT_RESET_EXPANDED_SAMPLER") == "1":
+        previous_count = int(adaptive_state["motion_num_frames"].numel())
+        current_count = len(adaptive_env.ref_observation_manager.files)
+        if previous_count != current_count:
+            if previous_count != 65 or current_count not in (126, 196):
+                raise ValueError(f"unexpected expanded sampler transition: {previous_count}->{current_count}")
+            print(f"[ExpandedDAgger] fresh sampler: {previous_count}->{current_count}; model/optimizer resume unchanged", flush=True)
+            return False
     load_adaptive_state = getattr(
         adaptive_env, "load_sonic_adaptive_state_dict", None
     )
