@@ -1,0 +1,14 @@
+{
+  "source_path": "/cpfs/user/yaoyifei/codespace/gbc/GBC/dependencies/rsl_rl",
+  "common": "/cpfs/user/yaoyifei/codespace/gbc/GBC/.git/modules/dependencies/rsl_rl",
+  "bundle_sha256": "80e9f647a4dcd07c4dc92eaaf8142a731a53115bc3bb296f37a8fb25cb47c2d9",
+  "bundle_bytes": 334856,
+  "parts": [
+    {
+      "name": "repository.bundle.part0000",
+      "bytes": 334856,
+      "sha256": "80e9f647a4dcd07c4dc92eaaf8142a731a53115bc3bb296f37a8fb25cb47c2d9"
+    }
+  ],
+  "note": "Includes all refs and reflog-reachable history. Git LFS payloads and worktree modifications are separate."
+}
