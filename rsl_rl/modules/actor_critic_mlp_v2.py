@@ -1,0 +1,1096 @@
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Multi-Modal MLP V2 with term_dict support and HistoryEncoder
+# Created by Yifei Yao (with AI assistance), 2025
+
+from __future__ import annotations
+from regex import B
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+from typing import Optional, Tuple
+
+class NoPooling(nn.Module):
+    """No pooling layer - identity"""
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        '''x.shape: (B, C, T)'''
+        B = x.shape[0]
+        x = x.reshape(B, -1, 1) # (B, C*T, 1)
+        return x
+
+class TemporalFeatureEncoder(nn.Module):
+    """
+    Temporal feature encoder for MLP with history observations.
+    
+    Process flow:
+    1. Split obs by terms: [a1,a2,a3,a4, b1,b2,b3,b4, ...] -> separate terms
+    2. Reshape each term: term.view(B, T, per_step_dim)
+    3. Compress if per_step_dim > threshold: Linear projection to latent_dim
+    4. Concatenate all terms: (B, T, total_per_step_dim)
+    5. Conv1D to compress temporal dimension: (B, total_per_step_dim, T) -> (B, total_per_step_dim, 1) -> (B, total_per_step_dim)
+    
+    Note: Conv1D only compresses the temporal dimension (T), not the feature dimension.
+          Output dimension = total_per_step_dim (sum of per-step dims after compression)
+    """
+    def __init__(
+        self,
+        term_dims: list[int],
+        term_names: list[str],
+        history_length: int,
+        latent_dim: int = 32,
+        compress_threshold: int = 32,
+        activation: str = "elu",
+        reorgnize_obs: bool = False,
+        no_pooling: bool = True,
+    ):
+        """
+        Args:
+            term_dims: List of dimensions for each term (e.g., [12, 12, 4])
+            term_names: List of term names (for debugging)
+            history_length: Length of history sequence
+            latent_dim: Latent dimension for large per-step features
+            compress_threshold: If per_step_dim > this, project to latent_dim
+            activation: Activation function
+        """
+        super().__init__()
+        
+        self.term_dims = term_dims
+        self.term_names = term_names
+        self.history_length = history_length
+        self.latent_dim = latent_dim
+        self.compress_threshold = compress_threshold
+        self.reorgnize_obs = reorgnize_obs
+        
+        # Build projection list (only register nn.Linear when needed)
+        self.projection_indices = []  # Which terms need projection
+        projection_layers = []
+        self.has_history = []
+        self.per_step_dims = []
+        
+        total_per_step_dim = 0
+        
+        for i, term_dim in enumerate(term_dims):
+            if history_length > 1 and (term_dim % history_length == 0 or reorgnize_obs):
+                # This term has history
+                per_step_dim = term_dim // history_length if not reorgnize_obs else term_dim
+                self.has_history.append(True)
+                
+                # Only create projection if needed
+                if per_step_dim > compress_threshold:
+                    projection_layers.append(nn.Linear(per_step_dim, latent_dim))
+                    self.projection_indices.append(i)
+                    self.per_step_dims.append(latent_dim)
+                    total_per_step_dim += latent_dim
+                else:
+                    self.per_step_dims.append(per_step_dim)
+                    total_per_step_dim += per_step_dim
+            else:
+                # No history
+                self.has_history.append(False)
+                self.per_step_dims.append(0)
+        
+        # Register projections as ModuleList (only actual nn.Linear layers)
+        if projection_layers:
+            self.projections = nn.ModuleList(projection_layers)
+        else:
+            self.projections = nn.ModuleList()
+        
+        # Store output dimension (total per-step dim after compression)
+        self.output_dim = total_per_step_dim if not no_pooling else total_per_step_dim * self.history_length
+        
+        # Conv1D for temporal compression
+        # Input: (B, total_per_step_dim, T)
+        # Output: (B, total_per_step_dim, 1) after pool -> (B, total_per_step_dim)
+        # Conv only compresses temporal dimension, keeps feature dimension unchanged
+        if total_per_step_dim > 0:
+            # Conv1D to process temporal sequence
+            # Keep channel size same as input
+            self.temporal_conv = nn.Conv1d(
+                in_channels=total_per_step_dim,
+                out_channels=total_per_step_dim,  # Keep same channel size
+                kernel_size=3,
+                padding=1
+            ) # compress ratio: kernel 3, padding 1 -> T stays the same
+            # self.pool = nn.AdaptiveAvgPool1d(1)
+            if no_pooling:
+                self.pool = NoPooling()
+            else:
+                self.pool = nn.AdaptiveAvgPool1d(1)
+                
+            
+            # Activation function
+            activations = {
+                "elu": nn.ELU(),
+                "relu": nn.ReLU(),
+                "gelu": nn.GELU(),
+                "tanh": nn.Tanh(),
+                "silu": nn.SiLU(),
+            }
+            self.activation = activations.get(activation.lower(), nn.ELU())
+        else:
+            self.temporal_conv = None
+    
+    def forward(self, obs: torch.Tensor):
+        """
+        Args:
+            obs: (B, total_obs_dim) in IsaacLab format [a1,a2,a3,a4, b1,b2,b3,b4, ...]
+        
+        Returns:
+            encoded: (B, output_dim) - temporally compressed features
+        """
+        B = obs.shape[0]
+        
+        if self.temporal_conv is None:
+            # No history terms, return empty
+            return torch.zeros(B, self.output_dim, device=obs.device, dtype=obs.dtype)
+        
+        # Split observations by term and process each
+        temporal_features = []  # List of (B, T, d) tensors
+        start = 0
+        proj_idx = 0
+        
+        for i, term_dim in enumerate(self.term_dims):
+            term_obs = obs[..., start:start+term_dim]  # (B, term_dim)
+            start += term_dim
+            
+            if not self.has_history[i]:
+                continue  # Skip non-history terms
+            
+            # Reshape: (B, term_dim) -> (B, T, per_step_dim)
+            per_step_dim = term_dim // self.history_length if not self.reorgnize_obs else term_dim
+            feature = term_obs.view(B, self.history_length, per_step_dim)  # (B, T, d)
+            
+            # Compress if needed
+            if i in self.projection_indices:
+                feature = self.projections[proj_idx](feature)  # (B, T, latent_dim)
+                proj_idx += 1
+            
+            temporal_features.append(feature)
+        
+        # Concatenate all temporal features: (B, T, total_per_step_dim)
+        if not temporal_features:
+            return torch.zeros(B, self.output_dim, device=obs.device, dtype=obs.dtype)
+        
+        feature_group = torch.cat(temporal_features, dim=-1)  # (B, T, total_per_step_dim)
+        
+        # Conv1D expects (B, C, T), so transpose
+        feature_group = feature_group.transpose(1, 2)  # (B, total_per_step_dim, T)
+        
+        # Temporal convolution
+        conv_out = self.activation(self.temporal_conv(feature_group))  # (B, output_dim, T)
+        
+        # Pool over time dimension
+        pooled = self.pool(conv_out).squeeze(-1)  # (B, output_dim)
+        
+        return pooled
+
+
+class MultiModalMLPV2(nn.Module):
+    """
+    Multi-Modal MLP V2 that processes observations using term_dict structure.
+    
+    Similar to ObservationEmbeddingV2 in MMTransformer, but outputs to MLP hidden layers
+    instead of transformer tokens.
+    
+    Key features:
+    - Processes each term separately
+    - Uses HistoryEncoder for terms with history_length > 1
+    - Concatenates all processed terms before feeding to main MLP
+    """
+    
+    def __init__(
+        self,
+        term_dict: dict[str, dict[str, int]],
+        output_size: int,
+        hidden_dims: list[int] = [512, 256, 128],
+        activation: str = "elu",
+        history_length: int = 1,
+        encoder_latent_dim: int = 128,
+        encoder_compress_threshold: int = 32,
+        use_layer_norm: bool = False,
+        reorgnize_obs: bool = False,
+        name: str = "",
+        no_pooling: bool = True,
+    ):
+        """
+        Args:
+            term_dict: Dictionary of observation terms, e.g., 
+                       {"policy": {"base_lin_vel": 30, "base_ang_vel": 30, ...}}
+            output_size: Dimension of output
+            hidden_dims: List of hidden layer dimensions for main MLP
+            activation: Activation function name
+            history_length: Length of history sequence (if terms contain temporal data)
+            encoder_latent_dim: Latent dimension for compressing large per-step features
+            encoder_compress_threshold: Compress per-step features > this to latent_dim
+            use_layer_norm: Whether to use LayerNorm
+            name: Name for debugging
+        """
+        super().__init__()
+        self.name = name
+        self.history_length = history_length
+        self.output_size = output_size
+        
+        # Parse term_dict
+        self.group_key = list(term_dict.keys())[0]
+        self.terms = term_dict[self.group_key]
+        
+        self.term_names = list(self.terms.keys())
+        self.term_dims = list(self.terms.values())
+        self.total_obs_dim = sum(self.term_dims)
+        
+        # Separate history terms from non-history terms
+        self.non_history_dims = []
+        for i, term_dim in enumerate(self.term_dims):
+            if history_length <= 1 or (term_dim % history_length != 0 and not reorgnize_obs):
+                self.non_history_dims.append((i, term_dim))
+        
+        total_non_history = sum(dim for _, dim in self.non_history_dims)
+        
+        # Use unified temporal encoder
+        if history_length > 1:
+            self.temporal_encoder = TemporalFeatureEncoder(
+                term_dims=self.term_dims,
+                term_names=self.term_names,
+                history_length=history_length,
+                latent_dim=encoder_latent_dim,
+                compress_threshold=encoder_compress_threshold,
+                activation=activation,
+                reorgnize_obs=reorgnize_obs,
+                no_pooling=no_pooling,
+            )
+            total_encoded_dim = self.temporal_encoder.output_dim + total_non_history
+        else:
+            # No history: direct pass-through
+            self.temporal_encoder = None
+            total_encoded_dim = self.total_obs_dim
+        
+        # Activation function
+        self.activation = self._get_activation(activation)
+        
+        # Main MLP processes encoded features
+        if hidden_dims:
+            self.main_mlp = self._build_mlp(total_encoded_dim, hidden_dims, use_layer_norm)
+            self.output_layer = nn.Linear(hidden_dims[-1], output_size)
+        else:
+            # No hidden layers, direct projection
+            self.main_mlp = nn.Identity()
+            self.output_layer = nn.Linear(total_encoded_dim, output_size)
+    
+    def _get_activation(self, activation: str):
+        """Get activation function by name"""
+        activations = {
+            "elu": nn.ELU(),
+            "relu": nn.ReLU(),
+            "gelu": nn.GELU(),
+            "tanh": nn.Tanh(),
+            "silu": nn.SiLU(),
+        }
+        if activation.lower() not in activations:
+            raise ValueError(f"Unknown activation: {activation}. Choose from {list(activations.keys())}")
+        return activations[activation.lower()]
+    
+    def _build_mlp(self, input_size: int, hidden_dims: list[int], use_layer_norm: bool):
+        """Build MLP with given dimensions"""
+        layers = []
+        prev_dim = input_size
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(self.activation)
+            prev_dim = hidden_dim
+        
+        return nn.Sequential(*layers)
+    
+    def encode(self, obs: torch.Tensor) -> torch.Tensor:
+        """Encode one flattened observation group without its output head."""
+        if self.temporal_encoder is not None:
+            # Extract temporal features
+            temporal_features = self.temporal_encoder(obs)  # (B, encoder_output_dim)
+            
+            # Extract non-history features
+            non_history_features = []
+            start = 0
+            for i, term_dim in enumerate(self.term_dims):
+                if (i, term_dim) in [(idx, dim) for idx, dim in self.non_history_dims]:
+                    non_history_features.append(obs[:, start:start+term_dim])
+                start += term_dim
+            
+            # Concatenate temporal and non-history
+            if non_history_features:
+                non_history = torch.cat(non_history_features, dim=-1)
+                concatenated = torch.cat([temporal_features, non_history], dim=-1)
+            else:
+                concatenated = temporal_features
+        else:
+            # No history: direct pass-through
+            concatenated = obs
+        
+        return self.main_mlp(concatenated)
+
+    def forward(self, obs: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Encode observations and apply this branch's output head."""
+
+        return self.output_layer(self.encode(obs))
+
+
+class DirectConcatMLP(nn.Module):
+    """Direct MLP over normalized state and reference observations.
+
+    SONIC's critic is a single six-layer MLP over ``critic_obs`` rather than
+    two independent encoders followed by another decoder.  This module keeps
+    the local reference mask explicit while preserving that direct topology.
+    """
+
+    fusion_mode = "direct_concat"
+
+    def __init__(
+        self,
+        term_dict: dict[str, dict[str, int]],
+        ref_term_dict: Optional[dict[str, dict[str, int]]],
+        output_size: int,
+        hidden_dims: list[int],
+        activation: str,
+        use_layer_norm: bool,
+        reference_first: bool = False,
+    ):
+        super().__init__()
+        self.reference_first = reference_first
+        self.fusion_mode = (
+            "direct_concat_ref_first" if reference_first else "direct_concat"
+        )
+        self.state_input_dim = sum(next(iter(term_dict.values())).values())
+        self.reference_input_dim = (
+            sum(next(iter(ref_term_dict.values())).values())
+            if ref_term_dict and next(iter(ref_term_dict.values()))
+            else 0
+        )
+        activations = {
+            "elu": nn.ELU,
+            "relu": nn.ReLU,
+            "gelu": nn.GELU,
+            "tanh": nn.Tanh,
+            "silu": nn.SiLU,
+        }
+        activation_cls = activations.get(activation.lower())
+        if activation_cls is None:
+            raise ValueError(
+                f"Unknown activation: {activation}. "
+                f"Choose from {list(activations)}"
+            )
+
+        layers = []
+        input_dim = self.state_input_dim + self.reference_input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(activation_cls())
+            input_dim = hidden_dim
+        layers.append(nn.Linear(input_dim, output_size))
+        self.network = nn.Sequential(*layers)
+
+    def reset(self, dones: Optional[torch.Tensor] = None):
+        del dones
+
+    def forward(
+        self,
+        observations: torch.Tensor,
+        ref_observations: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del kwargs
+        if self.reference_input_dim == 0:
+            return self.network(observations)
+        if ref_observations is None:
+            reference = observations.new_zeros(
+                observations.shape[0], self.reference_input_dim
+            )
+        else:
+            reference, reference_mask = ref_observations
+            if reference_mask is not None:
+                reference = reference * reference_mask.unsqueeze(-1).to(
+                    reference.dtype
+                )
+        inputs = (
+            torch.cat((reference, observations), dim=-1)
+            if self.reference_first
+            else torch.cat((observations, reference), dim=-1)
+        )
+        return self.network(inputs)
+
+
+class FusedMultiModalMLP(nn.Module):
+    """
+    Wrapper that combines main and ref MultiModalMLPV2 networks.
+    This provides a unified interface similar to MMTransformerV2.
+    """
+    def __init__(
+        self,
+        term_dict: dict[str, dict[str, int]],
+        ref_term_dict: Optional[dict[str, dict[str, int]]],
+        output_size: int,
+        hidden_dims: list[int],
+        activation: str,
+        history_length: int,
+        encoder_latent_dim: int,
+        encoder_compress_threshold: int,
+        use_layer_norm: bool,
+        fusion_mode: str,
+        name: str = "fused_mlp",
+        fuse_activation: bool = False,
+        reorgnize_obs: bool = False,
+        joint_decoder_hidden_dims: Optional[list[int]] = None,
+        reference_history_length: Optional[int] = None,
+        reference_encoder_output_dim: Optional[int] = None,
+        project_reference_features: bool = False,
+    ):
+        super().__init__()
+        self.reorgnize_obs = reorgnize_obs
+        self.history_length = history_length
+        
+        self.fusion_mode = fusion_mode
+        self.fuse_activation = fuse_activation
+        self.reference_history_length = (
+            history_length
+            if reference_history_length is None
+            else reference_history_length
+        )
+        self.reference_encoder_output_dim = reference_encoder_output_dim
+        self.project_reference_features = project_reference_features
+        if project_reference_features and reference_encoder_output_dim is None:
+            raise ValueError(
+                "project_reference_features requires reference_encoder_output_dim"
+            )
+        if (
+            reference_encoder_output_dim is not None
+            and reference_encoder_output_dim <= 0
+        ):
+            raise ValueError("reference_encoder_output_dim must be positive")
+        self.has_ref = ref_term_dict is not None and bool(list(ref_term_dict.values())[0])
+        
+        # Main network
+        self.main_net = MultiModalMLPV2(
+            term_dict=term_dict,
+            output_size=output_size,
+            hidden_dims=hidden_dims,
+            activation=activation,
+            history_length=history_length,
+            encoder_latent_dim=encoder_latent_dim,
+            encoder_compress_threshold=encoder_compress_threshold,
+            use_layer_norm=use_layer_norm,
+            name=f"{name}_main",
+            reorgnize_obs=reorgnize_obs
+        )
+        
+        self.activation = self._get_activation(activation)
+        
+        # Reference network (if available)
+        if self.has_ref:
+            self.ref_net = MultiModalMLPV2(
+                term_dict=ref_term_dict,
+                output_size=(
+                    output_size
+                    if reference_encoder_output_dim is None
+                    else reference_encoder_output_dim
+                ),
+                hidden_dims=hidden_dims,
+                activation=activation,
+                history_length=self.reference_history_length,
+                encoder_latent_dim=encoder_latent_dim,
+                encoder_compress_threshold=encoder_compress_threshold,
+                use_layer_norm=use_layer_norm,
+                name=f"{name}_ref",
+                reorgnize_obs=reorgnize_obs
+            )
+            
+            # Fusion layers
+            if fusion_mode == "gated":
+                self.gate = nn.Sequential(
+                    nn.Linear(output_size * 2, output_size),
+                    nn.Sigmoid()
+                )
+            elif fusion_mode == "concat":
+                self.fusion_proj = nn.Linear(output_size * 2, output_size)
+            elif fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
+                # SONIC conditions its dynamics decoder jointly on encoded
+                # reference tokens and proprioception.  ``joint_decoder``
+                # combines two encoded branches, while
+                # ``sonic_joint_decoder`` keeps normalized proprioception raw
+                # at the fusion boundary, matching SONIC's token_flattened +
+                # proprioception decoder contract more closely.
+                decoder_dims = (
+                    list(joint_decoder_hidden_dims)
+                    if joint_decoder_hidden_dims
+                    else list(hidden_dims)
+                )
+                decoder_layers = []
+                if fusion_mode == "sonic_joint_decoder":
+                    reference_feature_dim = (
+                        reference_encoder_output_dim
+                        if project_reference_features
+                        else hidden_dims[-1]
+                    )
+                    decoder_input_dim = (
+                        self.main_net.total_obs_dim + reference_feature_dim
+                    )
+                else:
+                    decoder_input_dim = hidden_dims[-1] * 2
+                for decoder_dim in decoder_dims:
+                    decoder_layers.append(nn.Linear(decoder_input_dim, decoder_dim))
+                    if use_layer_norm:
+                        decoder_layers.append(nn.LayerNorm(decoder_dim))
+                    decoder_layers.append(self._get_activation(activation))
+                    decoder_input_dim = decoder_dim
+                decoder_layers.append(nn.Linear(decoder_input_dim, output_size))
+                self.joint_decoder = nn.Sequential(*decoder_layers)
+        else:
+            self.ref_net = None
+            
+        self.obs_buffer = None
+        self.ref_obs_buffer = None
+            
+    def reset(self, dones: Optional[torch.Tensor] = None):
+        """Reset any recurrent states if needed (not used here)"""
+        if self.obs_buffer is not None:
+            if dones is not None:
+                mask = (dones == 1)
+                self.obs_buffer[:, mask, :] = 0.0
+                if self.ref_obs_buffer is not None:
+                    self.ref_obs_buffer[:, mask, :] = 0.0
+            else:
+                self.obs_buffer.zero_()
+                if self.ref_obs_buffer is not None:
+                    self.ref_obs_buffer.zero_()
+                
+    def _update_buffer(self, new_obs: torch.Tensor):
+        if self.obs_buffer is None:
+            B = new_obs.shape[0]
+            self.obs_buffer = torch.zeros((self.history_length, B, new_obs.shape[1]),
+                                          device=new_obs.device,
+                                          dtype=new_obs.dtype)
+
+            
+        self.obs_buffer = torch.roll(self.obs_buffer, shifts=-1, dims=0)
+        self.obs_buffer[-1, :, :] = new_obs
+        
+    def _update_ref_buffer(self, new_ref_obs: torch.Tensor):
+        if self.ref_obs_buffer is None:
+            B = new_ref_obs.shape[0]
+            self.ref_obs_buffer = torch.zeros((self.history_length, B, new_ref_obs.shape[1]),
+                                              device=new_ref_obs.device,
+                                              dtype=new_ref_obs.dtype)
+
+            
+        self.ref_obs_buffer = torch.roll(self.ref_obs_buffer, shifts=-1, dims=0)
+        self.ref_obs_buffer[-1, :, :] = new_ref_obs
+        
+            
+    def _get_activation(self, activation: str):
+        """Get activation function by name"""
+        activations = {
+            "elu": nn.ELU(),
+            "relu": nn.ReLU(),
+            "gelu": nn.GELU(),
+            "tanh": nn.Tanh(),
+            "silu": nn.SiLU(),
+        }
+        if activation.lower() not in activations:
+            raise ValueError(f"Unknown activation: {activation}. Choose from {list(activations.keys())}")
+        return activations[activation.lower()]
+    
+    def forward(
+        self,
+        observations: torch.Tensor,
+        ref_observations: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Args:
+            observations: Main observations (B, obs_dim)
+            ref_observations: Optional tuple of (ref_obs, ref_mask)
+                            ref_obs: (B, ref_obs_dim)
+                            ref_mask: (B,) boolean mask
+        
+        Returns:
+            output: (B, output_size)
+        """
+        # special handler to match with mmgpt class
+        if self.reorgnize_obs: # MMGPT mode enabled
+            if len(observations.shape) == 2: # inference mode
+                self._update_buffer(observations)
+                observations = self.obs_buffer.permute(1,0,2)  # (B, history_length, obs_dim)
+                if ref_observations is not None:
+                    ref_obs, ref_mask = ref_observations
+                    self._update_ref_buffer(ref_obs)
+                    ref_observations = (self.ref_obs_buffer.permute(1,0,2), ref_mask)
+            else:
+                observations = observations.permute(1,0,2)  # (B, history_length, obs_dim)
+                ref_observations = None if ref_observations is None else (ref_observations[0].permute(1,0,2), ref_observations[1][-1])
+            
+        
+        
+        if self.fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
+            if self.fusion_mode == "sonic_joint_decoder":
+                # The main branch remains the exact invalid-reference
+                # fallback, but its output head expects encoded features.
+                main_features = observations
+                main_output = self.main_net(observations)
+            else:
+                main_features = self.main_net.encode(observations)
+                main_output = self.main_net.output_layer(main_features)
+        else:
+            main_features = None
+            main_output = self.main_net(observations)
+        
+        if not self.has_ref or ref_observations is None:
+            return main_output
+        
+        ref_obs, ref_mask = ref_observations
+        if self.fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
+            ref_features = (
+                self.ref_net(ref_obs)
+                if self.project_reference_features
+                else self.ref_net.encode(ref_obs)
+            )
+            if ref_mask is not None:
+                ref_mask_expanded = ref_mask.unsqueeze(-1).float()
+                ref_features = ref_features * ref_mask_expanded
+            else:
+                ref_mask_expanded = None
+            fused_output = self.joint_decoder(
+                torch.cat([main_features, ref_features], dim=-1)
+            )
+        else:
+            ref_output = self.ref_net(ref_obs)
+            ref_mask_expanded = (
+                ref_mask.unsqueeze(-1).float() if ref_mask is not None else None
+            )
+        
+        # Fuse main and ref outputs
+        if self.fusion_mode == "gated":
+            gate_input = torch.cat([main_output, ref_output], dim=-1)
+            gate = self.gate(gate_input)
+            fused_output = main_output * (1 - gate) + ref_output * gate
+        elif self.fusion_mode == "add":
+            fused_output = main_output + ref_output
+        elif self.fusion_mode == "concat":
+            concat = torch.cat([main_output, ref_output], dim=-1)
+            fused_output = self.fusion_proj(concat)
+        elif self.fusion_mode in ("joint_decoder", "sonic_joint_decoder"):
+            pass
+        else:
+            raise ValueError(f"Unknown fusion_mode: {self.fusion_mode}")
+
+        if self.fuse_activation:
+            fused_output = self.activation(fused_output)
+
+        # An invalid reference must be an exact main-branch passthrough.  The
+        # old gated implementation zeroed ref_output before computing the gate
+        # and still attenuated main_output by (1 - gate).
+        if ref_mask_expanded is not None:
+            output = (
+                main_output * (1.0 - ref_mask_expanded)
+                + fused_output * ref_mask_expanded
+            )
+        else:
+            output = fused_output
+
+        return output
+
+
+class ActorCriticMLPV2(nn.Module):
+    """
+    Actor-Critic with Multi-Modal MLP V2 architecture.
+    Uses term_dict structure and HistoryEncoder for temporal information.
+    """
+    is_recurrent = False
+    
+    def __init__(
+        self,
+        term_dict: dict[str, dict[str, int]],
+        ref_term_dict: dict[str, dict[str, int]],
+        num_actions: int,
+        actor_hidden_dims: list[int] = [512, 256, 128],
+        critic_hidden_dims: list[int] = [512, 256, 128],
+        activation: str = "elu",
+        init_noise_std: float = 1.0,
+        min_noise_std: Optional[float] = None,
+        max_noise_std: Optional[float] = None,
+        noise_std_type: str = "scalar",
+        history_length: int = 1,
+        encoder_latent_dim: int = 128,
+        encoder_compress_threshold: int = 32,
+        use_layer_norm: bool = False,
+        fusion_mode: str = "gated",  # How to fuse actor obs and ref_obs
+        critic_fusion_mode: Optional[str] = None,
+        joint_decoder_hidden_dims: Optional[list[int]] = None,
+        reference_history_length: Optional[int] = None,
+        reference_encoder_output_dim: Optional[int] = None,
+        project_reference_features: bool = False,
+        load_dagger: bool = False,
+        load_dagger_path: Optional[str] = None,
+        load_actor_path: Optional[str] = None,
+        load_critic_path: Optional[str] = None,
+        **kwargs
+    ):
+        """
+        Args:
+            term_dict: Dictionary of observation terms for actor/critic
+                      e.g., {"policy": {"base_lin_vel": 30, ...}, "critic": {...}}
+            ref_term_dict: Dictionary of reference observation terms
+            num_actions: Number of action dimensions
+            actor_hidden_dims: Hidden layer dimensions for actor
+            critic_hidden_dims: Hidden layer dimensions for critic
+            activation: Activation function
+            init_noise_std: Initial standard deviation for action noise
+            min_noise_std: Optional lower bound applied to sampled-action std
+            max_noise_std: Optional upper bound applied to sampled-action std
+            noise_std_type: "scalar" or "log"
+            history_length: Length of history sequence
+            encoder_latent_dim: Latent dimension for compressing large per-step features
+            encoder_compress_threshold: Compress per-step features > this to latent_dim
+            use_layer_norm: Whether to use LayerNorm
+            fusion_mode: How to fuse main and reference features.  The
+                ``sonic_joint_decoder`` mode encodes the reference and then
+                jointly decodes it with raw normalized proprioception.
+            load_dagger: Whether to load dagger (teacher) model
+            load_dagger_path: Path to dagger model weights
+            load_actor_path: Path to pretrained actor weights
+        """
+        super().__init__()
+        
+        assert not load_dagger or load_dagger_path, \
+            "load_dagger and load_dagger_path must be provided if load_dagger is True"
+        
+        # Extract actor and critic term dicts
+        actor_term_dict = {"policy": term_dict.get("policy", {})}
+        critic_term_dict = {"critic": term_dict.get("critic", term_dict.get("policy", {}))}
+        
+        actor_ref_term_dict = {"policy": ref_term_dict.get("policy", {})} if ref_term_dict else None
+        critic_ref_term_dict = {"critic": ref_term_dict.get("critic", ref_term_dict.get("policy", {}))} if ref_term_dict else None
+        
+        # Actor network (fuses main + ref observations)
+        self.actor = FusedMultiModalMLP(
+            term_dict=actor_term_dict,
+            ref_term_dict=actor_ref_term_dict,
+            output_size=num_actions,
+            hidden_dims=actor_hidden_dims,
+            activation=activation,
+            history_length=history_length,
+            encoder_latent_dim=encoder_latent_dim,
+            encoder_compress_threshold=encoder_compress_threshold,
+            use_layer_norm=use_layer_norm,
+            fusion_mode=fusion_mode,
+            joint_decoder_hidden_dims=joint_decoder_hidden_dims,
+            reference_history_length=reference_history_length,
+            reference_encoder_output_dim=reference_encoder_output_dim,
+            project_reference_features=project_reference_features,
+            name="actor"
+        )
+        
+        # Dagger (teacher) network - only uses main observations, no ref_obs
+        if load_dagger:
+            self.actor_dagger = MultiModalMLPV2(
+                term_dict=actor_term_dict,
+                output_size=num_actions,
+                hidden_dims=actor_hidden_dims,
+                activation=activation,
+                history_length=history_length,
+                encoder_latent_dim=encoder_latent_dim,
+                encoder_compress_threshold=encoder_compress_threshold,
+                use_layer_norm=use_layer_norm,
+                name="actor_dagger"
+            )
+        else:
+            self.actor_dagger = None
+        
+        # SONIC uses a direct critic MLP while its actor encodes commands into
+        # tokens.  Keep the legacy shared fusion mode as the default so old
+        # checkpoints/configs remain loadable.
+        resolved_critic_fusion_mode = critic_fusion_mode or fusion_mode
+        if resolved_critic_fusion_mode in (
+            "direct_concat",
+            "direct_concat_ref_first",
+        ):
+            self.critic = DirectConcatMLP(
+                term_dict=critic_term_dict,
+                ref_term_dict=critic_ref_term_dict,
+                output_size=1,
+                hidden_dims=critic_hidden_dims,
+                activation=activation,
+                use_layer_norm=use_layer_norm,
+                reference_first=(
+                    resolved_critic_fusion_mode == "direct_concat_ref_first"
+                ),
+            )
+        else:
+            self.critic = FusedMultiModalMLP(
+                term_dict=critic_term_dict,
+                ref_term_dict=critic_ref_term_dict,
+                output_size=1,  # Value function outputs single value
+                hidden_dims=critic_hidden_dims,
+                activation=activation,
+                history_length=history_length,
+                encoder_latent_dim=encoder_latent_dim,
+                encoder_compress_threshold=encoder_compress_threshold,
+                use_layer_norm=use_layer_norm,
+                fusion_mode=resolved_critic_fusion_mode,
+                joint_decoder_hidden_dims=joint_decoder_hidden_dims,
+                name="critic"
+            )
+        
+        # Action noise
+        self.noise_std_type = noise_std_type
+        if min_noise_std is not None and min_noise_std <= 0.0:
+            raise ValueError("min_noise_std must be positive when specified")
+        if max_noise_std is not None and max_noise_std <= 0.0:
+            raise ValueError("max_noise_std must be positive when specified")
+        if (
+            min_noise_std is not None
+            and max_noise_std is not None
+            and min_noise_std > max_noise_std
+        ):
+            raise ValueError("min_noise_std cannot exceed max_noise_std")
+        self.min_noise_std = min_noise_std
+        self.max_noise_std = max_noise_std
+        if noise_std_type == "scalar":
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+            if load_dagger:
+                self.std_dagger = nn.Parameter(init_noise_std * torch.ones(num_actions))
+                self.std_dagger.requires_grad = False
+        elif noise_std_type == "log":
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            if load_dagger:
+                self.log_std_dagger = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+                self.log_std_dagger.requires_grad = False
+        else:
+            raise ValueError(f"Unknown standard deviation type: {noise_std_type}. Should be 'scalar' or 'log'")
+        
+        self.distribution = None
+        self.distribution_dagger = None
+        
+        # Load weights if specified
+        if load_dagger:
+            self.load_dagger_weights(load_dagger_path)
+        
+        if load_actor_path:
+            self.load_actor_weights(load_actor_path)
+        if load_critic_path:
+            self.load_critic_weights(load_critic_path)
+        
+        # Disable args validation for speedup
+        Normal.set_default_validate_args(False)
+        
+        print(f"Actor MLP V2: {self.actor}")
+        print(f"Critic MLP V2: {self.critic}")
+        if self.actor_dagger:
+            print(f"Dagger MLP V2: {self.actor_dagger}")
+    
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
+    
+    @property
+    def action_mean(self):
+        return self.distribution.mean
+    
+    @property
+    def action_std(self):
+        return self.distribution.stddev
+    
+    @property
+    def entropy(self):
+        return self.distribution.entropy().sum(dim=-1)
+    
+    @property
+    def action_mean_dagger(self):
+        return self.distribution_dagger.mean
+    
+    @property
+    def action_std_dagger(self):
+        return self.distribution_dagger.stddev
+    
+    @property
+    def entropy_dagger(self):
+        return self.distribution_dagger.entropy().sum(dim=-1)
+    
+    def reset(self, dones=None):
+        pass
+
+    def _clamp_action_std(self, std: torch.Tensor) -> torch.Tensor:
+        if self.min_noise_std is None and self.max_noise_std is None:
+            return std
+        return torch.clamp(
+            std,
+            min=self.min_noise_std,
+            max=self.max_noise_std,
+        )
+    
+    def update_distribution(self, observations, ref_observations=None, **kwargs):
+        """Update action distribution for actor"""
+        mean = self.actor(observations, ref_observations)
+        
+        # Set std
+        if self.noise_std_type == "scalar":
+            std = self.std
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std)
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
+
+        std = self._clamp_action_std(std).expand_as(mean)
+        
+        self.distribution = Normal(mean, std)
+    
+    def update_distribution_dagger(self, observations, ref_observations=None, **kwargs):
+        """Update action distribution for dagger (teacher)"""
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        
+        mean = self.actor_dagger(observations)
+        
+        if self.noise_std_type == "scalar":
+            std = self.std_dagger
+        elif self.noise_std_type == "log":
+            std = torch.exp(self.log_std_dagger)
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}")
+
+        std = self._clamp_action_std(std).expand_as(mean)
+        
+        self.distribution_dagger = Normal(mean, std)
+    
+    def act(self, observations, ref_observations=None, **kwargs):
+        """Sample action from distribution"""
+        self.update_distribution(observations, ref_observations, **kwargs)
+        return self.distribution.sample()
+    
+    def act_dagger(self, observations, ref_observations=None, **kwargs):
+        """Sample action from dagger distribution"""
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        self.update_distribution_dagger(observations, ref_observations, **kwargs)
+        return self.distribution_dagger.sample()
+    
+    def act_inference(self, observations, ref_observations=None, **kwargs):
+        """Get mean action for inference"""
+        return self.actor(observations, ref_observations)
+    
+    def act_dagger_inference(self, observations, ref_observations=None, **kwargs):
+        """Get mean action for dagger inference"""
+        assert self.actor_dagger is not None, "actor_dagger is not initialized"
+        return self.actor_dagger(observations)
+    
+    def evaluate(self, critic_observations, ref_critic_observations=None, **kwargs):
+        """Evaluate value function"""
+        return self.critic(critic_observations, ref_critic_observations)
+    
+    def get_actions_log_prob(self, actions):
+        """Get log probability of actions"""
+        return self.distribution.log_prob(actions).sum(dim=-1)
+    
+    def get_actions_log_prob_dagger(self, actions):
+        """Get log probability of actions from dagger"""
+        return self.distribution_dagger.log_prob(actions).sum(dim=-1)
+    
+    def load_actor_weights(self, path: str):
+        """Load pretrained actor weights"""
+        state_dict = torch.load(path, map_location="cpu")
+        # check for 'actor' in the state_dict keys
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the actor_dagger weights through layer name matching (starting with 'actor')
+        actor_weights = {k[len('actor.'):]: v for k, v in model_state_dict.items() if k.startswith('actor')}
+        critic_weights = {k[len('critic.'):]: v for k, v in model_state_dict.items() if k.startswith('critic')}
+        actor_state_dict = self.actor.state_dict()
+        critic_state_dict = self.critic.state_dict()
+        new_actor_weights = {}
+        new_critic_weights = {}
+        # perform weights checking
+        for k, v in actor_weights.items():
+            if k not in actor_state_dict:
+                print(f"Warning: Key {k} not found in actor state_dict, removing...")
+                continue
+            if actor_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {actor_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_actor_weights[k] = v
+                
+        for k, v in critic_weights.items():
+            if k not in critic_state_dict:
+                print(f"Warning: Key {k} not found in critic state_dict, removing...")
+                continue
+            if critic_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {critic_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_critic_weights[k] = v   
+            
+        actor_weights = new_actor_weights
+        critic_weights = new_critic_weights
+        # perform actor state dict fullfilling
+        for k, v in actor_state_dict.items():
+            if k not in actor_weights:
+                actor_weights[k] = v
+                
+        for k, v in critic_state_dict.items():
+            if k not in critic_weights:
+                critic_weights[k] = v
+        # load the weights
+        # self.actor.load_state_dict(dagger_weights)
+        self.actor.load_state_dict(actor_weights)
+        self.critic.load_state_dict(critic_weights)
+        
+        # load std - NOTE: std is stored inside model_state_dict, not at top level
+        if self.noise_std_type == "scalar" and 'std' in model_state_dict:
+            self.std.data = model_state_dict['std']
+            print(f"Loaded std from checkpoint: {self.std.data[:5]}...")
+        elif self.noise_std_type == "log" and 'log_std' in model_state_dict:
+            self.log_std.data = model_state_dict['log_std']
+            print(f"Loaded log_std from checkpoint: {self.log_std.data[:5]}...")
+        
+        
+        print(f"Loaded actor weights from {path} to actor and critic")
+        
+    def load_critic_weights(self, path: str):
+        """Load pretrained critic weights"""
+        state_dict = torch.load(path, map_location="cpu")
+        # check for 'critic' in the state_dict keys
+        assert 'model_state_dict' in state_dict.keys(), f"Key 'model_state_dict' not found in state_dict keys: {state_dict.keys()}, check if your model is the correct one created by rsl_rl"
+        
+        model_state_dict = state_dict['model_state_dict']
+        # load the critic weights through layer name matching (starting with 'critic')
+        critic_weights = {k[len('critic.'):]: v for k, v in model_state_dict.items() if k.startswith('critic')}
+        critic_state_dict = self.critic.state_dict()
+        new_critic_weights = {}
+        # perform weights checking
+        for k, v in critic_weights.items():
+            if k not in critic_state_dict:
+                print(f"Warning: Key {k} not found in critic state_dict, removing...")
+                continue
+            if critic_state_dict[k].shape != v.shape:
+                print(f"Warning: Shape mismatch for key {k}: {critic_state_dict[k].shape} vs {v.shape}, removing...")
+                continue
+            new_critic_weights[k] = v   
+            
+        critic_weights = new_critic_weights
+        # perform critic state dict fullfilling
+        for k, v in critic_state_dict.items():
+            if k not in critic_weights:
+                critic_weights[k] = v
+        # load the weights
+        self.critic.load_state_dict(critic_weights)
+        print(f"Loaded critic weights from {path} to critic")
+        
+    
+    def load_dagger_weights(self, path: str):
+        """Load dagger (teacher) weights"""
+        # TODO: Implement weight loading
+        print(f"Warning: load_dagger_weights not fully implemented for ActorCriticMLPV2")
+        pass

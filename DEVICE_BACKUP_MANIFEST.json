@@ -1,0 +1,9 @@
+{
+  "source_path": "/cpfs/user/yaoyifei/codespace/gbc/.codex-worktrees/GBC-controller-runtime-sonic-native-effective-recovery-0807/dependencies/rsl_rl",
+  "source_head": "ab747f7ad0f8e4e0d1cd954898fa8e16b9bd147f",
+  "source_branch": "codex/rsl-sonic-native-effective-recovery-0807",
+  "snapshot_utc": "2026-11-26T16:33:12Z",
+  "files": 70,
+  "exclusions": [],
+  "note": "Working tree snapshot. Local history, ignored files and original staged state are tracked separately in the device backup inventory."
+}
