@@ -1,0 +1,14 @@
+{
+  "source_path": "/cpfs/user/yaoyifei/codespace/gbc/.codex-worktrees/GBC-runtime-sparse-ttt-dagger-0902/dependencies/rsl_rl",
+  "common": "/cpfs/user/yaoyifei/codespace/gbc/.codex-worktrees/GBC-runtime-sparse-ttt-dagger-0902/dependencies/rsl_rl/.git",
+  "bundle_sha256": "0b2f6a8e33b158ae9712496067b9066b92c1aaa48426be308a86b75dbb6d32c8",
+  "bundle_bytes": 448029,
+  "parts": [
+    {
+      "name": "repository.bundle.part0000",
+      "bytes": 448029,
+      "sha256": "0b2f6a8e33b158ae9712496067b9066b92c1aaa48426be308a86b75dbb6d32c8"
+    }
+  ],
+  "note": "Includes all refs and reflog-reachable history. Git LFS payloads and worktree modifications are separate."
+}

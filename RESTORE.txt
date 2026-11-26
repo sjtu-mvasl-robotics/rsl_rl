@@ -1,0 +1,6 @@
+cat repository.bundle.part* > repository.bundle
+sha256sum repository.bundle
+git bundle verify repository.bundle
+git clone --mirror repository.bundle restored.git
+
+Compare SHA256 with MANIFEST.json. Worktree snapshots are stored on separate backup branches. Git LFS payloads are not included in a Git bundle.
