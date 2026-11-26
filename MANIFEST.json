@@ -1,0 +1,14 @@
+{
+  "source_path": "/cpfs/user/yaoyifei/codespace/gbc/.claude-worktrees/rsl_rl-official-sonic-1012",
+  "common": "/cpfs/user/yaoyifei/codespace/gbc/.claude-worktrees/rsl_rl-official-sonic-1012/.git",
+  "bundle_sha256": "b016509fe206bbde8bbc1898f4a0b5a664e6eb22c4fc05ca6f98b35db0d30099",
+  "bundle_bytes": 456694,
+  "parts": [
+    {
+      "name": "repository.bundle.part0000",
+      "bytes": 456694,
+      "sha256": "b016509fe206bbde8bbc1898f4a0b5a664e6eb22c4fc05ca6f98b35db0d30099"
+    }
+  ],
+  "note": "Includes all refs and reflog-reachable history. Git LFS payloads and worktree modifications are separate."
+}
