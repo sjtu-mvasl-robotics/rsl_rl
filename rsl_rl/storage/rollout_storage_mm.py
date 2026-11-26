@@ -1,0 +1,1328 @@
+# Copyright (c) 2025, Shanghai Jiao Tong University, MVASL Lab
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+
+from __future__ import annotations
+from calendar import c
+
+import torch
+
+from rsl_rl.utils import split_and_pad_trajectories_front as split_and_pad_trajectories
+
+
+class RolloutStorageMM:
+    class Transition:
+        def __init__(self):
+            self.observations = None
+            self.raw_observations = None
+            self.reference_observations = None
+            self.reference_observations_mask = None
+            self.dreamer_target_observations = None
+            self.dreamer_target_observations_mask = None
+            self.critic_observations = None
+            self.critic_reference_observations = None
+            self.critic_reference_observations_mask = None
+            self.amp_observations = None
+            self.amp_reference_observations = None
+            self.amp_reference_observations_mask = None
+            self.actions = None
+            self.privileged_actions = None
+            self.dagger_actions = None
+            self.rewards = None
+            self.dones = None
+            self.values = None
+            self.actions_log_prob = None
+            self.action_mean = None
+            self.action_sigma = None
+            self.hidden_states = None
+            self.rnd_state = None
+
+        def clear(self):
+            self.__init__()
+
+    def __init__(
+        self,
+        training_type,
+        num_envs,
+        num_transitions_per_env,
+        obs_shape,
+        ref_obs_shape,
+        privileged_obs_shape,
+        privileged_ref_obs_shape,
+        actions_shape,
+        apply_dagger_actions=False,
+        rnd_state_shape=None,
+        amp_cfg=None,
+        device="cpu",
+        actor_history_length=1,
+        critic_history_length=1,
+        raw_obs_shape=None,
+        dreamer_target_shape=None,
+    ):
+        self.training_type = training_type
+        self.device = device
+        self.num_transitions_per_env = num_transitions_per_env
+        self.obs_shape = obs_shape
+        self.ref_obs_shape = ref_obs_shape
+        self.privileged_obs_shape = privileged_obs_shape
+        self.privileged_ref_obs_shape = privileged_ref_obs_shape
+        self.actions_shape = actions_shape
+        self.rnd_state_shape = rnd_state_shape
+        self.amp_cfg = amp_cfg
+        self.actor_history_length = int(actor_history_length)
+        self.critic_history_length = int(critic_history_length)
+        self.raw_obs_shape = raw_obs_shape
+        self.dreamer_target_shape = dreamer_target_shape
+        if self.actor_history_length < 1:
+            raise ValueError("actor_history_length must be at least 1")
+        if self.critic_history_length < 1:
+            raise ValueError("critic_history_length must be at least 1")
+        # backbone_input_dim is the per-timestep observation dim; amp_net input = backbone_input_dim * amp_history_len
+        self.amp_shape = amp_cfg["net_cfg"]["backbone_input_dim"] if amp_cfg is not None else None
+        self.amp_history_length = amp_cfg["net_cfg"]["amp_history_length"] if amp_cfg is not None else None
+     
+        # Core
+        self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        if raw_obs_shape is not None and raw_obs_shape[0] is not None:
+            self.raw_observations = torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                *raw_obs_shape,
+                device=self.device,
+            )
+        else:
+            self.raw_observations = None
+        if dreamer_target_shape is not None and dreamer_target_shape[0] is not None:
+            self.dreamer_target_observations = torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                *dreamer_target_shape,
+                device=self.device,
+            )
+            self.dreamer_target_observations_mask = torch.zeros(
+                num_transitions_per_env,
+                num_envs,
+                device=self.device,
+                dtype=torch.bool,
+            )
+        else:
+            self.dreamer_target_observations = None
+            self.dreamer_target_observations_mask = None
+        if privileged_obs_shape[0] is not None:
+            self.privileged_observations = torch.zeros(
+                num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device
+            )
+        else:
+            self.privileged_observations = None
+        if ref_obs_shape[0] is not None:
+            self.reference_observations = torch.zeros(num_transitions_per_env, num_envs, *ref_obs_shape, device=self.device)
+            self.reference_observations_mask = torch.zeros(num_transitions_per_env, num_envs, device=self.device).bool() # single stage mask shape: (num_envs,) with num_transitions: (num_transitions_per_env, num_envs)
+            if privileged_ref_obs_shape[0] is not None:
+                self.privileged_reference_observations = torch.zeros(
+                    num_transitions_per_env, num_envs, *privileged_ref_obs_shape, device=self.device
+                )
+                self.privileged_reference_observations_mask = torch.zeros(num_transitions_per_env, num_envs, device=self.device).bool()
+            else:
+                self.privileged_reference_observations = None
+                self.privileged_reference_observations_mask = None
+        else:
+            self.reference_observations = None
+            self.reference_observations_mask = None
+            self.privileged_reference_observations = None
+            self.privileged_reference_observations_mask = None
+        
+        # for amp
+        if self.amp_cfg is not None:
+            assert ref_obs_shape[0] is not None, "AMP requires reference observations."
+            self.amp_observations = torch.zeros(num_transitions_per_env, num_envs, self.amp_shape, device=self.device)
+            self.amp_reference_observations = torch.zeros(num_transitions_per_env, num_envs, self.amp_shape, device=self.device)
+            self.amp_reference_observations_mask = torch.zeros(num_transitions_per_env, num_envs, device=self.device).bool()
+        else:
+            self.amp_observations = None
+            self.amp_reference_observations = None
+            self.amp_reference_observations_mask = None
+        
+        self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+        self.dagger_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device) if apply_dagger_actions else None
+
+        if training_type == "distillation":
+            self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+
+        # For PPO
+        if training_type == "rl":
+            self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+            self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+
+        # For RND
+        if rnd_state_shape is not None:
+            self.rnd_state = torch.zeros(num_transitions_per_env, num_envs, *rnd_state_shape, device=self.device)
+
+        self.num_transitions_per_env = num_transitions_per_env
+        self.num_envs = num_envs
+
+        # A rollout boundary is not necessarily an episode boundary. Keep the
+        # raw prefix needed to reconstruct the first history windows of the
+        # next rollout under the current network parameters. Episode boundaries
+        # are applied later from the carried done flags.
+        self._init_history_prefixes()
+
+        # rnn
+        self.saved_hidden_states_a = None
+        self.saved_hidden_states_c = None
+
+        self.step = 0
+
+    def add_transitions(self, transition: Transition):
+        if self.step >= self.num_transitions_per_env:
+            raise AssertionError("Rollout buffer overflow")
+        self.observations[self.step].copy_(transition.observations)
+        if self.raw_observations is not None:
+            if transition.raw_observations is None:
+                raise ValueError("raw observations are required by this rollout storage")
+            self.raw_observations[self.step].copy_(transition.raw_observations)
+        if self.dreamer_target_observations is not None:
+            if (
+                transition.dreamer_target_observations is None
+                or transition.dreamer_target_observations_mask is None
+            ):
+                raise ValueError("external Dreamer targets are required by this rollout storage")
+            self.dreamer_target_observations[self.step].copy_(
+                transition.dreamer_target_observations
+            )
+            self.dreamer_target_observations_mask[self.step].copy_(
+                transition.dreamer_target_observations_mask
+            )
+        if self.privileged_observations is not None:
+            self.privileged_observations[self.step].copy_(transition.critic_observations)
+
+        if self.reference_observations is not None:
+            self.reference_observations[self.step].copy_(transition.reference_observations)
+            self.reference_observations_mask[self.step].copy_(transition.reference_observations_mask)
+            if self.privileged_reference_observations is not None:
+                self.privileged_reference_observations[self.step].copy_(transition.critic_reference_observations)
+                self.privileged_reference_observations_mask[self.step].copy_(transition.critic_reference_observations_mask)
+                
+        if self.dagger_actions is not None:
+            self.dagger_actions[self.step].copy_(transition.dagger_actions)           
+        
+        self.actions[self.step].copy_(transition.actions)
+        self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        self.dones[self.step].copy_(transition.dones.view(-1, 1))
+        if self.training_type == "distillation":
+            self.privileged_actions[self.step].copy_(transition.privileged_actions)
+        if self.training_type == "rl":
+            self.values[self.step].copy_(transition.values)
+            self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
+            self.mu[self.step].copy_(transition.action_mean)
+            self.sigma[self.step].copy_(transition.action_sigma)
+        if self.rnd_state_shape is not None:
+            self.rnd_state[self.step].copy_(transition.rnd_state)
+            
+        if self.amp_cfg is not None:
+            self.amp_observations[self.step].copy_(transition.amp_observations)
+            self.amp_reference_observations[self.step].copy_(transition.amp_reference_observations)
+            self.amp_reference_observations_mask[self.step].copy_(transition.amp_reference_observations_mask)
+        
+        self._save_hidden_states(transition.hidden_states)
+        self.step += 1
+
+    def _save_hidden_states(self, hidden_states):
+        if hidden_states is None or hidden_states == (None, None):
+            return
+        # make a tuple out of GRU hidden state sto match the LSTM format
+        hid_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
+        hid_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
+
+        # initialize if needed
+        if self.saved_hidden_states_a is None:
+            self.saved_hidden_states_a = [
+                torch.zeros(self.observations.shape[0], *hid_a[i].shape, device=self.device) for i in range(len(hid_a))
+            ]
+            self.saved_hidden_states_c = [
+                torch.zeros(self.observations.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))
+            ]
+        # copy the states
+        for i in range(len(hid_a)):
+            self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
+            self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
+
+    def _init_history_prefixes(self):
+        actor_prefix_len = self.actor_history_length - 1
+        critic_prefix_len = self.critic_history_length - 1
+
+        def zeros_like_sequence(sequence, prefix_len, *, dtype=None):
+            if prefix_len == 0 or sequence is None:
+                return None
+            shape = (prefix_len, *sequence.shape[1:])
+            return torch.zeros(
+                shape,
+                device=self.device,
+                dtype=sequence.dtype if dtype is None else dtype,
+            )
+
+        self.actor_history_prefix_observations = zeros_like_sequence(
+            self.observations, actor_prefix_len
+        )
+        self.actor_history_prefix_raw_observations = zeros_like_sequence(
+            self.raw_observations, actor_prefix_len
+        )
+        self.actor_history_prefix_reference_observations = zeros_like_sequence(
+            self.reference_observations, actor_prefix_len
+        )
+        self.actor_history_prefix_reference_masks = zeros_like_sequence(
+            self.reference_observations_mask,
+            actor_prefix_len,
+            dtype=torch.bool,
+        )
+        self.actor_history_prefix_dones = zeros_like_sequence(
+            self.dones, actor_prefix_len
+        )
+        self.actor_history_prefix_valid = (
+            torch.zeros(
+                actor_prefix_len,
+                self.num_envs,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if actor_prefix_len > 0
+            else None
+        )
+
+        critic_observations = (
+            self.privileged_observations
+            if self.privileged_observations is not None
+            else self.observations
+        )
+        critic_reference_observations = (
+            self.privileged_reference_observations
+            if self.privileged_reference_observations is not None
+            else self.reference_observations
+        )
+        critic_reference_masks = (
+            self.privileged_reference_observations_mask
+            if self.privileged_reference_observations_mask is not None
+            else self.reference_observations_mask
+        )
+        self.critic_history_prefix_observations = zeros_like_sequence(
+            critic_observations, critic_prefix_len
+        )
+        self.critic_history_prefix_reference_observations = zeros_like_sequence(
+            critic_reference_observations, critic_prefix_len
+        )
+        self.critic_history_prefix_reference_masks = zeros_like_sequence(
+            critic_reference_masks,
+            critic_prefix_len,
+            dtype=torch.bool,
+        )
+        self.critic_history_prefix_dones = zeros_like_sequence(
+            self.dones, critic_prefix_len
+        )
+        self.critic_history_prefix_valid = (
+            torch.zeros(
+                critic_prefix_len,
+                self.num_envs,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if critic_prefix_len > 0
+            else None
+        )
+
+    @staticmethod
+    def _carry_prefix(prefix, current, num_current):
+        if prefix is None:
+            return
+        if current is None:
+            raise ValueError("cannot carry a history prefix from a missing sequence")
+        combined = torch.cat((prefix, current[:num_current]), dim=0)
+        prefix.copy_(combined[-prefix.shape[0] :])
+
+    def _carry_history_prefixes(self):
+        if self.step == 0:
+            return
+
+        current_valid = torch.ones(
+            self.step,
+            self.num_envs,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        critic_observations = (
+            self.privileged_observations
+            if self.privileged_observations is not None
+            else self.observations
+        )
+        critic_reference_observations = (
+            self.privileged_reference_observations
+            if self.privileged_reference_observations is not None
+            else self.reference_observations
+        )
+        critic_reference_masks = (
+            self.privileged_reference_observations_mask
+            if self.privileged_reference_observations_mask is not None
+            else self.reference_observations_mask
+        )
+
+        for prefix, current in (
+            (self.actor_history_prefix_observations, self.observations),
+            (
+                self.actor_history_prefix_raw_observations,
+                self.raw_observations,
+            ),
+            (
+                self.actor_history_prefix_reference_observations,
+                self.reference_observations,
+            ),
+            (
+                self.actor_history_prefix_reference_masks,
+                self.reference_observations_mask,
+            ),
+            (self.actor_history_prefix_dones, self.dones),
+            (self.actor_history_prefix_valid, current_valid),
+            (self.critic_history_prefix_observations, critic_observations),
+            (
+                self.critic_history_prefix_reference_observations,
+                critic_reference_observations,
+            ),
+            (
+                self.critic_history_prefix_reference_masks,
+                critic_reference_masks,
+            ),
+            (self.critic_history_prefix_dones, self.dones),
+            (self.critic_history_prefix_valid, current_valid),
+        ):
+            if prefix is not None:
+                self._carry_prefix(prefix, current, self.step)
+
+    def clear(self):
+        self._carry_history_prefixes()
+        self.step = 0
+
+    def compute_returns(self, last_values, gamma, lam, normalize_advantage: bool = True):
+        advantage = 0
+        for step in reversed(range(self.num_transitions_per_env)):
+            if step == self.num_transitions_per_env - 1:
+                next_values = last_values
+            else:
+                next_values = self.values[step + 1]
+            next_is_not_terminal = 1.0 - self.dones[step].float()
+            delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
+            advantage = delta + next_is_not_terminal * gamma * lam * advantage
+            self.returns[step] = advantage + self.values[step]
+
+        # Compute and normalize the advantages
+        self.advantages = self.returns - self.values
+        if normalize_advantage:
+            self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+
+    def get_statistics(self):
+        done = self.dones
+        done[-1] = 1
+        flat_dones = done.permute(1, 0, 2).reshape(-1, 1)
+        done_indices = torch.cat(
+            (flat_dones.new_tensor([-1], dtype=torch.int64), flat_dones.nonzero(as_tuple=False)[:, 0])
+        )
+        trajectory_lengths = done_indices[1:] - done_indices[:-1]
+        return trajectory_lengths.float().mean(), self.rewards.mean()
+    
+    def generator(self):
+        if self.training_type != "distillation":
+            raise ValueError("This function is only available for distillation training.")
+
+        for i in range(self.num_transitions_per_env):
+            if self.privileged_observations is not None:
+                privileged_observations = self.privileged_observations[i]
+            else:
+                privileged_observations = self.observations[i]
+
+            if self.privileged_reference_observations is not None:
+                privileged_reference_observations = self.privileged_reference_observations[i]
+                privileged_reference_observations_mask = self.privileged_reference_observations_mask[i]
+                privileged_ref_obs_batch_rtn = (privileged_reference_observations, privileged_reference_observations_mask)
+            else:
+                privileged_ref_obs_batch_rtn = None
+            ref_obs_batch_rtn = (self.reference_observations[i], self.reference_observations_mask[i])
+
+            yield self.observations[i], privileged_observations, ref_obs_batch_rtn, privileged_ref_obs_batch_rtn, self.actions[i], self.privileged_actions[i], self.dones[i]
+
+    def mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        if self.training_type != "rl":
+            raise ValueError("This function is only available for reinforcement learning training.")
+
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+        # indices = torch.arange(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+
+        observations = self.observations.flatten(0, 1)
+        if self.privileged_observations is not None:
+            critic_observations = self.privileged_observations.flatten(0, 1)
+        else:
+            critic_observations = observations
+        
+        if self.reference_observations is not None:
+            reference_observations = self.reference_observations.flatten(0, 1)
+            reference_observations_mask = self.reference_observations_mask.flatten(0, 1)
+            if self.privileged_reference_observations is not None:
+                critic_reference_observations = self.privileged_reference_observations.flatten(0, 1)
+                critic_reference_observations_mask = self.privileged_reference_observations_mask.flatten(0, 1)
+            else:
+                critic_reference_observations = reference_observations
+                critic_reference_observations_mask = reference_observations_mask
+        else:
+            reference_observations = None
+            reference_observations_mask = None
+            critic_reference_observations = None
+            critic_reference_observations_mask = None
+        
+        if self.amp_observations is not None:
+            amp_observations = self.amp_observations.flatten(0, 1)
+            amp_reference_observations = self.amp_reference_observations.flatten(0, 1)
+            amp_reference_observations_mask = self.amp_reference_observations_mask.flatten(0, 1)
+        else:
+            amp_observations = None
+            amp_reference_observations = None
+            amp_reference_observations_mask = None
+
+        actions = self.actions.flatten(0, 1)
+        dagger_actions = self.dagger_actions.flatten(0, 1) if self.dagger_actions is not None else None
+        values = self.values.flatten(0, 1)
+        returns = self.returns.flatten(0, 1)
+        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+        advantages = self.advantages.flatten(0, 1)
+        old_mu = self.mu.flatten(0, 1)
+        old_sigma = self.sigma.flatten(0, 1)
+
+        # For RND
+        if self.rnd_state_shape is not None:
+            rnd_state = self.rnd_state.flatten(0, 1)
+
+        dones_flat = self.dones.flatten(0, 1)
+
+        for epoch in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                end = (i + 1) * mini_batch_size
+                batch_idx = indices[start:end]
+                obs_batch = observations[batch_idx] # shape: (mini_batch_size, num_envs, *obs_shape)
+                ref_obs_batch = reference_observations[batch_idx] if reference_observations is not None else None
+                ref_obs_mask_batch = reference_observations_mask[batch_idx] if reference_observations_mask is not None else None
+                ref_obs_batch_rtn = (ref_obs_batch, ref_obs_mask_batch) if ref_obs_batch is not None else None
+                critic_observations_batch = critic_observations[batch_idx]
+                critic_ref_obs_batch = critic_reference_observations[batch_idx] if critic_reference_observations is not None else None
+                critic_ref_obs_mask_batch = critic_reference_observations_mask[batch_idx] if critic_reference_observations_mask is not None else None
+                critic_ref_obs_batch_rtn = (critic_ref_obs_batch, critic_ref_obs_mask_batch) if critic_ref_obs_batch is not None else None
+                actions_batch = actions[batch_idx]
+                dagger_actions_batch = dagger_actions[batch_idx] if dagger_actions is not None else None
+                target_values_batch = values[batch_idx]
+                returns_batch = returns[batch_idx]
+                old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
+                advantages_batch = advantages[batch_idx]
+                old_mu_batch = old_mu[batch_idx]
+                old_sigma_batch = old_sigma[batch_idx]
+
+                if self.rnd_state_shape is not None:
+                    rnd_state_batch = rnd_state[batch_idx]
+                else:
+                    rnd_state_batch = None
+
+                # AMP history extraction
+                if self.amp_cfg and amp_observations is not None:
+                    amp_history_idx = self._compute_amp_history_indices(
+                        batch_idx, dones_flat
+                    )
+                    amp_obs_history = amp_observations[amp_history_idx]
+                    amp_ref_obs_history = amp_reference_observations[amp_history_idx]
+                    amp_ref_obs_history_mask = amp_reference_observations_mask[amp_history_idx].bool()
+                else:
+                    amp_obs_history = None
+                    amp_ref_obs_history = None
+                    amp_ref_obs_history_mask = None
+
+                yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
+                    None,
+                    None,
+                ), None, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask, None, None
+
+    def _create_obs_buffer_slice(
+        self,
+        obs_sequence,
+        idx,
+        dones_sequence,
+        num_steps_per_env=None,
+        sequence_valid=None,
+    ):
+        """
+        Create a special obs buffer slice for buffer_mini_batch_generator.
+        Optimized version using PyTorch parallel operations instead of loops.
+        
+        Args:
+            obs_sequence: Flattened observation sequence of shape (total_steps, *obs_shape)
+            idx: Current indices tensor of shape (mini_batch_size,)
+            dones_sequence: Flattened dones sequence of shape (total_steps, 1) 
+            num_steps_per_env: Number of steps to look back per environment
+            num_envs: Number of environments
+            sequence_valid: Optional flattened mask marking physically present
+                prefix/current observations.
+            
+        Returns:
+            obs_buffer: Buffer of shape (num_steps_per_env, mini_batch_size, *obs_shape)
+            mask: Mask of shape (num_steps_per_env, mini_batch_size) indicating valid entries
+        """
+        num_steps_per_env = (
+            self.actor_history_length
+            if num_steps_per_env is None
+            else int(num_steps_per_env)
+        )
+        if num_steps_per_env < 1:
+            raise ValueError("num_steps_per_env must be at least 1")
+        num_envs = self.num_envs
+        device = obs_sequence.device
+        
+        # Flatten dones for easier indexing
+        dones_flat = dones_sequence.squeeze(-1) if dones_sequence.dim() > 1 else dones_sequence
+        
+        # Create step offsets for all timesteps: [num_steps_per_env-1, num_steps_per_env-2, ..., 0]
+        step_offsets = torch.arange(num_steps_per_env - 1, -1, -1, device=device)  # [3, 2, 1, 0]
+        
+        # Broadcast to create target indices for all batch samples and all steps
+        # idx: (mini_batch_size,) -> (1, mini_batch_size)
+        # step_offsets: (num_steps_per_env,) -> (num_steps_per_env, 1)
+        # target_indices: (num_steps_per_env, mini_batch_size)
+        idx_expanded = idx.unsqueeze(0)  # (1, mini_batch_size)
+        step_offsets_expanded = step_offsets.unsqueeze(1)  # (num_steps_per_env, 1)
+        target_indices = idx_expanded - step_offsets_expanded * num_envs  # (num_steps_per_env, mini_batch_size)
+        
+        # Create validity mask for indices (True where indices are valid)
+        valid_mask = (target_indices >= 0) & (target_indices < obs_sequence.shape[0])
+        
+        # Clamp indices to valid range to avoid indexing errors
+        clamped_indices = torch.clamp(target_indices, 0, obs_sequence.shape[0] - 1)
+
+        if sequence_valid is not None:
+            sequence_valid = sequence_valid.reshape(-1).bool()
+            if sequence_valid.shape[0] != obs_sequence.shape[0]:
+                raise ValueError(
+                    "sequence_valid must match flattened observation length, "
+                    f"got {sequence_valid.shape[0]} and {obs_sequence.shape[0]}"
+                )
+            valid_mask = valid_mask & sequence_valid[clamped_indices]
+        
+        # Gather observations using advanced indexing
+        # obs_sequence: (total_steps, *obs_shape)
+        # clamped_indices: (num_steps_per_env, mini_batch_size)
+        obs_buffer = obs_sequence[clamped_indices]  # (num_steps_per_env, mini_batch_size, *obs_shape)
+        
+        # Apply done masking
+        # Get dones for all target indices
+        dones_buffer = dones_flat[clamped_indices]  # (num_steps_per_env, mini_batch_size)
+        dones_buffer = dones_buffer * valid_mask  # Zero out invalid entries
+        
+        # Find the latest done position for each batch sample
+        # We need to find the last True value in each column (batch sample)
+        # First, create a mask for done positions
+        done_positions = dones_buffer.bool()  # (num_steps_per_env, mini_batch_size)
+        # dones[t] is observed after taking the action from obs[t]. It cuts the
+        # edge between obs[t] and obs[t + 1], but must not remove obs[t] when
+        # recomputing that transition's own action/log-probability.
+        done_positions[-1] = False
+        
+        # For each batch sample, find the latest done step
+        # We'll use a clever approach: multiply done positions by step indices and take max
+        step_indices = torch.arange(num_steps_per_env, device=device).unsqueeze(1)  # (num_steps_per_env, 1)
+        done_step_indices = torch.where(
+            done_positions,
+            step_indices.expand_as(done_positions),
+            -torch.ones_like(done_positions, dtype=torch.long),
+        )
+
+        # Get the latest done step for each batch sample (-1 if no done found)
+        latest_done_steps = done_step_indices.max(dim=0).values
+        
+        # Create done masking
+        # For each batch sample, mask out steps from 0 to latest_done_step (inclusive)
+        step_range = torch.arange(num_steps_per_env, device=device).unsqueeze(1)  # (num_steps_per_env, 1)
+        latest_done_expanded = latest_done_steps.unsqueeze(0)  # (1, mini_batch_size)
+        
+        # Create mask: False where step <= latest_done_step, True otherwise
+        done_mask = step_range > latest_done_expanded  # (num_steps_per_env, mini_batch_size)
+        
+        # Combine validity mask and done mask
+        final_mask = valid_mask & done_mask
+
+        # Zero reset-crossing frames before any temporal compressor sees them;
+        # the attention padding mask remains the second line of defense.
+        mask_shape = final_mask.shape + (1,) * (obs_buffer.dim() - 2)
+        obs_buffer = obs_buffer * final_mask.reshape(mask_shape).to(obs_buffer.dtype)
+
+        return obs_buffer, final_mask, clamped_indices, final_mask
+    
+    def _buffer_sample(self, obs_sequence, indices, mask):
+        seq = obs_sequence[indices]  # (num_steps_per_env, mini_batch_size, *obs_shape)
+        mask_shape = mask.shape + (1,) * (seq.dim() - 2)
+        seq = seq * mask.reshape(mask_shape).to(seq.dtype)
+        return seq
+
+    def _compute_amp_history_indices(self, batch_idx, dones_flat):
+        """
+        Compute AMP history indices with episode-boundary (done) clamping.
+
+        Given batch_idx indices into flattened storage, compute history lookback
+        indices of shape [B, H] where H = amp_history_length. Handles:
+        1. Environment boundary clamping (don't cross env boundaries)
+        2. Episode reset (done) clamping (if done found in history, clamp all
+           earlier indices to the first step after the done)
+
+        Example: num_envs=10, H=6, batch_idx=[55] (env=5, timestep=5)
+            raw history:        [5, 15, 25, 35, 45, 55]
+            dones at indices:   [0,  0,  1,  0,  0,  0]
+            after done-clamp:   [35, 35, 35, 35, 45, 55]
+
+        Args:
+            batch_idx: [B] indices into flattened storage
+            dones_flat: [Total, 1] or [Total] flattened dones tensor
+
+        Returns:
+            amp_history_indices: [B, H] long tensor of valid history indices
+        """
+        device = batch_idx.device
+        H = self.amp_history_length
+        B = batch_idx.shape[0]
+
+        if dones_flat.dim() > 1:
+            dones_flat = dones_flat.squeeze(-1)
+
+        # 1. Per-env lower bounds
+        env_lower_bounds = (batch_idx % self.num_envs).unsqueeze(-1)  # [B, 1]
+
+        # 2. Offsets from oldest to newest
+        offsets = torch.arange(H - 1, -1, -1, device=device) * self.num_envs  # [H]
+
+        # 3. Raw history indices
+        amp_history_indices = batch_idx.unsqueeze(-1) - offsets  # [B, H]
+
+        # 4. Clamp to env lower bound
+        amp_history_indices = torch.maximum(amp_history_indices, env_lower_bounds)  # [B, H]
+
+        # 5. Done-handling
+        total_steps = dones_flat.shape[0]
+        safe_indices = amp_history_indices.clamp(0, total_steps - 1)  # [B, H]
+
+        dones_at_history = dones_flat[safe_indices]  # [B, H]
+
+        positions = torch.arange(H, device=device).unsqueeze(0)  # [1, H]
+        done_mask = dones_at_history.bool()  # [B, H]
+
+        done_positions = done_mask.float() * positions.float()  # [B, H]
+        latest_done_pos, _ = done_positions.max(dim=-1)  # [B]
+        has_done = done_mask.any(dim=-1)  # [B]
+        latest_done_pos = torch.where(has_done, latest_done_pos.long(),
+                                       torch.tensor(-1, device=device, dtype=torch.long))  # [B]
+
+        should_clamp = positions.long() <= latest_done_pos.unsqueeze(-1)  # [B, H]
+
+        clamp_pos = (latest_done_pos + 1).clamp(max=H - 1)  # [B]
+        replacement_indices = amp_history_indices[
+            torch.arange(B, device=device), clamp_pos
+        ]  # [B]
+
+        amp_history_indices = torch.where(
+            should_clamp,
+            replacement_indices.unsqueeze(-1).expand_as(amp_history_indices),
+            amp_history_indices
+        )
+
+        return amp_history_indices  # [B, H]
+
+    # for MMGPT (non recurrent)
+    def buffer_mini_batch_generator(self, num_mini_batches, num_epochs=8, num_steps_per_env=None):
+        if self.training_type != "rl":
+            raise ValueError("This function is only available for reinforcement learning training.")
+
+        actor_history_length = (
+            self.actor_history_length
+            if num_steps_per_env is None
+            else int(num_steps_per_env)
+        )
+        if not 1 <= actor_history_length <= self.actor_history_length:
+            raise ValueError(
+                "requested actor history length must be between 1 and the "
+                f"configured {self.actor_history_length}, got {actor_history_length}"
+            )
+        critic_history_length = self.critic_history_length
+
+        def prepend(prefix, current, history_length):
+            prefix_length = history_length - 1
+            if prefix_length == 0:
+                return current
+            if prefix is None or prefix.shape[0] < prefix_length:
+                raise RuntimeError(
+                    f"missing {prefix_length}-step rollout history prefix"
+                )
+            return torch.cat((prefix[-prefix_length:], current), dim=0)
+
+        batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = batch_size // num_mini_batches
+        indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+        # indices = torch.arange(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
+
+        current_valid = torch.ones(
+            self.num_transitions_per_env,
+            self.num_envs,
+            device=self.device,
+            dtype=torch.bool,
+        )
+
+        actor_observation_sequence = prepend(
+            self.actor_history_prefix_observations,
+            self.observations,
+            actor_history_length,
+        )
+        raw_actor_observation_sequence = (
+            prepend(
+                self.actor_history_prefix_raw_observations,
+                self.raw_observations,
+                actor_history_length,
+            )
+            if self.raw_observations is not None
+            else None
+        )
+        actor_done_sequence = prepend(
+            self.actor_history_prefix_dones,
+            self.dones,
+            actor_history_length,
+        )
+        actor_valid_sequence = prepend(
+            self.actor_history_prefix_valid,
+            current_valid,
+            actor_history_length,
+        )
+        observations = actor_observation_sequence.flatten(0, 1)
+        raw_observations = (
+            raw_actor_observation_sequence.flatten(0, 1)
+            if raw_actor_observation_sequence is not None
+            else None
+        )
+        actor_dones_flat = actor_done_sequence.flatten(0, 1)
+        actor_valid_flat = actor_valid_sequence.flatten(0, 1)
+        actor_index_offset = (actor_history_length - 1) * self.num_envs
+
+        if self.privileged_observations is not None:
+            current_critic_observations = self.privileged_observations
+        else:
+            current_critic_observations = self.observations
+
+        critic_observation_sequence = prepend(
+            self.critic_history_prefix_observations,
+            current_critic_observations,
+            critic_history_length,
+        )
+        critic_done_sequence = prepend(
+            self.critic_history_prefix_dones,
+            self.dones,
+            critic_history_length,
+        )
+        critic_valid_sequence = prepend(
+            self.critic_history_prefix_valid,
+            current_valid,
+            critic_history_length,
+        )
+        critic_observations = critic_observation_sequence.flatten(0, 1)
+        critic_dones_flat = critic_done_sequence.flatten(0, 1)
+        critic_valid_flat = critic_valid_sequence.flatten(0, 1)
+        critic_index_offset = (critic_history_length - 1) * self.num_envs
+        
+        if self.reference_observations is not None:
+            reference_observations = prepend(
+                self.actor_history_prefix_reference_observations,
+                self.reference_observations,
+                actor_history_length,
+            ).flatten(0, 1)
+            reference_observations_mask = prepend(
+                self.actor_history_prefix_reference_masks,
+                self.reference_observations_mask,
+                actor_history_length,
+            ).flatten(0, 1)
+            if self.privileged_reference_observations is not None:
+                current_critic_reference_observations = (
+                    self.privileged_reference_observations
+                )
+                current_critic_reference_masks = (
+                    self.privileged_reference_observations_mask
+                )
+            else:
+                current_critic_reference_observations = self.reference_observations
+                current_critic_reference_masks = self.reference_observations_mask
+            critic_reference_observations = prepend(
+                self.critic_history_prefix_reference_observations,
+                current_critic_reference_observations,
+                critic_history_length,
+            ).flatten(0, 1)
+            critic_reference_observations_mask = prepend(
+                self.critic_history_prefix_reference_masks,
+                current_critic_reference_masks,
+                critic_history_length,
+            ).flatten(0, 1)
+        else:
+            reference_observations = None
+            reference_observations_mask = None
+            critic_reference_observations = None
+            critic_reference_observations_mask = None
+        
+        if self.amp_observations is not None:
+            amp_observations = self.amp_observations.flatten(0, 1)
+            amp_reference_observations = self.amp_reference_observations.flatten(0, 1)
+            amp_reference_observations_mask = self.amp_reference_observations_mask.flatten(0, 1)
+        else:
+            amp_observations = None
+            amp_reference_observations = None
+            amp_reference_observations_mask = None
+
+        actions = self.actions.flatten(0, 1)
+        dreamer_target_observations = (
+            self.dreamer_target_observations.flatten(0, 1)
+            if self.dreamer_target_observations is not None
+            else None
+        )
+        dreamer_target_observations_mask = (
+            self.dreamer_target_observations_mask.flatten(0, 1)
+            if self.dreamer_target_observations_mask is not None
+            else None
+        )
+        dagger_actions = self.dagger_actions.flatten(0, 1) if self.dagger_actions is not None else None
+        values = self.values.flatten(0, 1)
+        returns = self.returns.flatten(0, 1)
+        old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+        advantages = self.advantages.flatten(0, 1)
+        old_mu = self.mu.flatten(0, 1)
+        old_sigma = self.sigma.flatten(0, 1)
+
+        # For RND
+        if self.rnd_state_shape is not None:
+            rnd_state = self.rnd_state.flatten(0, 1)
+
+        dones_flat = self.dones.flatten(0, 1)
+
+        for epoch in range(num_epochs):
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                end = (i + 1) * mini_batch_size
+                batch_idx = indices[start:end]
+                actor_batch_idx = batch_idx + actor_index_offset
+                critic_batch_idx = batch_idx + critic_index_offset
+
+                # obs_batch = observations[batch_idx] # shape: (mini_batch_size, num_envs, *obs_shape)
+                obs_batch, masks_batch, clamped_indices, sample_mask = self._create_obs_buffer_slice(
+                    observations,
+                    actor_batch_idx,
+                    actor_dones_flat,
+                    num_steps_per_env=actor_history_length,
+                    sequence_valid=actor_valid_flat,
+                ) # shape: (num_steps_per_env, mini_batch_size, *obs_shape)
+                raw_obs_batch = (
+                    self._buffer_sample(
+                        raw_observations,
+                        clamped_indices,
+                        sample_mask,
+                    )
+                    if raw_observations is not None
+                    else None
+                )
+                # obs_batch: (num_steps_per_env, mini_batch_size, *obs_shape)
+                # ref_obs_batch = reference_observations[batch_idx] if reference_observations is not None else None
+                # ref_obs_batch, _ = self._create_obs_buffer_slice(reference_observations, batch_idx, self.dones.flatten(0, 1)) if reference_observations is not None else (None, None)
+                ref_obs_batch = self._buffer_sample(reference_observations, clamped_indices, sample_mask) if reference_observations is not None else None
+                # ref_obs_mask_batch = reference_observations_mask[batch_idx] if reference_observations_mask is not None else None
+                # ref_obs_mask_batch, _ = self._create_obs_buffer_slice(reference_observations_mask.unsqueeze(-1).float(), batch_idx, self.dones.flatten(0, 1)) if reference_observations_mask is not None else (None, None)
+                ref_obs_mask_batch = self._buffer_sample(reference_observations_mask.unsqueeze(-1).float(), clamped_indices, sample_mask).squeeze(-1).bool() if reference_observations_mask is not None else None
+                # ref_obs_mask_batch = ref_obs_mask_batch.squeeze(-1).bool() if ref_obs_mask_batch is not None else None
+                ref_obs_batch_rtn = (ref_obs_batch, ref_obs_mask_batch) if ref_obs_batch is not None else None
+                # critic_observations_batch = critic_observations[batch_idx]
+                # critic_observations_batch, _ = self._create_obs_buffer_slice(critic_observations, batch_idx, self.dones.flatten(0, 1))
+                critic_observations_batch, _, critic_clamped_indices, critic_sample_mask = self._create_obs_buffer_slice(
+                    critic_observations,
+                    critic_batch_idx,
+                    critic_dones_flat,
+                    num_steps_per_env=critic_history_length,
+                    sequence_valid=critic_valid_flat,
+                )
+                # critic_ref_obs_batch = critic_reference_observations[batch_idx] if critic_reference_observations is not None else None
+                # critic_ref_obs_batch, _ = self._create_obs_buffer_slice(critic_reference_observations, batch_idx, self.dones.flatten(0, 1)) if critic_reference_observations is not None else (None, None)
+                critic_ref_obs_batch = self._buffer_sample(critic_reference_observations, critic_clamped_indices, critic_sample_mask) if critic_reference_observations is not None else None
+                # critic_ref_obs_mask_batch, _ = self._create_obs_buffer_slice(critic_reference_observations_mask.unsqueeze(-1).float(), batch_idx, self.dones.flatten(0, 1)) if critic_reference_observations_mask is not None else (None, None)
+                critic_ref_obs_mask_batch = self._buffer_sample(critic_reference_observations_mask.unsqueeze(-1).float(), critic_clamped_indices, critic_sample_mask).squeeze(-1).bool() if critic_reference_observations_mask is not None else None
+                # critic_ref_obs_mask_batch = critic_ref_obs_mask_batch.squeeze(-1).bool() if critic_ref_obs_mask_batch is not None else None
+                critic_ref_obs_batch_rtn = (critic_ref_obs_batch, critic_ref_obs_mask_batch) if critic_ref_obs_batch is not None else None
+                actions_batch = actions[batch_idx]
+                dreamer_target_batch = (
+                    (
+                        dreamer_target_observations[batch_idx],
+                        dreamer_target_observations_mask[batch_idx],
+                    )
+                    if dreamer_target_observations is not None
+                    else None
+                )
+                dagger_actions_batch = dagger_actions[batch_idx] if dagger_actions is not None else None
+                target_values_batch = values[batch_idx]
+                returns_batch = returns[batch_idx]
+                old_actions_log_prob_batch = old_actions_log_prob[batch_idx]
+                advantages_batch = advantages[batch_idx]
+                old_mu_batch = old_mu[batch_idx]
+                old_sigma_batch = old_sigma[batch_idx]
+
+                if self.rnd_state_shape is not None:
+                    rnd_state_batch = rnd_state[batch_idx]
+                else:
+                    rnd_state_batch = None
+
+                # AMP history extraction
+                if self.amp_cfg and amp_observations is not None:
+                    amp_history_idx = self._compute_amp_history_indices(
+                        batch_idx, dones_flat
+                    )
+                    amp_obs_history = amp_observations[amp_history_idx]
+                    amp_ref_obs_history = amp_reference_observations[amp_history_idx]
+                    amp_ref_obs_history_mask = amp_reference_observations_mask[amp_history_idx].bool()
+                else:
+                    amp_obs_history = None
+                    amp_ref_obs_history = None
+                    amp_ref_obs_history_mask = None
+
+                yield obs_batch, ref_obs_batch_rtn, critic_observations_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
+                    None,
+                    None,
+                ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask, raw_obs_batch, dreamer_target_batch
+
+    def streaming_sequence_mini_batch_generator(
+        self,
+        num_mini_batches,
+        num_epochs=8,
+        num_steps_per_env=None,
+    ):
+        """Yield contiguous env trajectories for streaming-local MMGPT PPO.
+
+        The legacy buffer generator constructs one H-frame window for every
+        rollout transition. This generator instead prepends H-1 retained raw
+        frames once and encodes the full rollout once per environment. PPO
+        targets remain restricted to the current rollout portion.
+        """
+
+        if self.training_type != "rl":
+            raise ValueError("streaming sequence batches require RL storage")
+        if self.amp_cfg is not None:
+            raise ValueError("streaming MMGPT sequence batches do not support AMP")
+        if self.dagger_actions is not None:
+            raise ValueError(
+                "streaming MMGPT sequence batches currently require pure RL "
+                "without a DAgger teacher"
+            )
+        history_length = (
+            self.actor_history_length
+            if num_steps_per_env is None
+            else int(num_steps_per_env)
+        )
+        if not 1 <= history_length <= self.actor_history_length:
+            raise ValueError(
+                "requested streaming history length must be between 1 and "
+                f"{self.actor_history_length}, got {history_length}"
+            )
+        if self.num_envs % num_mini_batches != 0:
+            raise ValueError(
+                "num_envs must be divisible by num_mini_batches for streaming "
+                f"sequence training, got {self.num_envs} and {num_mini_batches}"
+            )
+
+        prefix_length = history_length - 1
+
+        def prepend(prefix, current):
+            if prefix_length == 0:
+                return current
+            if prefix is None or prefix.shape[0] < prefix_length:
+                raise RuntimeError(
+                    f"missing {prefix_length}-step streaming rollout prefix"
+                )
+            return torch.cat((prefix[-prefix_length:], current), dim=0)
+
+        current_valid = torch.ones(
+            self.num_transitions_per_env,
+            self.num_envs,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        obs_sequence = prepend(
+            self.actor_history_prefix_observations, self.observations
+        )
+        masks_sequence = prepend(
+            self.actor_history_prefix_valid, current_valid
+        ).bool()
+        dones_sequence = prepend(
+            self.actor_history_prefix_dones, self.dones
+        ).squeeze(-1).bool()
+        raw_obs_sequence = (
+            prepend(
+                self.actor_history_prefix_raw_observations,
+                self.raw_observations,
+            )
+            if self.raw_observations is not None
+            else None
+        )
+        ref_sequence = (
+            prepend(
+                self.actor_history_prefix_reference_observations,
+                self.reference_observations,
+            )
+            if self.reference_observations is not None
+            else None
+        )
+        ref_mask_sequence = (
+            prepend(
+                self.actor_history_prefix_reference_masks,
+                self.reference_observations_mask,
+            ).bool()
+            if self.reference_observations_mask is not None
+            else None
+        )
+
+        # Preserve the data contract even for an uninitialized first-rollout
+        # prefix: masked frames must not leak through observation embeddings.
+        expand_dims = (1,) * (obs_sequence.dim() - 2)
+        obs_sequence = obs_sequence * masks_sequence.reshape(
+            masks_sequence.shape + expand_dims
+        ).to(obs_sequence.dtype)
+        if raw_obs_sequence is not None:
+            raw_obs_sequence = raw_obs_sequence * masks_sequence.reshape(
+                masks_sequence.shape + (1,) * (raw_obs_sequence.dim() - 2)
+            ).to(raw_obs_sequence.dtype)
+        if ref_sequence is not None:
+            effective_ref_mask = ref_mask_sequence & masks_sequence
+            ref_sequence = ref_sequence * effective_ref_mask.unsqueeze(-1).to(
+                ref_sequence.dtype
+            )
+            ref_mask_sequence = effective_ref_mask
+
+        episode_ids = torch.zeros_like(dones_sequence, dtype=torch.long)
+        if episode_ids.shape[0] > 1:
+            episode_ids[1:] = torch.cumsum(dones_sequence[:-1].long(), dim=0)
+
+        critic_observations = (
+            self.privileged_observations
+            if self.privileged_observations is not None
+            else self.observations
+        )
+        critic_reference_observations = (
+            self.privileged_reference_observations
+            if self.privileged_reference_observations is not None
+            else self.reference_observations
+        )
+        critic_reference_masks = (
+            self.privileged_reference_observations_mask
+            if self.privileged_reference_observations_mask is not None
+            else self.reference_observations_mask
+        )
+        envs_per_batch = self.num_envs // num_mini_batches
+
+        for _ in range(num_epochs):
+            env_order = torch.randperm(self.num_envs, device=self.device)
+            for batch_id in range(num_mini_batches):
+                env_idx = env_order[
+                    batch_id * envs_per_batch:(batch_id + 1) * envs_per_batch
+                ]
+
+                def current_flat(sequence):
+                    return sequence[:, env_idx].flatten(0, 1)
+
+                obs_batch = obs_sequence[:, env_idx]
+                masks_batch = masks_sequence[:, env_idx]
+                ref_obs_batch = (
+                    (
+                        ref_sequence[:, env_idx],
+                        ref_mask_sequence[:, env_idx],
+                    )
+                    if ref_sequence is not None
+                    else None
+                )
+                critic_obs_batch = current_flat(critic_observations)
+                critic_ref_obs_batch = (
+                    (
+                        current_flat(critic_reference_observations),
+                        current_flat(critic_reference_masks),
+                    )
+                    if critic_reference_observations is not None
+                    else None
+                )
+                raw_obs_batch = (
+                    raw_obs_sequence[:, env_idx]
+                    if raw_obs_sequence is not None
+                    else None
+                )
+                dreamer_target_batch = (
+                    (
+                        current_flat(self.dreamer_target_observations),
+                        current_flat(self.dreamer_target_observations_mask),
+                    )
+                    if self.dreamer_target_observations is not None
+                    else None
+                )
+                rnd_state_batch = (
+                    current_flat(self.rnd_state)
+                    if self.rnd_state_shape is not None
+                    else None
+                )
+                sequence_metadata = {
+                    "streaming_sequence": True,
+                    "episode_ids": episode_ids[:, env_idx],
+                    "sequence_output_start": prefix_length,
+                }
+
+                yield (
+                    obs_batch,
+                    ref_obs_batch,
+                    critic_obs_batch,
+                    critic_ref_obs_batch,
+                    current_flat(self.actions),
+                    current_flat(self.values),
+                    current_flat(self.advantages),
+                    current_flat(self.returns),
+                    current_flat(self.actions_log_prob),
+                    current_flat(self.mu),
+                    current_flat(self.sigma),
+                    None,
+                    sequence_metadata,
+                    masks_batch,
+                    rnd_state_batch,
+                    None,
+                    None,
+                    None,
+                    raw_obs_batch,
+                    dreamer_target_batch,
+                )
+    
+    
+
+    # for MMGPT
+    def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        if self.training_type != "rl":
+            raise ValueError("This function is only available for reinforcement learning training.")
+        
+        # batch_size = self.num_envs * self.num_transitions_per_env
+        mini_batch_size = self.num_envs // num_mini_batches
+        padded_obs_trajectories, obs_masks = split_and_pad_trajectories(self.observations, self.dones)
+        padded_ref_obs_trajectories, padded_ref_obs_masks = split_and_pad_trajectories(self.reference_observations, self.dones) if self.reference_observations is not None else (None, None)
+        padded_ref_observation_masks, _ = split_and_pad_trajectories(self.reference_observations_mask.unsqueeze(-1).float(), self.dones) if self.reference_observations_mask is not None else (None, None)
+        
+        if self.privileged_observations is not None:
+            padded_critic_obs_trajectories, critic_obs_masks = split_and_pad_trajectories(self.privileged_observations, self.dones)
+            padded_critic_ref_obs_trajectories, padded_critic_ref_obs_masks = split_and_pad_trajectories(self.privileged_reference_observations, self.dones) if self.privileged_reference_observations is not None else (None, None)
+            padded_critic_ref_observation_masks, _ = split_and_pad_trajectories(self.privileged_reference_observations_mask.unsqueeze(-1).float(), self.dones) if self.privileged_reference_observations_mask is not None else (None, None)
+        else:
+            padded_critic_obs_trajectories, critic_obs_masks = padded_obs_trajectories, obs_masks
+            padded_critic_ref_obs_trajectories, padded_critic_ref_obs_masks = padded_ref_obs_trajectories, padded_ref_obs_masks
+            padded_critic_ref_observation_masks = padded_ref_observation_masks
+            
+        if self.amp_observations is not None:
+            padded_amp_obs_trajectories, amp_obs_masks = split_and_pad_trajectories(self.amp_observations, self.dones)
+            padded_amp_ref_obs_trajectories, padded_amp_ref_obs_masks = split_and_pad_trajectories(self.amp_reference_observations, self.dones) if self.amp_reference_observations is not None else (None, None)
+            padded_amp_ref_observation_masks, _ = split_and_pad_trajectories(self.amp_reference_observations_mask.unsqueeze(-1).float(), self.dones) if self.amp_reference_observations_mask is not None else (None, None)
+            
+        if self.rnd_state_shape is not None:
+            padded_rnd_state_trajectories, _ = split_and_pad_trajectories(self.rnd_state, self.dones)
+        
+        else:
+            padded_rnd_state_trajectories = None
+
+        
+        for ep in range(num_epochs):
+            first_traj = 0
+            for i in range(num_mini_batches):
+                start = i * mini_batch_size
+                stop = (i + 1) * mini_batch_size
+                
+                dones = self.dones.squeeze(-1)
+                last_was_done = torch.zeros_like(dones, dtype=torch.bool)
+                last_was_done[1:] = dones[:-1]
+                last_was_done[0] = 1
+                trajectories_batch_size = torch.sum(last_was_done[:,start:stop])
+                last_traj = first_traj + trajectories_batch_size
+
+                masks_batch = obs_masks[:, first_traj:last_traj]
+                obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
+                ref_obs_batch = padded_ref_obs_trajectories[:, first_traj:last_traj] if padded_ref_obs_trajectories is not None else None
+                ref_obs_mask_batch = padded_ref_observation_masks[:, first_traj:last_traj].squeeze(-1) if padded_ref_observation_masks is not None else None
+                ref_obs_batch_rtn = (ref_obs_batch, ref_obs_mask_batch)
+                critic_obs_batch = padded_critic_obs_trajectories[:, first_traj:last_traj]
+                critic_ref_obs_batch = padded_critic_ref_obs_trajectories[:, first_traj:last_traj] if padded_critic_ref_obs_trajectories is not None else None
+                critic_ref_obs_mask_batch = padded_critic_ref_observation_masks[:, first_traj:last_traj].squeeze(-1) if padded_critic_ref_observation_masks is not None else None
+                critic_ref_obs_batch_rtn = (critic_ref_obs_batch, critic_ref_obs_mask_batch)
+                if padded_rnd_state_trajectories is not None:
+                    rnd_state_batch = padded_rnd_state_trajectories[:, first_traj:last_traj]
+                else:
+                    rnd_state_batch = None
+                    
+                actions_batch = self.actions[:, start:stop]
+                old_mu_batch = self.mu[:, start:stop]
+                old_sigma_batch = self.sigma[:, start:stop]
+                returns_batch = self.returns[:, start:stop]
+                advantages_batch = self.advantages[:, start:stop]
+                target_values_batch = self.values[:, start:stop]
+                old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+                dagger_actions_batch = self.dagger_actions[:, start:stop] if self.dagger_actions is not None else None
+                last_was_done = last_was_done.permute(1, 0)
+                
+                # AMP history extraction
+                if self.amp_cfg and padded_amp_obs_trajectories is not None:
+                    amp_obs_traj = padded_amp_obs_trajectories[:, first_traj:last_traj]  # (T, N, D)
+                    amp_ref_obs_traj = padded_amp_ref_obs_trajectories[:, first_traj:last_traj]  # (T, N, D)
+                    amp_ref_mask_traj = padded_amp_ref_observation_masks[:, first_traj:last_traj].squeeze(-1)  # (T, N)
+                    amp_traj_masks = obs_masks[:, first_traj:last_traj]  # (T, N)
+
+                    T_len, N_traj = amp_obs_traj.shape[0], amp_obs_traj.shape[1]
+                    H = self.amp_history_length
+
+                    # Build time indices for history lookback
+                    t_range = torch.arange(T_len, device=self.device)  # [T]
+                    h_offsets = torch.arange(H - 1, -1, -1, device=self.device)  # [H]
+                    time_indices = t_range.unsqueeze(-1) - h_offsets.unsqueeze(0)  # [T, H]
+                    time_indices = time_indices.clamp(min=0)  # [T, H]
+
+                    # Index trajectories: [T, H] indexing into [T, N, D] -> [T, H, N, D]
+                    amp_obs_history = amp_obs_traj[time_indices]  # [T, H, N, D]
+                    amp_ref_obs_history = amp_ref_obs_traj[time_indices]  # [T, H, N, D]
+                    amp_ref_obs_mask_history = amp_ref_mask_traj[time_indices]  # [T, H, N]
+
+                    # Reshape: (T, H, N, D) -> (T*N, H, D)
+                    amp_obs_history = amp_obs_history.permute(0, 2, 1, 3).reshape(-1, H, self.amp_shape)
+                    amp_ref_obs_history = amp_ref_obs_history.permute(0, 2, 1, 3).reshape(-1, H, self.amp_shape)
+                    amp_ref_obs_history_mask = amp_ref_obs_mask_history.permute(0, 2, 1).reshape(-1, H).bool()
+
+                    # Apply trajectory validity mask (T-outer, N-inner to match permute(0,2,1,3).reshape)
+                    amp_valid = amp_traj_masks.reshape(-1)  # [T*N]
+                    amp_obs_history = amp_obs_history * amp_valid.unsqueeze(-1).unsqueeze(-1)
+                    amp_ref_obs_history = amp_ref_obs_history * amp_valid.unsqueeze(-1).unsqueeze(-1)
+                    amp_ref_obs_history_mask = amp_ref_obs_history_mask & amp_valid.unsqueeze(-1).bool()
+                else:
+                    amp_obs_history = None
+                    amp_ref_obs_history = None
+                    amp_ref_obs_history_mask = None
+
+                yield obs_batch, ref_obs_batch_rtn, critic_obs_batch, critic_ref_obs_batch_rtn, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, dagger_actions_batch, (
+                    None,
+                    None,
+                ), masks_batch, rnd_state_batch, amp_obs_history, amp_ref_obs_history, amp_ref_obs_history_mask, None, None
+                
+                first_traj = last_traj
+
+                
+                    
+                
+                
+                
+                
+                
