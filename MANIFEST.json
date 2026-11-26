@@ -1,0 +1,14 @@
+{
+  "source_path": "/cpfs/user/yaoyifei/codespace/gbc/.codex-worktrees/GBC-controller-mmgpt-ablation-0805/dependencies/rsl_rl",
+  "common": "/cpfs/user/yaoyifei/codespace/gbc/GBC/.git/worktrees/GBC-controller-runtime-0803/modules/dependencies/rsl_rl",
+  "bundle_sha256": "9d818aab8d9c11a1dd807dd59f805e9c2c6661205c44a616c86dbaa3177c15f2",
+  "bundle_bytes": 444100,
+  "parts": [
+    {
+      "name": "repository.bundle.part0000",
+      "bytes": 444100,
+      "sha256": "9d818aab8d9c11a1dd807dd59f805e9c2c6661205c44a616c86dbaa3177c15f2"
+    }
+  ],
+  "note": "Includes all refs and reflog-reachable history. Git LFS payloads and worktree modifications are separate."
+}
