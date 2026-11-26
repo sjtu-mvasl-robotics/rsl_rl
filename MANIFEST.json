@@ -1,0 +1,14 @@
+{
+  "source_path": "/cpfs/user/yaoyifei/codespace/gbc/.codex-worktrees/GBC-controller-mmgpt-zero-bc-0903/dependencies/rsl_rl",
+  "common": "/cpfs/user/yaoyifei/codespace/gbc/GBC/.git/worktrees/GBC-controller-mmgpt-zero-bc-0903/modules/dependencies/rsl_rl",
+  "bundle_sha256": "fa90b7d0d2e3dda1f01656a3735cb6e884fc6917d25ae8035f20fd6c1a799dc9",
+  "bundle_bytes": 468159,
+  "parts": [
+    {
+      "name": "repository.bundle.part0000",
+      "bytes": 468159,
+      "sha256": "fa90b7d0d2e3dda1f01656a3735cb6e884fc6917d25ae8035f20fd6c1a799dc9"
+    }
+  ],
+  "note": "Includes all refs and reflog-reachable history. Git LFS payloads and worktree modifications are separate."
+}
