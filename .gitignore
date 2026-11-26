@@ -1,0 +1,33 @@
+# IDEs
+.idea
+
+# builds
+*.egg-info
+
+# cache
+__pycache__
+.pytest_cache
+
+# vs code
+.vscode
+
+test*
+CONTRIBUTORS.md
+
+# copilot test files
+*benchmark*
+debug*
+complete*
+final*
+*test*
+*.md
+quick*
+*analysis*
+*analyze*
+*.pkl
+*generate*
+*optimized*
+*complex*
+*.png
+*verify*
+*comparison*
